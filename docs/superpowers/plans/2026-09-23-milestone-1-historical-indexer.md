@@ -146,7 +146,7 @@ TELEGRAM_ALLOWED_USER_IDS=
 
 - [ ] **Step 5: Write `config/chains.json`**
 
-`archiveProbe` addresses are long-lived contracts on each chain. The values below must each be **verified against that chain** before the task is complete: call `getCode(address, block)` and confirm non-empty on an archive node. Do not copy an address between chains.
+`archiveProbe` addresses are long-lived contracts on each chain. Every value below is provisional until Step 12 verifies it with a real `getCode` call — **all three chains, mainnet included**. Do not copy an address between chains, and do not mark this task done on unverified values: a wrong probe block makes the probe fail on a genuine archive node and needlessly disables deploy-block search.
 
 ```json
 {
@@ -444,10 +444,51 @@ function readChainsFile(): unknown {
 Run: `npx vitest run test/unit/config.test.ts && npm run typecheck`
 Expected: PASS, 7 tests. Typecheck clean.
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 12: Verify every archiveProbe against its real chain**
+
+This gate blocks the task. Requires RPC URLs in `.env` for all three chains.
+
+`scripts/verify-archive-probes.ts`:
+
+```ts
+/** Confirms each chains.json archiveProbe really has code at its block. */
+import { createPublicClient, http } from 'viem';
+import { loadConfig } from '../src/config.js';
+
+const config = loadConfig();
+let failures = 0;
+
+for (const [chainId, chain] of config.chains) {
+  const client = createPublicClient({ transport: http(chain.rpcUrl) });
+  const { address, block } = chain.archiveProbe;
+  try {
+    const code = await client.getCode({ address, blockNumber: BigInt(block) });
+    const ok = Boolean(code) && code !== '0x';
+    process.stdout.write(
+      `${ok ? 'PASS' : 'FAIL'}  chain ${chainId} (${chain.name})  ${address} @ ${block}\n`,
+    );
+    if (!ok) failures += 1;
+  } catch (err) {
+    process.stdout.write(
+      `FAIL  chain ${chainId} (${chain.name})  ${address} @ ${block}  ` +
+      `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    failures += 1;
+  }
+}
+
+process.exitCode = failures > 0 ? 1 : 0;
+```
+
+Run: `npx tsx scripts/verify-archive-probes.ts`
+Expected: `PASS` for every configured chain, exit code 0.
+
+A `FAIL` means either the probe block predates that contract's deployment (fix the block in `chains.json` and re-run) or the RPC is not an archive node (a real finding — report it, since deploy-block search will be unavailable on that chain). **Do not proceed to Task 2 until every configured chain prints PASS, and report any chain that could not be checked at all.**
+
+- [ ] **Step 13: Commit**
 
 ```bash
-git add package.json package-lock.json tsconfig.json vitest.config.ts .env.example config/ src/ test/
+git add package.json package-lock.json tsconfig.json vitest.config.ts .env.example config/ src/ test/ scripts/
 git commit -m "feat: project scaffold, shared types, typed errors, and zod config
 
 Multi-chain via per-chain RPC_URL_<chainId> discovery. A chain in
@@ -2941,7 +2982,12 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: everything from Tasks 1–12
 - Produces:
-  - `interface BackfillDeps { db; getCode: CodeReader; supports: SupportsInterface; fetchLogs: LogFetcher; txSource: TxSource; getHead(): Promise<bigint>; now(): Date }`
+  - `interface BackfillDeps { db; getCode: CodeReader; supports: SupportsInterface; makeFetchLogs(standard: Standard): LogFetcher; txSource: TxSource; getHead(): Promise<bigint>; now(): Date }`
+
+**Why `makeFetchLogs(standard)` and not a plain `fetchLogs`:** the `getLogs`
+topic filter depends on the standard, which is not known until bootstrap has
+run inside `backfill()`. A caller therefore cannot build the fetcher up front —
+it has to be constructed once the standard is resolved.
   - `interface BackfillOptions { chainId: number; contract: string; chain: Pick<ChainConfig,'initialChunk'|'maxChunk'|'confirmations'|'blockFetchThreshold'|'archiveProbe'>; deployBlockOverride?: number; standardOverride?: Standard; etherscanApiKey?: string; maxHeadExtensions?: number; staleLockMs?: number; jobId?: string; onProgress?(p: Progress): void; hooks?: { afterChunkCommit?(ctx: { chunkIndex: number; toBlock: bigint }): void | Promise<void> } }`
   - `interface Progress { fromBlock: bigint; toBlock: bigint; target: bigint; rowsInserted: number; totalRows: number }`
   - `interface BackfillResult { standard: Standard; deployBlock: number; lastIndexedBlock: number; rowsInserted: number; headExtensions: number }`
@@ -3004,7 +3050,7 @@ function makeDeps(over: Partial<BackfillDeps> = {}): BackfillDeps {
     db,
     getCode: async ({ blockNumber }) => (blockNumber >= DEPLOY ? '0xcode' : '0x'),
     supports: async (id) => id === INTERFACE_IDS.erc721,
-    fetchLogs: async ({ fromBlock, toBlock }) =>
+    makeFetchLogs: () => async ({ fromBlock, toBlock }) =>
       [1, 2, 3].filter((n) => BigInt(100 + n) >= fromBlock && BigInt(100 + n) <= toBlock)
         .map((n) => mintLog(n, BigInt(100 + n))),
     txSource: {
@@ -3170,7 +3216,12 @@ export interface BackfillDeps {
   db: Database.Database;
   getCode: CodeReader;
   supports: SupportsInterface;
-  fetchLogs: LogFetcher;
+  /**
+   * Built per run, not passed in ready-made: the getLogs topic filter depends
+   * on the standard, which bootstrap only resolves once this function is
+   * already running.
+   */
+  makeFetchLogs(standard: Standard): LogFetcher;
   txSource: TxSource;
   getHead(): Promise<bigint>;
   now(): Date;
@@ -3266,6 +3317,8 @@ export async function backfill(
     const { standard, deployBlock } = existing;
 
     // --- chunk loop ------------------------------------------------------
+    const fetchLogs = deps.makeFetchLogs(standard);
+
     let cursor = BigInt(existing.lastIndexedBlock) + 1n;
     let rowsInserted = 0;
     let chunkIndex = 0;
@@ -3274,7 +3327,7 @@ export async function backfill(
     for (;;) {
       while (cursor <= target) {
         for await (const chunk of iterateLogs({
-          fetch: deps.fetchLogs,
+          fetch: fetchLogs,
           fromBlock: cursor,
           toBlock: target,
           initialChunk: chain.initialChunk,
@@ -3573,14 +3626,15 @@ async function main(): Promise<void> {
       getCode: (a) =>
         limit(async () => (await client.getCode({ address: a.address, blockNumber: a.blockNumber })) ?? '0x'),
       supports: (id) => limit(() => makeSupportsInterface(client, address)(id)),
-      fetchLogs: ({ fromBlock, toBlock }) =>
+      // Built with the standard backfill resolved during bootstrap, so topic
+      // filtering is correct for 721 and 1155 alike.
+      makeFetchLogs: (resolvedStandard) => ({ fromBlock, toBlock }) =>
         limit(async () =>
           (await client.getLogs({
             address,
             fromBlock,
             toBlock,
-            // Filtering by topic0 keeps unrelated events out of the chunk.
-            topics: [standard ? TRANSFER_TOPICS[standard] : TRANSFER_TOPICS['721']],
+            topics: [TRANSFER_TOPICS[resolvedStandard]],
           })) as never,
         ),
       txSource: {
@@ -3624,8 +3678,6 @@ main().catch((err: unknown) => {
 });
 ```
 
-**Note on the `topics` filter:** when no `--standard` is passed the standard is not known until bootstrap runs inside `backfill()`. Resolve this by making the CLI's `fetchLogs` read the standard after bootstrap. The simplest correct approach: have `backfill()` pass the resolved standard to `fetchLogs` as a second argument. Update `LogFetcher` in `src/indexer/logs.ts` to `(a: { fromBlock; toBlock }) => Promise<RawLog[]>` bound per-run by `backfill` via a closure it creates after bootstrap. **Implement this as: `BackfillDeps.fetchLogs` becomes `makeFetchLogs(standard: Standard): LogFetcher`**, and update Task 13's `makeDeps` test helper accordingly. Verify Task 13's tests still pass after the change.
-
 - [ ] **Step 5: Run the tests and typecheck**
 
 Run: `npx vitest run && npm run typecheck`
@@ -3634,12 +3686,11 @@ Expected: PASS, all suites.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/cli/ test/unit/args.test.ts src/indexer/backfill.ts src/indexer/logs.ts test/unit/backfill.test.ts
+git add src/cli/ test/unit/args.test.ts
 git commit -m "feat: CLI entrypoint with validated arguments
 
 Bad input returns a helpful message and a non-zero exit, never a stack
-trace. fetchLogs is built per run from the resolved standard so topic
-filtering is correct for both 721 and 1155.
+trace.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -3760,9 +3811,9 @@ describe.skipIf(!configured)('backfill against a real collection', () => {
           getCode: async (a) =>
             (await client.getCode({ address: a.address, blockNumber: a.blockNumber })) ?? '0x',
           supports: makeSupportsInterface(client, address),
-          fetchLogs: async ({ fromBlock, toBlock }) =>
+          makeFetchLogs: (standard) => async ({ fromBlock, toBlock }) =>
             (await client.getLogs({
-              address, fromBlock, toBlock, topics: [TRANSFER_TOPICS['721']],
+              address, fromBlock, toBlock, topics: [TRANSFER_TOPICS[standard]],
             })) as never,
           txSource: makeTxSource(client),
           getHead: () => client.getBlockNumber(),
@@ -3853,6 +3904,6 @@ Per the project working rules, Milestone 1 ends here. Report: what was built, th
 
 **Spec coverage.** Every spec section maps to a task: config → 1; logger/security → 2; data model and migrations → 3; locking, cleanup, read guard → 4; idempotent writes and chunked IN → 5; decoding incl. `batch_index` → 6; classification → 7; client and rate limit → 8; adaptive chunking and `isRangeError` → 9; ERC-165 and Enumerable → 10; deploy-block precedence and archive probe → 11; enrichment heuristic → 12; reorg safety, head extension, orchestration, fault-injection hook → 13; CLI → 14; integration tests, fixtures, README limitations → 15.
 
-**Known deviation carried forward:** Task 14 changes `BackfillDeps.fetchLogs` into `makeFetchLogs(standard)`, because topic filtering needs the standard, which is only known after bootstrap. This is called out in Task 14 Step 4 with instructions to update Task 13's helper and re-run its tests. An implementer working Task 13 in isolation will write the simpler signature first and change it in Task 14; that is intentional, not an oversight.
+**Type consistency.** `BackfillDeps.makeFetchLogs(standard)` is defined that way in Task 13 and used unchanged by Tasks 14 and 15. An earlier draft had Task 13 declare a plain `fetchLogs` and Task 14 rewrite it — a signature known to be wrong when written, which would have left Task 13's tests drifting from the shipped shape.
 
 **Placeholders.** The only `REPLACE_ME` values are the three integration-test constants, which cannot be known before Step 2 and which the spec requires the user to verify. The `archiveProbe` entries in Task 1 are real addresses but are explicitly marked as requiring per-chain verification before commit.
