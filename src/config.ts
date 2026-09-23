@@ -51,7 +51,15 @@ export function loadConfig(
     if (!match || !value) continue;
     const chainId = Number(match[1]);
     const entry = parsedChains.data[String(chainId)];
-    if (!entry) continue; // configured but unknown chain: ignored, not an error
+
+    if (!entry) {
+      // Configured but unknown chain: ignored, not an error. Still a real,
+      // key-bearing endpoint if well-formed, so it must be scrubbed from logs
+      // even though it never reaches cfg.chains.
+      if (isHttpUrl(value)) secrets.push(value);
+      continue;
+    }
+
     if (!isHttpUrl(value)) {
       throw new ConfigError(`${key} is not a valid http(s) URL`);
     }

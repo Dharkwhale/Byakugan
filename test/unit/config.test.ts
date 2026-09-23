@@ -43,6 +43,19 @@ describe('loadConfig', () => {
     expect(cfg.chains.has(999)).toBe(false);
   });
 
+  it('still scrubs an RPC_URL for a chain absent from chains.json', () => {
+    const cfg = loadConfig(
+      {
+        RPC_URL_1: 'https://a.example/k',
+        RPC_URL_999: 'https://c.example/UNKNOWNCHAINKEY',
+        DB_PATH: './x.db',
+      },
+      CHAINS,
+    );
+    expect(cfg.chains.has(999)).toBe(false);
+    expect(cfg.secrets).toContain('https://c.example/UNKNOWNCHAINKEY');
+  });
+
   it('leaves a chain in chains.json without an env var unavailable, not an error', () => {
     const cfg = loadConfig({ RPC_URL_1: 'https://a.example/k', DB_PATH: './x.db' }, CHAINS);
     expect(cfg.chains.has(8453)).toBe(false);
