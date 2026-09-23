@@ -141,8 +141,20 @@ because they are `uint256` and exceed JavaScript's safe integer range.
 `standard`, `deploy_block`, `deploy_block_source`, and `last_indexed_block` are
 nullable, which the locking design requires: a job must be able to claim a
 collection *before* bootstrap has determined those values. A row with
-`standard IS NULL` means "claimed, not yet bootstrapped". Every read path treats
-such a row as un-indexed.
+`standard IS NULL` means "claimed, not yet bootstrapped".
+
+**Every read path must filter on `standard IS NOT NULL`.** This is a correctness
+requirement, not a convention. An unbootstrapped row that leaks into a read
+surfaces as a known collection holding zero transfers — so a status query would
+report an indexed collection at zero progress, and Milestone 2's `firstMinters`
+would return an empty list rather than an error. Silently empty output is worse
+than a failure, because nothing signals that the answer is wrong.
+
+The guard is enforced in one place: the collections repository exposes no
+unfiltered "get by address". The only lookup returns
+`{ state: 'indexed', … } | { state: 'not_indexed' }`, with a claimed-but-
+unbootstrapped row mapping to `not_indexed`. Callers cannot forget the filter
+because they never see the raw row.
 
 SQLite runs in WAL mode with a `busy_timeout`.
 
@@ -209,7 +221,30 @@ ON CONFLICT (chain_id, contract) DO UPDATE
 this one exits with a clear error. `locked_by` is a job identity (uuid, pid,
 hostname). The lock is refreshed on each chunk commit, so the stale cutoff
 (default 5 minutes) only expires locks whose owner actually died. Release
-happens in a `finally`, so a thrown job does not leave the collection wedged.
+happens in a `finally`, so a thrown job does not leave the collection wedged —
+including when bootstrap itself throws.
+
+### Bootstrap failure cleanup
+
+The claim upsert creates a row before bootstrap runs, so a bootstrap that throws
+(`UnsupportedStandardError`, `DeployBlockUnavailableError`) would otherwise leave
+a permanent `standard IS NULL` orphan in `collections`. Indexing a rejected
+address would then keep working, but the orphan would pollute every listing.
+
+On bootstrap failure the job deletes the row it created:
+
+```sql
+DELETE FROM collections
+ WHERE chain_id = ? AND contract = ?
+   AND standard IS NULL          -- never remove a bootstrapped collection
+   AND locked_by = ?             -- only the row this job claimed
+```
+
+Both guards matter. `standard IS NULL` means a retry that races a
+now-succeeding job can never delete a real collection, and `locked_by = ?`
+means a job cannot delete a row another job owns. The delete and the lock
+release run in the same `finally`, so every exit path — success, rejection, or
+crash mid-bootstrap — leaves the table in a defensible state.
 
 ### Bootstrap
 
@@ -383,6 +418,11 @@ Added by the design gaps above:
 - lock contention: a second claim against a held lock fails; a claim against a
   stale lock succeeds; two claims on a collection with no row yet resolve to
   exactly one winner
+- bootstrap failure cleanup: a rejected standard and an unavailable deploy block
+  each leave no row behind, the lock released either way; the delete does not
+  remove a bootstrapped row, and does not remove a row another job holds
+- read-path guard: a claimed-but-unbootstrapped row reads as `not_indexed`, not
+  as an indexed collection with zero transfers
 - migration runner resolves the repo root correctly
 
 Fixtures are real logs and txs captured to `test/fixtures/` by a small committed
