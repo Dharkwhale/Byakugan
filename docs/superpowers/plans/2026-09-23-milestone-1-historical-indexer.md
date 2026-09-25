@@ -33,7 +33,8 @@
 | `src/types.ts` | shared domain types |
 | `src/errors.ts` | typed error classes |
 | `src/config.ts` | zod-validated env + chains.json — the only reader of `process.env` |
-| `src/logger.ts` | pino with secret scrubbing |
+| `src/secrets.ts` | token derivation + scrubbing (pure, no deps; shared with scripts) |
+| `src/logger.ts` | pino wired to scrub every serialized line |
 | `src/db/paths.ts` | repo-root and migrations-dir resolution |
 | `src/db/connection.ts` | better-sqlite3 handle, WAL, busy_timeout |
 | `src/db/migrate.ts` | migration runner |
@@ -509,26 +510,274 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Logger with secret scrubbing
+### Task 2: Secret scrubbing and the logger
 
 **Files:**
-- Create: `src/logger.ts`
-- Test: `test/unit/logger.test.ts`
+- Create: `src/secrets.ts`, `src/logger.ts`
+- Modify: `scripts/verify-archive-probes.ts` — delete its local `scrub()`/`scrubUnknown()` and import the shared ones
+- Test: `test/unit/secrets.test.ts`, `test/unit/logger.test.ts`
 
 **Interfaces:**
-- Consumes: `Config.secrets` from Task 1
-- Produces: `scrubSecrets(value: string, secrets: string[]): string`, `createLogger(secrets: string[], stream?: NodeJS.WritableStream): Logger`
+- Consumes: `Config.secrets` (Task 1)
+- Produces, from `src/secrets.ts` (pure, no dependencies — which is why it is separate from `logger.ts`, so scripts can scrub without pulling in pino):
+  - `deriveSecretTokens(rawSecrets: string[]): string[]`
+  - `scrubSecrets(value: string, tokens: string[]): string`
+  - `scrubUnknown(value: unknown, tokens: string[]): string`
+- Produces, from `src/logger.ts`:
+  - `createLogger(rawSecrets: string[], stream?: NodeJS.WritableStream): Logger`
 
-Pino's built-in `redact` only masks object *properties*. Viem embeds the RPC URL in error **messages**, so property redaction alone leaks the API key. This task scrubs strings.
+**Design — three decisions, each because the obvious alternative fails:**
 
-- [ ] **Step 1: Write the failing test**
+**1. Scrub at serialization, not by path.** Pino's `redact` masks named object
+paths. It cannot reach a secret inside `err.message`, inside a stack trace,
+inside an `err.cause` nested several levels down, inside an array element, or
+inside an object *key* name — and those are exactly where viem puts the RPC
+URL. Scrubbing the serialized line is the only point every shape must pass
+through, so nothing can bypass it whatever form it arrives in.
+
+**2. Match the key value, not the whole URL.** A secret stored as
+`https://eth-mainnet.g.alchemy.com/v2/<KEY>` will not match a log line that
+contains the key alone, or the URL with a different path, or the URL
+percent-encoded (`encodeURIComponent` leaves the alphanumeric key intact while
+encoding the separators, so whole-URL matching misses it entirely). So derive
+tokens: the raw secret, every long path segment, every query-parameter value,
+and the percent-encoded form of each. Replace longest-first so a shorter token
+cannot leave a fragment of a longer one behind.
+
+**3. A generic fallback pattern, so an endpoint added later is still covered.**
+Token matching only protects secrets that reached `Config.secrets`. A URL
+constructed at runtime, or a chain configured after the logger was built, would
+leak. A conservative pattern — a long opaque segment after `/v2/` or `/v3/`, or
+an `apikey=`/`api_key=` query value — catches Alchemy- and Infura-shaped keys
+that no token knows about. It only ever fires inside a URL-ish context, so it
+cannot redact ordinary prose.
+
+- [ ] **Step 1: Write the failing tests for `src/secrets.ts`**
+
+`test/unit/secrets.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { deriveSecretTokens, scrubSecrets, scrubUnknown } from '../../src/secrets.js';
+
+const KEY = 'aBcD1234efGh5678ijKl9012mnOp3456';
+const RPC_URL = `https://eth-mainnet.g.alchemy.com/v2/${KEY}`;
+const ES_KEY = 'ESKEY9876543210ABCDEF';
+
+describe('deriveSecretTokens', () => {
+  it('includes the raw secret', () => {
+    expect(deriveSecretTokens([RPC_URL])).toContain(RPC_URL);
+  });
+
+  it('extracts the key segment from the URL path', () => {
+    expect(deriveSecretTokens([RPC_URL])).toContain(KEY);
+  });
+
+  it('includes the percent-encoded raw secret', () => {
+    expect(deriveSecretTokens([RPC_URL])).toContain(encodeURIComponent(RPC_URL));
+  });
+
+  it('extracts a query-parameter value', () => {
+    const tokens = deriveSecretTokens([`https://api.example.com/v2/api?apikey=${ES_KEY}`]);
+    expect(tokens).toContain(ES_KEY);
+  });
+
+  it('keeps a bare non-URL secret', () => {
+    expect(deriveSecretTokens([ES_KEY])).toContain(ES_KEY);
+  });
+
+  // Redacting "v2" or "eth-mainnet" would mangle every log line in the project.
+  it('does not treat short or structural path segments as secrets', () => {
+    const tokens = deriveSecretTokens([RPC_URL]);
+    expect(tokens).not.toContain('v2');
+    expect(tokens).not.toContain('eth-mainnet.g.alchemy.com');
+  });
+
+  it('ignores empty and whitespace-only secrets', () => {
+    expect(deriveSecretTokens(['', '   '])).toEqual([]);
+  });
+
+  it('orders tokens longest first so a short token cannot fragment a longer one', () => {
+    const tokens = deriveSecretTokens([RPC_URL]);
+    const lengths = tokens.map((t) => t.length);
+    expect([...lengths].sort((a, b) => b - a)).toEqual(lengths);
+  });
+});
+
+describe('scrubSecrets', () => {
+  const tokens = deriveSecretTokens([RPC_URL, ES_KEY]);
+
+  it('removes a bare key', () => {
+    expect(scrubSecrets(`calling with ${KEY} now`, tokens)).not.toContain(KEY);
+  });
+
+  it('removes a full URL', () => {
+    const out = scrubSecrets(`GET ${RPC_URL} failed`, tokens);
+    expect(out).not.toContain(KEY);
+    expect(out).toContain('GET');
+    expect(out).toContain('failed');
+  });
+
+  it('removes the percent-encoded form', () => {
+    expect(scrubSecrets(encodeURIComponent(RPC_URL), tokens)).not.toContain(KEY);
+  });
+
+  it('removes every occurrence, not just the first', () => {
+    expect(scrubSecrets(`${KEY} and ${KEY} and ${KEY}`, tokens)).not.toContain(KEY);
+  });
+
+  // The fallback: this key was never in Config.secrets.
+  it('redacts an Alchemy-shaped key that no token knows about', () => {
+    const unknownKey = 'zZyYxXwW1122334455667788990011223';
+    const out = scrubSecrets(`https://base-mainnet.g.alchemy.com/v2/${unknownKey}`, tokens);
+    expect(out).not.toContain(unknownKey);
+  });
+
+  it('redacts an apikey query value that no token knows about', () => {
+    const unknownKey = 'QRSTUV1234567890abcdef';
+    const out = scrubSecrets(`https://api.etherscan.io/v2/api?apikey=${unknownKey}&x=1`, tokens);
+    expect(out).not.toContain(unknownKey);
+  });
+
+  it('leaves ordinary prose untouched', () => {
+    const prose = 'indexed 1200 transfers for chain 8453 in 4.2s';
+    expect(scrubSecrets(prose, tokens)).toBe(prose);
+  });
+
+  it('is a no-op with no tokens and no fallback match', () => {
+    expect(scrubSecrets('plain text', [])).toBe('plain text');
+  });
+});
+
+describe('scrubUnknown', () => {
+  const tokens = deriveSecretTokens([RPC_URL]);
+
+  it('scrubs an Error message', () => {
+    expect(scrubUnknown(new Error(`boom ${KEY}`), tokens)).not.toContain(KEY);
+  });
+
+  it('scrubs a non-Error value without throwing', () => {
+    expect(scrubUnknown(KEY, tokens)).not.toContain(KEY);
+    expect(scrubUnknown(null, tokens)).toBe('null');
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `npx vitest run test/unit/secrets.test.ts`
+Expected: FAIL — cannot resolve `../../src/secrets.js`.
+
+- [ ] **Step 3: Write `src/secrets.ts`**
+
+```ts
+/** Minimum length for a path segment or query value to be treated as a key. */
+const MIN_TOKEN_LENGTH = 16;
+
+const REDACTED = '[REDACTED]';
+
+/**
+ * Patterns for secrets no token knows about — a URL built at runtime, or a
+ * chain configured after the logger was constructed. Deliberately narrow: each
+ * only fires inside a URL-ish context, so ordinary prose is never touched.
+ */
+const FALLBACK_PATTERNS: Array<[RegExp, string]> = [
+  [/(\/v[23]\/)[A-Za-z0-9_-]{16,}/g, `$1${REDACTED}`],
+  [/((?:api[-_]?key|apikey|access[-_]?token)=)[A-Za-z0-9_.-]{8,}/gi, `$1${REDACTED}`],
+];
+
+/**
+ * Expands raw secrets into every form they might appear in.
+ *
+ * A secret stored as a full URL will not match a log line carrying only its key
+ * segment, or the same URL percent-encoded — `encodeURIComponent` leaves the
+ * alphanumeric key intact while encoding the separators around it. So the key
+ * itself becomes a token in its own right.
+ *
+ * Sorted longest-first: replacing a short token first could consume part of a
+ * longer one and leave the remainder in the output.
+ */
+export function deriveSecretTokens(rawSecrets: string[]): string[] {
+  const tokens = new Set<string>();
+
+  for (const raw of rawSecrets) {
+    const secret = raw?.trim();
+    if (!secret) continue;
+    tokens.add(secret);
+
+    let url: URL | undefined;
+    try {
+      url = new URL(secret);
+    } catch {
+      url = undefined;
+    }
+
+    if (url) {
+      for (const segment of url.pathname.split('/')) {
+        if (segment.length >= MIN_TOKEN_LENGTH) tokens.add(segment);
+      }
+      for (const value of url.searchParams.values()) {
+        if (value.length >= 8) tokens.add(value);
+      }
+    }
+  }
+
+  // Encoded forms, added after the loop so encoding is applied to every token.
+  for (const token of [...tokens]) {
+    const encoded = encodeURIComponent(token);
+    if (encoded !== token) tokens.add(encoded);
+  }
+
+  return [...tokens].sort((a, b) => b.length - a.length);
+}
+
+export function scrubSecrets(value: string, tokens: string[]): string {
+  let out = value;
+  for (const token of tokens) {
+    if (!token) continue;
+    out = out.split(token).join(REDACTED);
+  }
+  for (const [pattern, replacement] of FALLBACK_PATTERNS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
+export function scrubUnknown(value: unknown, tokens: string[]): string {
+  const text = value instanceof Error ? (value.stack ?? value.message) : String(value);
+  return scrubSecrets(text, tokens);
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `npx vitest run test/unit/secrets.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Write the failing tests for `src/logger.ts`**
+
+Every shape test comes in a pair. The first asserts the secret is absent from
+the **whole output string** — not that a named field equals a placeholder,
+because a path-based assertion passes while the same secret sits in a stack
+trace two levels down. The second is a **control**: the same shape logged with
+no secrets configured, asserting the raw key *is* present.
+
+The control is what makes the pair meaningful. Without it, a shape test passes
+just as happily when pino never serialized that shape at all — a nested `cause`
+that is silently dropped produces output with no secret in it and no scrubbing
+whatsoever. The control fails loudly in that case.
 
 `test/unit/logger.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
 import { Writable } from 'node:stream';
-import { createLogger, scrubSecrets } from '../../src/logger.js';
+import type { Logger } from 'pino';
+import { createLogger } from '../../src/logger.js';
+
+// A bare token, not a URL: the fallback patterns must not match it, or the
+// control assertions below could pass for the wrong reason.
+const SECRET = 'ESKEY9876543210ABCDEF';
 
 function capture(): { stream: Writable; output: () => string } {
   let buf = '';
@@ -538,92 +787,201 @@ function capture(): { stream: Writable; output: () => string } {
   return { stream, output: () => buf };
 }
 
-describe('scrubSecrets', () => {
-  it('replaces every occurrence of each secret', () => {
-    const out = scrubSecrets('call https://a.example/KEY failed for https://a.example/KEY', [
-      'https://a.example/KEY',
-    ]);
-    expect(out).toBe('call [redacted] failed for [redacted]');
-    expect(out).not.toContain('KEY');
+interface Shape {
+  name: string;
+  marker: string;
+  emit(log: Logger): void;
+}
+
+const shapes: Shape[] = [
+  {
+    name: 'top-level field',
+    marker: 'marker-toplevel',
+    emit: (log) => log.info({ endpoint: SECRET, note: 'marker-toplevel' }, 'call'),
+  },
+  {
+    name: 'error message',
+    marker: 'marker-errmsg',
+    emit: (log) => log.error(new Error(`request failed for ${SECRET} marker-errmsg`)),
+  },
+  {
+    name: 'stack trace',
+    marker: 'marker-stack',
+    emit: (log) => {
+      const err = new Error('boom');
+      err.stack = `Error: boom\n    at post (${SECRET}:1:1)\n    at marker-stack (x.ts:2:2)`;
+      log.error(err);
+    },
+  },
+  {
+    name: 'nested cause, three levels deep',
+    marker: 'marker-cause',
+    emit: (log) => {
+      const deepest = new Error(`deepest ${SECRET} marker-cause`);
+      const middle = new Error('middle', { cause: deepest });
+      log.error(new Error('outer', { cause: middle }));
+    },
+  },
+  {
+    name: 'array element',
+    marker: 'marker-array',
+    emit: (log) => log.info({ endpoints: ['first', SECRET, 'marker-array'] }, 'call'),
+  },
+  {
+    name: 'object key name',
+    marker: 'marker-keyname',
+    emit: (log) => log.info({ [SECRET]: 'marker-keyname' }, 'call'),
+  },
+  {
+    name: 'percent-encoded form',
+    marker: 'marker-encoded',
+    emit: (log) =>
+      log.info(
+        { encoded: encodeURIComponent(`https://x.example/v2/${SECRET}`), note: 'marker-encoded' },
+        'call',
+      ),
+  },
+];
+
+describe.each(shapes)('secret in $name', ({ marker, emit }) => {
+  it('is absent from the serialized output', () => {
+    const { stream, output } = capture();
+    emit(createLogger([SECRET], stream));
+    expect(output()).not.toContain(SECRET);
+    // Proves the shape actually reached the output, so the assertion above is
+    // about scrubbing rather than about pino dropping the field.
+    expect(output()).toContain(marker);
   });
 
-  it('ignores empty secrets so it cannot redact everything', () => {
-    expect(scrubSecrets('hello', [''])).toBe('hello');
+  it('control: appears unredacted when no secret is configured', () => {
+    const { stream, output } = capture();
+    emit(createLogger([], stream));
+    expect(output()).toContain(SECRET);
+    expect(output()).toContain(marker);
   });
 });
 
 describe('createLogger', () => {
-  it('scrubs an RPC URL embedded in an error message', () => {
+  it('derives tokens from a raw URL, so the bare key is scrubbed too', () => {
+    const key = 'aBcD1234efGh5678ijKl9012mnOp3456';
     const { stream, output } = capture();
-    const log = createLogger(['https://eth.example/SUPERSECRET'], stream);
-    log.error(
-      new Error('HTTP request failed: https://eth.example/SUPERSECRET returned 429'),
-      'rpc failure',
-    );
-    expect(output()).not.toContain('SUPERSECRET');
-    expect(output()).toContain('[redacted]');
+    const log = createLogger([`https://eth-mainnet.g.alchemy.com/v2/${key}`], stream);
+    log.info({ note: `bare key ${key} here` }, 'call');
+    expect(output()).not.toContain(key);
   });
 
-  it('scrubs a secret appearing in a logged object property', () => {
+  it('still logs the message and level', () => {
     const { stream, output } = capture();
-    const log = createLogger(['ESKEY'], stream);
-    log.info({ url: 'https://api.etherscan.io/v2/api?apikey=ESKEY' }, 'explorer call');
-    expect(output()).not.toContain('ESKEY');
+    createLogger([SECRET], stream).info('hello world');
+    expect(output()).toContain('hello world');
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 6: Run the tests to verify they fail**
 
 Run: `npx vitest run test/unit/logger.test.ts`
 Expected: FAIL — cannot resolve `../../src/logger.js`.
 
-- [ ] **Step 3: Write `src/logger.ts`**
+- [ ] **Step 7: Write `src/logger.ts`**
 
-Scrubbing happens on the serialized line, which is the only place guaranteed to catch secrets in messages, stacks, and nested properties alike.
+`errWithCause` matters: the default error serializer does not walk the `cause`
+chain, so a secret nested inside one would never reach the output — and the
+control test in the pair above is what catches that.
 
 ```ts
 import { Writable } from 'node:stream';
 import pino, { type Logger } from 'pino';
+import { deriveSecretTokens, scrubSecrets } from './secrets.js';
 
-export function scrubSecrets(value: string, secrets: string[]): string {
-  let out = value;
-  for (const secret of secrets) {
-    if (!secret) continue;
-    out = out.split(secret).join('[redacted]');
-  }
-  return out;
-}
-
-export function createLogger(secrets: string[], stream?: NodeJS.WritableStream): Logger {
+/**
+ * A pino logger whose every serialized line is scrubbed.
+ *
+ * The scrub sits on the stream rather than in `redact` paths, because a secret
+ * can arrive inside an error message, a stack trace, a cause several levels
+ * down, an array element, or an object key name — none of which a path can
+ * name. The stream is the one place they all pass through.
+ */
+export function createLogger(
+  rawSecrets: string[],
+  stream?: NodeJS.WritableStream,
+): Logger {
+  const tokens = deriveSecretTokens(rawSecrets);
   const target = stream ?? process.stdout;
+
   const scrubbing = new Writable({
     write(chunk, _enc, cb) {
-      target.write(scrubSecrets(String(chunk), secrets));
+      target.write(scrubSecrets(String(chunk), tokens));
       cb();
     },
   });
+
   return pino(
-    { level: process.env.LOG_LEVEL ?? 'info', base: undefined },
+    {
+      level: process.env.LOG_LEVEL ?? 'info',
+      base: undefined,
+      // The default err serializer stops at the top-level error.
+      serializers: { err: pino.stdSerializers.errWithCause },
+    },
     scrubbing,
   );
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 8: Run the tests to verify they pass**
 
-Run: `npx vitest run test/unit/logger.test.ts`
-Expected: PASS, 4 tests.
+Run: `npx vitest run test/unit/logger.test.ts && npm run typecheck`
+Expected: PASS — 7 shape pairs (14 tests) plus 2.
 
-- [ ] **Step 5: Commit**
+If a control test fails, the shape is not reaching pino's output at all; fix the
+serializer configuration rather than deleting the shape.
+
+- [ ] **Step 9: Retrofit the probe script to the shared implementation**
+
+`scripts/verify-archive-probes.ts` currently carries its own local `scrub()` and
+`scrubUnknown()`. Delete both and import from `src/secrets.js`, deriving tokens
+once from `config.secrets`:
+
+```ts
+import { deriveSecretTokens, scrubUnknown } from '../src/secrets.js';
+
+const tokens = deriveSecretTokens(config.secrets);
+// ... and at the single call site:
+detail = scrubUnknown(err, tokens);
+```
+
+One implementation, not two. Verify no local scrub helper remains:
+
+Run: `grep -n "function scrub" scripts/verify-archive-probes.ts`
+Expected: no output.
+
+- [ ] **Step 10: Verify the gate still passes**
+
+Run: `npm run verify:probes`
+Expected: `3 PASS, 0 FAIL, 0 INCONCLUSIVE`, exit 0. Report the exact output.
+
+- [ ] **Step 11: Run the full suite and commit**
+
+Run: `npm test && npm run typecheck`
 
 ```bash
-git add src/logger.ts test/unit/logger.test.ts
-git commit -m "feat: pino logger that scrubs secrets from serialized output
+git add src/secrets.ts src/logger.ts scripts/verify-archive-probes.ts test/unit/secrets.test.ts test/unit/logger.test.ts
+git commit -m "feat: secret scrubbing at serialization, shared by logger and scripts
 
-Property-level redaction is not enough: viem puts the RPC URL, which
-carries the API key, inside error messages. Scrubbing the serialized
-line covers messages, stacks, and nested properties.
+Pino redact paths cannot reach a secret inside err.message, a stack
+trace, a cause nested several levels down, an array element, or an
+object key name — which is where viem actually puts the RPC URL. The
+scrub sits on the stream instead, the one point every shape passes
+through.
+
+Tokens are derived from the key value rather than the whole URL:
+encodeURIComponent leaves an alphanumeric key intact while encoding the
+separators, so whole-URL matching misses the encoded form entirely. A
+narrow fallback pattern covers keys that never reached Config.secrets.
+
+Each shape test is paired with a control asserting the secret appears
+when no secret is configured, so a shape pino silently drops cannot
+masquerade as a shape successfully scrubbed.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
