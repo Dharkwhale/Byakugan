@@ -24,6 +24,6 @@
     "requestsPerSecond": 25,
     "confirmations": 30,
     "blockFetchThreshold": 3,
-    "archiveProbe": { "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", "block": 100000 }
+    "archiveProbe": { "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", "block": 30000000 }
   }
 }

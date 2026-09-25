@@ -10,8 +10,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
-    "index": "tsx src/cli/index.ts",
-    "migrate": "tsx src/db/migrate.ts"
+    "index": "node --env-file-if-exists=.env --import tsx src/cli/index.ts",
+    "migrate": "node --env-file-if-exists=.env --import tsx src/db/migrate.ts",
+    "verify:probes": "node --env-file-if-exists=.env --import tsx scripts/verify-archive-probes.ts"
   },
   "keywords": [],
   "author": "",
