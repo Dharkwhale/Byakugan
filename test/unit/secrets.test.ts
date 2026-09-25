@@ -362,6 +362,9 @@ describe('scrubSecrets — property test across hostile Unicode filler', () => {
   // BMP look-alikes/length-changers under case-folding, combining marks,
   // astral surrogate pairs (emoji + a mathematical-alphanumeric character),
   // RTL control marks, and plain ASCII — the categories the finding named.
+  // Written as explicit \u escapes (rather than the literal glyphs) so the
+  // combining marks and RTL controls stay legible in source instead of
+  // silently attaching to whatever character precedes them in the editor.
   const ATOMS = [
     'İ', 'ß', 'ſ', 'K', // U+0130, U+00DF, U+017F, U+212A (Kelvin sign)
     '̀', '́', '̈', 'ͯ', // combining marks
@@ -409,20 +412,33 @@ describe('scrubSecrets — property test across hostile Unicode filler', () => {
     };
   }
 
-  it('leaves no 4+ character prefix of the spliced secret in the output, across hundreds of randomized hostile-Unicode splices', () => {
+  // Threshold and filler size are load-bearing, not arbitrary: the İ-leak
+  // length equals the number of İ characters preceding the secret, and with
+  // too few filler atoms the probability of a run long enough to clear a
+  // higher threshold collapses. A round-2 version of this test asserted
+  // len >= 4 with a filler cap of 12 atoms (only ~1/22 of them İ) — measured
+  // afterward, against a deliberately reconstructed pre-fix
+  // (toLowerCase-based) implementation, at 0 failures out of 300, because
+  // the maximum İ run across all 300 seeded iterations never reached 4. The
+  // same generator at len >= 1 caught the same reconstructed bug 65/300
+  // times. len >= 1 with a 40-atom filler cap and 500 iterations was
+  // measured (against the current, fixed implementation) to produce zero
+  // false positives before adopting it here.
+  it('leaves no 1+ character prefix of the spliced secret in the output, across hundreds of randomized hostile-Unicode splices', () => {
     const SEED = 0xc0ffee;
-    const ITERATIONS = 300;
+    const ITERATIONS = 500;
+    const FILLER_MAX = 40;
     const rand = mulberry32(SEED);
 
     for (let i = 0; i < ITERATIONS; i++) {
-      const before = randomFiller(rand, Math.floor(rand() * 12));
-      const after = randomFiller(rand, Math.floor(rand() * 12));
+      const before = randomFiller(rand, Math.floor(rand() * FILLER_MAX));
+      const after = randomFiller(rand, Math.floor(rand() * FILLER_MAX));
       const { tokens, spliced } = pickVariant(rand);
 
       const text = `${before}${spliced}${after}`;
       const out = scrubSecrets(text, tokens);
 
-      for (let len = 4; len <= spliced.length; len++) {
+      for (let len = 1; len <= spliced.length; len++) {
         const prefix = spliced.slice(0, len);
         if (out.includes(prefix)) {
           throw new Error(

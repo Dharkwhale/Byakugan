@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Writable } from 'node:stream';
+import { Writable, PassThrough } from 'node:stream';
 import pino, { type Logger } from 'pino';
 import { createLogger, createScrubbingStream } from '../../src/logger.js';
 
@@ -281,5 +281,22 @@ describe('createScrubbingStream', () => {
 
     expect(afterFirst).toBeLessThanOrEqual(before + 1);
     expect(afterSecond).toBe(afterFirst);
+  });
+
+  // Minor: the stdout test above only proves "at most one" — it can pass
+  // vacuously if stdout was already guarded by an earlier test in this file,
+  // or already carried an unrelated listener, since it never pins the
+  // starting count at zero. A fresh stream with a known-zero starting count
+  // proves both halves: a listener IS attached (not zero, relying only on
+  // the manual EPIPE repro elsewhere), and a second call adds no more.
+  it('attaches exactly one error listener to a fresh stream via createLogger, and no more on a second call', () => {
+    const fresh = new PassThrough();
+    expect(fresh.listenerCount('error')).toBe(0);
+
+    createLogger(['secret-a'], fresh);
+    expect(fresh.listenerCount('error')).toBe(1);
+
+    createLogger(['secret-b'], fresh);
+    expect(fresh.listenerCount('error')).toBe(1);
   });
 });
