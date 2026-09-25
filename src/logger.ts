@@ -23,17 +23,38 @@ export function createLogger(
   const tokens = deriveSecretTokens(rawSecrets);
   const target = stream ?? process.stdout;
 
-  // A write failure is reported through the callback path below, which is
-  // the correct channel (it also drives backpressure). Node additionally
-  // auto-emits 'error' on whichever stream's own write callback received the
-  // error — on `target` itself, independent of anything we do — and on
-  // `scrubbing` once we forward that error into its own callback. Neither
-  // emission has a listener otherwise, and an unlistened 'error' event
-  // crashes the process; that would turn a single failed write (or an EPIPE
-  // on a closed stdout) into a process-ending exception, which is worse than
-  // the silent drop this fix replaces. Swallow both here — the callback path
-  // is the real signal.
-  target.on('error', () => {});
+  // pino has no channel for a destination-stream write error — it never
+  // reads the callback we hand `target.write()` below, so a failure there
+  // would otherwise vanish. Report the first one as a process warning
+  // instead (scrubbed: the failure reason can itself embed a secret, e.g. a
+  // viem error carrying the request URL). Gated on `hasWarned` so a
+  // persistently failing target cannot spam.
+  let hasWarned = false;
+  function reportWriteFailure(err: unknown): void {
+    if (hasWarned) return;
+    hasWarned = true;
+    const message = err instanceof Error ? err.message : String(err);
+    process.emitWarning(
+      `byakugan logger: write to log destination failed: ${scrubSecrets(message, tokens)}`,
+    );
+  }
+
+  // Node auto-emits 'error' on whichever stream's own write callback
+  // receives an error; with no listener, that crashes the whole process —
+  // worse than the dropped line this fix is meant to prevent. stdout/stderr
+  // already tolerate EPIPE without this, and the synchronous-throw catch
+  // below covers their other escape path, so leave them alone. For any
+  // other stream, attach at most one no-op listener: unconditionally
+  // attaching would leak a new listener on every `createLogger` call against
+  // a stream shared across calls (a real risk for a process-global-like
+  // stream), and could silence errors unrelated to this logger.
+  if (
+    target !== process.stdout &&
+    target !== process.stderr &&
+    target.listenerCount?.('error') === 0
+  ) {
+    target.on('error', () => {});
+  }
 
   const scrubbing = new Writable({
     write(chunk, _enc, cb) {
@@ -41,17 +62,24 @@ export function createLogger(
       try {
         line = scrubSecrets(String(chunk), tokens);
       } catch (err) {
+        reportWriteFailure(err);
         cb(err as Error);
         return;
       }
       try {
-        // Deferring `cb` until the underlying write's callback fires gives
-        // real backpressure (a slow/stalled target no longer looks ready),
-        // and surfaces a write error instead of silently dropping the line.
-        target.write(line, (err) => cb(err ?? null));
+        // Serializes this stream's writes to the target's pace, and lets a
+        // synchronous throw (e.g. EPIPE on a closed stdout) be caught below
+        // instead of escaping into business code via log.info()/log.error().
+        // This is NOT full backpressure: pino never reads write()'s boolean
+        // return, so a persistently slow (not failing) target still buffers
+        // inside this wrapper rather than blocking the caller. A write
+        // failure is not silently dropped — see `reportWriteFailure` above.
+        target.write(line, (err) => {
+          if (err) reportWriteFailure(err);
+          cb(err ?? null);
+        });
       } catch (err) {
-        // A synchronous throw (e.g. EPIPE on a closed stdout) must not
-        // escape into business code via log.info()/log.error().
+        reportWriteFailure(err);
         cb(err as Error);
       }
     },

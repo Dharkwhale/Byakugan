@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Writable } from 'node:stream';
 import pino, { type Logger } from 'pino';
 import { createLogger } from '../../src/logger.js';
@@ -125,8 +125,13 @@ describe('createLogger', () => {
 
 // Important 5: a failing destination must not vanish silently, and must not
 // turn into an exception in business code (e.g. EPIPE on a closed stdout).
+// pino itself never reads the callback passed to `target.write()`, so the
+// only real, externally-observable signal of a write failure is the
+// `process.emitWarning` call in `reportWriteFailure` (tested below). The
+// internal-stream check here confirms the write callback plumbing itself
+// forwards the error correctly, which `reportWriteFailure` depends on.
 describe('createLogger — write failure handling', () => {
-  it('surfaces a write callback error instead of dropping it silently', () => {
+  it('forwards a write callback error into the wrapper stream instead of dropping it', () => {
     const failing = new Writable({
       write(_chunk, _enc, cb) {
         cb(new Error('boom-write'));
@@ -160,5 +165,40 @@ describe('createLogger — write failure handling', () => {
     });
     const log = createLogger([], throwing);
     expect(() => log.info('hello')).not.toThrow();
+  });
+
+  it('emits a scrubbed process warning on the first write failure, and only once', async () => {
+    const secret = 'WARNSECRET1234567890';
+    const failing = new Writable({
+      write(_chunk, _enc, cb) {
+        cb(new Error(`boom ${secret}`));
+      },
+    });
+    failing.on('error', () => {});
+
+    const warnings: string[] = [];
+    const spy = vi.spyOn(process, 'emitWarning').mockImplementation((msg) => {
+      warnings.push(String(msg));
+      return undefined as never;
+    });
+
+    try {
+      const log = createLogger([secret], failing);
+      log.info('first');
+      log.info('second');
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(warnings.length).toBe(1);
+      expect(warnings[0]).not.toContain(secret);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('does not attach a swallowing error listener to process.stdout (listener leak)', () => {
+    const before = process.stdout.listenerCount('error');
+    createLogger(['x']); // no explicit stream -> defaults to process.stdout
+    createLogger(['y']);
+    expect(process.stdout.listenerCount('error')).toBe(before);
   });
 });

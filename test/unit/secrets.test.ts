@@ -34,14 +34,32 @@ describe('deriveSecretTokens', () => {
     expect(tokens).not.toContain('eth-mainnet.g.alchemy.com');
   });
 
+  // "v2" (2 chars) is far below MIN_TOKEN_LENGTH (8) and doesn't actually
+  // probe the lowered constant. A 7-character structural segment is the
+  // realistic near-miss: one character short of the minimum, and a name
+  // ("mainnet") this project's own RPC URLs plausibly contain.
+  it('does not harvest a 7-character structural path segment just under the minimum', () => {
+    const tokens = deriveSecretTokens(['https://mainnet.example.com/v2/api']);
+    expect(tokens).not.toContain('mainnet');
+  });
+
   it('ignores empty and whitespace-only secrets', () => {
     expect(deriveSecretTokens(['', '   '])).toEqual([]);
   });
+});
 
-  it('orders tokens longest first so a short token cannot fragment a longer one', () => {
-    const tokens = deriveSecretTokens([RPC_URL]);
-    const lengths = tokens.map((t) => t.length);
-    expect([...lengths].sort((a, b) => b - a)).toEqual(lengths);
+describe('scrubSecrets — token order does not matter', () => {
+  // deriveSecretTokens returns tokens longest-first as a courtesy, but
+  // scrubSecrets must not depend on that: it finds each token's occurrences
+  // independently and only merges afterward. Passing tokens in the WRONG
+  // order (shortest first) is the behavioural version of the old "ordering"
+  // test, which only checked deriveSecretTokens's own output and would pass
+  // even if scrubSecrets silently required sorted input.
+  it('fully redacts a secret even when a token that could fragment it is passed first', () => {
+    const shortToken = KEY.slice(0, 8); // a prefix of KEY, shorter than KEY itself
+    const out = scrubSecrets(`calling with ${KEY} now`, [shortToken, KEY]);
+    expect(out).not.toContain(KEY);
+    expect(out).not.toContain(KEY.slice(8)); // no fragment of the non-shared remainder
   });
 });
 
@@ -238,5 +256,53 @@ describe('scrubSecrets — case sensitivity', () => {
     const tokens = deriveSecretTokens([KEY]);
     const folded = KEY.toLowerCase();
     expect(scrubSecrets(`calling with ${folded} now`, tokens)).not.toContain(folded);
+  });
+});
+
+// Critical (new): findTokenRanges must never compute match indices on a
+// case-folded copy of the text. toLowerCase() changes the length of U+0130
+// İ (it becomes "i" + U+0307, two UTF-16 code units instead of one), which
+// skews every index after an İ relative to the original string — leaking a
+// prefix of whatever secret follows and eating unrelated trailing text
+// instead. On-chain metadata (collection/token names) is attacker-supplied,
+// so this is reachable by anyone who can mint a token whose name contains İ.
+describe('scrubSecrets — İ (U+0130) index skew', () => {
+  const skewKey = 'aBcDeF0123456789KEYTAIL';
+
+  it.each([1, 4, 16])('does not leak the key when %i İ character(s) precede it', (n) => {
+    const tokens = deriveSecretTokens([skewKey]);
+    const prefix = 'İ'.repeat(n);
+    const text = `${prefix} url=${skewKey}trailing-text-here`;
+    const out = scrubSecrets(text, tokens);
+    expect(out).not.toContain(skewKey);
+    // Check every prefix of the key, not just the whole key: a whole-key
+    // check passes even while e.g. the first 16 of 23 characters leak.
+    for (let len = 4; len <= skewKey.length; len += 4) {
+      expect(out).not.toContain(skewKey.slice(0, len));
+    }
+  });
+
+  it('leaves ordinary Turkish text unchanged when no secret is present', () => {
+    const turkish = "İstanbul için İzmir'den İnternet üzerinden istek gönderildi";
+    expect(scrubSecrets(turkish, [])).toBe(turkish);
+  });
+});
+
+// Important (new): Config.secrets holds operator-supplied RPC URLs. A
+// benign query param on one of them (e.g. ?network=arbitrum-one) must not
+// become a project-wide redaction token just because it happens to be long
+// enough — only a credential-shaped param name should cause harvesting.
+describe('deriveSecretTokens — query-value harvesting restricted to credential-named params', () => {
+  it('does not harvest a non-credential query value', () => {
+    const tokens = deriveSecretTokens([
+      'https://rpc.example.com/v2/aBcD1234?network=arbitrum-one',
+    ]);
+    expect(tokens).not.toContain('arbitrum-one');
+  });
+
+  it('still harvests a credential-named query value', () => {
+    const value = 'CREDVALUE1234567890';
+    const tokens = deriveSecretTokens([`https://rpc.example.com/v2/api?apikey=${value}`]);
+    expect(tokens).toContain(value);
   });
 });

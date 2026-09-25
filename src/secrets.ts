@@ -27,11 +27,17 @@ function redactPathKey(text: string): string {
 /**
  * Only credential-shaped query param names. Deliberately excludes bare `key`
  * and bare `token` — this project logs `tokenId` constantly, and a bare
- * `token=` rule would redact it on every line.
+ * `token=` rule would redact it on every line. Shared with
+ * `deriveSecretTokens`'s query-value harvesting, so both use one definition
+ * of "looks like a credential param name".
  */
+const CREDENTIAL_PARAM_NAME_ALTERNATION =
+  'api[-_]?key|apikey|dkey|access[-_]?token|auth[-_]?token|secret';
+const CREDENTIAL_PARAM_NAME_RE = new RegExp(`^(?:${CREDENTIAL_PARAM_NAME_ALTERNATION})$`, 'i');
+
 function redactQueryKey(text: string): string {
   return text.replace(
-    /((?:api[-_]?key|apikey|dkey|access[-_]?token|auth[-_]?token|secret)=)[A-Za-z0-9_.-]{8,}/gi,
+    new RegExp(`((?:${CREDENTIAL_PARAM_NAME_ALTERNATION})=)[A-Za-z0-9_.-]{8,}`, 'gi'),
     `$1${REDACTED}`,
   );
 }
@@ -65,9 +71,9 @@ const FALLBACK_PASSES: Array<(text: string) => string> = [
  * byte sequence once JSON.stringify has run). So every one of those forms
  * becomes a token in its own right.
  *
- * Sorted longest-first: replacing a short token first could consume part of a
- * longer one and leave the remainder in the output. `scrubSecrets` re-sorts
- * on its own input too, so this ordering is a courtesy, not a dependency.
+ * Returned longest-first for readability when inspected directly; this is a
+ * courtesy, not a dependency — `scrubSecrets` finds and merges match ranges
+ * per token independently of input order (see its own comment).
  */
 export function deriveSecretTokens(rawSecrets: string[]): string[] {
   const tokens = new Set<string>();
@@ -88,8 +94,15 @@ export function deriveSecretTokens(rawSecrets: string[]): string[] {
       for (const segment of url.pathname.split('/')) {
         if (segment.length >= MIN_TOKEN_LENGTH) tokens.add(segment);
       }
-      for (const value of url.searchParams.values()) {
-        if (value.length >= MIN_TOKEN_LENGTH) tokens.add(value);
+      // Only harvest a query value when its param name looks credential-shaped.
+      // Config.secrets holds operator-supplied RPC URLs; a benign param like
+      // `?network=arbitrum-one` is not a secret, and turning it into a
+      // project-wide redaction token would quietly corrupt every log line
+      // that mentions that network.
+      for (const [paramName, value] of url.searchParams) {
+        if (value.length >= MIN_TOKEN_LENGTH && CREDENTIAL_PARAM_NAME_RE.test(paramName)) {
+          tokens.add(value);
+        }
       }
       // Infura-style basic auth: https://:SECRET@host/... or https://user:SECRET@host/...
       if (url.username) tokens.add(url.username);
@@ -114,30 +127,47 @@ interface Range {
   end: number;
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * Finds every occurrence of every token, case-insensitively, allowing
- * occurrences to overlap each other. Overlap matters: two configured secrets
- * that happen to share a run of characters can both occur in the same
- * stretch of text (e.g. adjacent path segments), and each occurrence must be
- * found independently of whether another token's match already claimed part
- * of that span.
+ * Finds every occurrence of a single token, case-insensitively, allowing
+ * occurrences to overlap each other (see the stepping note below — a
+ * self-overlapping token, and two different tokens overlapping each other in
+ * the source text, both need this).
+ *
+ * Matches against the ORIGINAL string, never a case-folded copy. Computing
+ * indices on `text.toLowerCase()` and then slicing the original is unsound:
+ * `toLowerCase()` changes the length of some BMP characters — U+0130 `İ`
+ * becomes two UTF-16 code units, `i` + U+0307 — so every index computed on
+ * the folded copy is skewed relative to the original once an İ has appeared
+ * before it. That skew silently redacts the wrong span: a prefix of the real
+ * secret survives and unrelated trailing text gets eaten instead, and each
+ * additional İ widens the leak by one more character. A case-insensitive
+ * regex run directly on the original string has no such skew, because it
+ * never produces a second copy with different offsets.
+ *
+ * Latent cost note: this is superlinear in the number of tokens when tokens
+ * are highly self-similar (each token's own `from = index + 1` stepping
+ * rescans overlapping tokens' territory) — measured at ~1.5s for 30
+ * near-duplicate tokens over ~100KB of text. Real provider keys are
+ * independently random, not self-similar, so this is a latent characteristic
+ * rather than a practical concern for this project's actual secrets.
  */
-function findTokenRanges(text: string, tokens: string[]): Range[] {
+function findTokenRanges(text: string, token: string): Range[] {
   const ranges: Range[] = [];
-  const lower = text.toLowerCase();
-
-  for (const token of tokens) {
-    if (!token) continue;
-    const needle = token.toLowerCase();
-    let from = 0;
-    while (from <= lower.length - needle.length) {
-      const idx = lower.indexOf(needle, from);
-      if (idx === -1) break;
-      ranges.push({ start: idx, end: idx + needle.length });
-      from = idx + 1;
-    }
+  const re = new RegExp(escapeRegExp(token), 'gi');
+  let from = 0;
+  for (;;) {
+    re.lastIndex = from;
+    const match = re.exec(text);
+    if (!match) break;
+    ranges.push({ start: match.index, end: match.index + match[0].length });
+    // Step by one, not by match length: stepping by length would miss a
+    // self-overlapping occurrence of the same token.
+    from = match.index + 1;
   }
-
   return ranges;
 }
 
@@ -172,11 +202,18 @@ function mergeRanges(ranges: Range[]): Range[] {
  * either token can survive.
  */
 export function scrubSecrets(value: string, tokens: string[]): string {
-  const usable = [...tokens].filter((t) => t.length > 0).sort((a, b) => b.length - a.length);
+  // Order does not matter: each token's occurrences are found independently
+  // (against the original string) and only merged afterward, so an unsorted
+  // token list is handled exactly the same as a sorted one.
+  const usable = tokens.filter((t) => t.length > 0);
 
   let out = value;
   if (usable.length > 0) {
-    const ranges = mergeRanges(findTokenRanges(out, usable));
+    const allRanges: Range[] = [];
+    for (const token of usable) {
+      allRanges.push(...findTokenRanges(out, token));
+    }
+    const ranges = mergeRanges(allRanges);
     if (ranges.length > 0) {
       let result = '';
       let cursor = 0;
