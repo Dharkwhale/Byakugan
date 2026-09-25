@@ -25,21 +25,52 @@ function redactPathKey(text: string): string {
 }
 
 /**
- * Only credential-shaped query param names. Deliberately excludes bare `key`
- * and bare `token` — this project logs `tokenId` constantly, and a bare
- * `token=` rule would redact it on every line. Shared with
- * `deriveSecretTokens`'s query-value harvesting, so both use one definition
- * of "looks like a credential param name".
+ * One auditable table of credential-shaped query param (name pattern, value
+ * pattern) pairs — the single source of truth for "looks like a credential
+ * param", shared by `deriveSecretTokens`'s query-value harvesting and the
+ * `redactQueryKey` fallback below. Before this table existed, harvesting and
+ * the fallback each carried their own copy of the name list and drifted:
+ * `?x-api-key=`/`?api_secret=` were redacted by the fallback but never
+ * became tokens, and bare `?token=`/`?password=` values were harvested by
+ * neither. A single table makes the covered set — and any future gap in
+ * it — readable at a glance instead of implicit in two hand-copied regexes.
+ *
+ * Bare `token` (and `secret`, `password`) is safe here because this is a
+ * param-NAME match requiring the name to equal `token` exactly (anchored via
+ * `isCredentialParamName`, and via the `=` boundary in `redactQueryKey`) —
+ * it does not match `tokenId=` or `token_id=`, which this project logs
+ * constantly.
  */
-const CREDENTIAL_PARAM_NAME_ALTERNATION =
-  'api[-_]?key|apikey|dkey|access[-_]?token|auth[-_]?token|secret';
-const CREDENTIAL_PARAM_NAME_RE = new RegExp(`^(?:${CREDENTIAL_PARAM_NAME_ALTERNATION})$`, 'i');
+const CREDENTIAL_QUERY_PARAMS: ReadonlyArray<{ name: string; value: string }> = [
+  { name: 'api[-_]?key', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'x-api-key', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'apikey', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'api[-_]?secret', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'dkey', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'access[-_]?token', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'auth[-_]?token', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'token', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'secret', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'password', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'passwd', value: '[A-Za-z0-9_.-]{8,}' },
+  { name: 'pwd', value: '[A-Za-z0-9_.-]{8,}' },
+];
+
+const CREDENTIAL_PARAM_NAME_RE = new RegExp(
+  `^(?:${CREDENTIAL_QUERY_PARAMS.map((p) => p.name).join('|')})$`,
+  'i',
+);
+
+function isCredentialParamName(name: string): boolean {
+  return CREDENTIAL_PARAM_NAME_RE.test(name);
+}
 
 function redactQueryKey(text: string): string {
-  return text.replace(
-    new RegExp(`((?:${CREDENTIAL_PARAM_NAME_ALTERNATION})=)[A-Za-z0-9_.-]{8,}`, 'gi'),
-    `$1${REDACTED}`,
-  );
+  let out = text;
+  for (const { name, value } of CREDENTIAL_QUERY_PARAMS) {
+    out = out.replace(new RegExp(`((?:${name})=)(?:${value})`, 'gi'), `$1${REDACTED}`);
+  }
+  return out;
 }
 
 /** Infura-style basic-auth credentials: https://:SECRET@host/... */
@@ -100,7 +131,7 @@ export function deriveSecretTokens(rawSecrets: string[]): string[] {
       // project-wide redaction token would quietly corrupt every log line
       // that mentions that network.
       for (const [paramName, value] of url.searchParams) {
-        if (value.length >= MIN_TOKEN_LENGTH && CREDENTIAL_PARAM_NAME_RE.test(paramName)) {
+        if (value.length >= MIN_TOKEN_LENGTH && isCredentialParamName(paramName)) {
           tokens.add(value);
         }
       }
@@ -156,6 +187,11 @@ function escapeRegExp(s: string): string {
  * rather than a practical concern for this project's actual secrets.
  */
 function findTokenRanges(text: string, token: string): Range[] {
+  // Defensive: scrubSecrets already filters empty tokens before calling
+  // here, but an empty token fed directly to this function (e.g. if that
+  // filter is ever removed) would otherwise match at every position and
+  // inject a spurious [REDACTED] at index 0.
+  if (!token) return [];
   const ranges: Range[] = [];
   const re = new RegExp(escapeRegExp(token), 'gi');
   let from = 0;

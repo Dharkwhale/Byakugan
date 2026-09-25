@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Writable } from 'node:stream';
 import pino, { type Logger } from 'pino';
-import { createLogger } from '../../src/logger.js';
+import { createLogger, createScrubbingStream } from '../../src/logger.js';
 
 /**
  * `createLogger`'s public surface only returns a `Logger`, so the internal
@@ -166,15 +166,35 @@ describe('createLogger — write failure handling', () => {
     const log = createLogger([], throwing);
     expect(() => log.info('hello')).not.toThrow();
   });
+});
 
-  it('emits a scrubbed process warning on the first write failure, and only once', async () => {
+// Round 3: the stream plumbing is the least verifiable part of the module by
+// inspection alone, and it is where the round-2 EPIPE regression and the
+// write-failure double-throw both landed. Tested directly here rather than
+// only indirectly through createLogger + pino.
+describe('createScrubbingStream', () => {
+  it('passes scrubbed content through to the target on a successful write', () => {
+    let received = '';
+    const target = new Writable({
+      write(chunk, _enc, cb) {
+        received += String(chunk);
+        cb();
+      },
+    });
+    const scrubbing = createScrubbingStream(target, ['SECRETVALUE12345']);
+    scrubbing.write('note: SECRETVALUE12345 here\n');
+    expect(received).not.toContain('SECRETVALUE12345');
+    expect(received).toContain('note:');
+  });
+
+  it('triggers exactly one process warning when the target write fails repeatedly', async () => {
     const secret = 'WARNSECRET1234567890';
-    const failing = new Writable({
+    const target = new Writable({
       write(_chunk, _enc, cb) {
         cb(new Error(`boom ${secret}`));
       },
     });
-    failing.on('error', () => {});
+    target.on('error', () => {});
 
     const warnings: string[] = [];
     const spy = vi.spyOn(process, 'emitWarning').mockImplementation((msg) => {
@@ -183,9 +203,9 @@ describe('createLogger — write failure handling', () => {
     });
 
     try {
-      const log = createLogger([secret], failing);
-      log.info('first');
-      log.info('second');
+      const scrubbing = createScrubbingStream(target, [secret]);
+      scrubbing.write('first\n');
+      scrubbing.write('second\n');
       await new Promise((resolve) => setImmediate(resolve));
 
       expect(warnings.length).toBe(1);
@@ -195,10 +215,71 @@ describe('createLogger — write failure handling', () => {
     }
   });
 
-  it('does not attach a swallowing error listener to process.stdout (listener leak)', () => {
+  it('does not throw when the target write throws synchronously', () => {
+    const target = new Writable({
+      write() {
+        throw new Error('sync-boom');
+      },
+    });
+    const scrubbing = createScrubbingStream(target, []);
+    expect(() => scrubbing.write('hello')).not.toThrow();
+  });
+
+  // Important: the write failure originally reported via a scrubbed message
+  // can itself throw while scrubbing that message (a pathological token) —
+  // reportWriteFailure must never propagate that, or the very function that
+  // exists to keep failures out of business code becomes the thing that
+  // leaks one in.
+  it('does not throw when scrubbing the write-failure message itself throws', () => {
+    const pathologicalTokens = [null as unknown as string];
+    const target = new Writable({
+      write(_chunk, _enc, cb) {
+        cb();
+      },
+    });
+    const scrubbing = createScrubbingStream(target, pathologicalTokens);
+    expect(() => scrubbing.write('line with problems')).not.toThrow();
+  });
+
+  it('attaches at most one error listener to the same target across repeated calls', () => {
+    const target = new Writable({
+      write(_chunk, _enc, cb) {
+        cb();
+      },
+    });
+    expect(target.listenerCount('error')).toBe(0);
+    createScrubbingStream(target, []);
+    createScrubbingStream(target, []);
+    createScrubbingStream(target, []);
+    expect(target.listenerCount('error')).toBe(1);
+  });
+
+  it('suppresses a fatal, unlistened error on the target without throwing', () => {
+    const target = new Writable({
+      write(_chunk, _enc, cb) {
+        cb();
+      },
+    });
+    createScrubbingStream(target, []);
+    expect(() => {
+      target.emit('error', new Error('EPIPE'));
+    }).not.toThrow();
+  });
+
+  // Critical regression (round 3): round 2 exempted process.stdout/stderr
+  // from the error-listener guard on the (false) assumption that stdio
+  // already tolerates EPIPE. It does not — piping the default destination
+  // into a consumer that closes early kills the process. The guard must
+  // cover stdio too, and — since it is a shared, process-global-like object
+  // — it must still only ever attach once.
+  it('guards process.stdout too, and only once', () => {
     const before = process.stdout.listenerCount('error');
-    createLogger(['x']); // no explicit stream -> defaults to process.stdout
-    createLogger(['y']);
-    expect(process.stdout.listenerCount('error')).toBe(before);
+    createScrubbingStream(process.stdout, []);
+    const afterFirst = process.stdout.listenerCount('error');
+    createScrubbingStream(process.stdout, []);
+    const afterSecond = process.stdout.listenerCount('error');
+
+    expect(afterFirst).toBeLessThanOrEqual(before + 1);
+    expect(afterSecond).toBe(afterFirst);
   });
 });

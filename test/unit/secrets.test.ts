@@ -208,11 +208,22 @@ describe('fallback path-key pattern — narrowed to avoid over-matching', () => 
   });
 });
 
-// Important 4: the query-param fallback must only fire on credential-shaped
-// names. This project logs `tokenId` on essentially every line.
+// Important 4 / round-3: the query-param fallback and query-value harvesting
+// now share ONE table (CREDENTIAL_QUERY_PARAMS in src/secrets.ts) so they
+// can't drift the way they did before — the fallback used to redact
+// ?x-api-key=/?api_secret= that harvesting never turned into tokens, and
+// bare ?token=/?password= were harvested by neither. Bare `token`/`secret`/
+// `password` are safe to include because this is a param-NAME match
+// requiring an exact `name=` — it does not match `tokenId=` or `token_id=`,
+// which this project logs constantly.
 describe('fallback query-param pattern — credential names only', () => {
   it('does not redact tokenId, a field this project logs constantly', () => {
     const prose = 'tokenId=123456789012345678';
+    expect(scrubSecrets(prose, [])).toBe(prose);
+  });
+
+  it('does not redact token_id either', () => {
+    const prose = 'token_id=123456789012345678';
     expect(scrubSecrets(prose, [])).toBe(prose);
   });
 
@@ -226,6 +237,30 @@ describe('fallback query-param pattern — credential names only', () => {
     expect(scrubSecrets(`?dkey=${unknownKey}`, [])).not.toContain(unknownKey);
     expect(scrubSecrets(`?auth_token=${unknownKey}`, [])).not.toContain(unknownKey);
     expect(scrubSecrets(`?secret=${unknownKey}`, [])).not.toContain(unknownKey);
+  });
+
+  // Round-3: broadened coverage, previously missing or inconsistent between
+  // harvesting and the fallback.
+  it('redacts x-api-key and api_secret in the fallback', () => {
+    const unknownKey = 'QRSTUV1234567890abcdef';
+    expect(scrubSecrets(`?x-api-key=${unknownKey}`, [])).not.toContain(unknownKey);
+    expect(scrubSecrets(`?api_secret=${unknownKey}`, [])).not.toContain(unknownKey);
+  });
+
+  it('redacts bare token=, password=, passwd=, and pwd= in the fallback', () => {
+    const unknownKey = 'QRSTUV1234567890abcdef';
+    expect(scrubSecrets(`?token=${unknownKey}`, [])).not.toContain(unknownKey);
+    expect(scrubSecrets(`?password=${unknownKey}`, [])).not.toContain(unknownKey);
+    expect(scrubSecrets(`?passwd=${unknownKey}`, [])).not.toContain(unknownKey);
+    expect(scrubSecrets(`?pwd=${unknownKey}`, [])).not.toContain(unknownKey);
+  });
+
+  it('harvests x-api-key, api_secret, bare token=, and password= as tokens too', () => {
+    const value = 'HARVESTVALUE1234567890';
+    for (const paramName of ['x-api-key', 'api_secret', 'token', 'password']) {
+      const tokens = deriveSecretTokens([`https://rpc.example.com/v2/abcd1234?${paramName}=${value}`]);
+      expect(tokens).toContain(value);
+    }
   });
 });
 
@@ -250,14 +285,11 @@ describe('deriveSecretTokens — lowered minimum token length', () => {
   });
 });
 
-// Minor (c): matching is case-insensitive.
-describe('scrubSecrets — case sensitivity', () => {
-  it('redacts a case-folded secret', () => {
-    const tokens = deriveSecretTokens([KEY]);
-    const folded = KEY.toLowerCase();
-    expect(scrubSecrets(`calling with ${folded} now`, tokens)).not.toContain(folded);
-  });
-});
+// Minor (c) — case-insensitivity — was tested here with a single hand-picked
+// example. Removed in round 3: the property test below (see "hostile
+// Unicode filler") exercises case-folding as one of its randomized variants
+// across hundreds of iterations and generic filler contexts, which strictly
+// subsumes this specific example.
 
 // Critical (new): findTokenRanges must never compute match indices on a
 // case-folded copy of the text. toLowerCase() changes the length of U+0130
@@ -304,5 +336,102 @@ describe('deriveSecretTokens — query-value harvesting restricted to credential
     const value = 'CREDVALUE1234567890';
     const tokens = deriveSecretTokens([`https://rpc.example.com/v2/api?apikey=${value}`]);
     expect(tokens).toContain(value);
+  });
+});
+
+// Important (new): three rounds of hand-picked adversarial inputs is the
+// wrong instrument — that is exactly where the İ bug hid. A deterministic
+// (seeded, not Math.random()) property test sprays a hostile Unicode
+// alphabet around a spliced secret and checks the general invariant instead
+// of one fixture at a time. Any failure reproduces exactly, because the
+// PRNG is seeded.
+describe('scrubSecrets — property test across hostile Unicode filler', () => {
+  // mulberry32: small, deterministic, seeded PRNG. Not cryptographic — only
+  // needs to be reproducible and reasonably well distributed.
+  function mulberry32(seed: number): () => number {
+    let s = seed;
+    return () => {
+      s |= 0;
+      s = (s + 0x6d2b79f5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // BMP look-alikes/length-changers under case-folding, combining marks,
+  // astral surrogate pairs (emoji + a mathematical-alphanumeric character),
+  // RTL control marks, and plain ASCII — the categories the finding named.
+  const ATOMS = [
+    'İ', 'ß', 'ſ', 'K', // U+0130, U+00DF, U+017F, U+212A (Kelvin sign)
+    '̀', '́', '̈', 'ͯ', // combining marks
+    '😀', '🔥', '\u{1D400}', '\u{1D49C}', // astral surrogate pairs
+    '‏', '‮', // RTL mark, RTL override
+    'a', 'b', 'Z', '9', ' ', '-', '_', '.', // plain ASCII
+  ];
+
+  function randomFiller(rand: () => number, length: number): string {
+    let out = '';
+    for (let i = 0; i < length; i++) {
+      out += ATOMS[Math.floor(rand() * ATOMS.length)];
+    }
+    return out;
+  }
+
+  // Two fixtures: one plain (for the raw/case-folded/percent-encoded
+  // variants — it contains '/', '+', '=' so percent-encoding actually
+  // transforms it, not a no-op), one containing a quote (for the
+  // JSON-escaped variant — a secret with no escapable character would make
+  // that branch a no-op and decorative, the same mistake flagged earlier).
+  const PLAIN_SECRET = 'zQ7mPk2R/t9Lw+4Vb1=';
+  const QUOTED_SECRET = 'zQ7"Pk2Rt9Lw4Vb1c2';
+
+  function pickVariant(rand: () => number): { tokens: string[]; spliced: string } {
+    const roll = rand();
+    if (roll < 0.34) {
+      return { tokens: deriveSecretTokens([PLAIN_SECRET]), spliced: PLAIN_SECRET };
+    }
+    if (roll < 0.67) {
+      return {
+        tokens: deriveSecretTokens([PLAIN_SECRET]),
+        spliced: PLAIN_SECRET.toLowerCase(),
+      };
+    }
+    if (roll < 0.84) {
+      return {
+        tokens: deriveSecretTokens([PLAIN_SECRET]),
+        spliced: encodeURIComponent(PLAIN_SECRET),
+      };
+    }
+    return {
+      tokens: deriveSecretTokens([QUOTED_SECRET]),
+      spliced: JSON.stringify(QUOTED_SECRET).slice(1, -1),
+    };
+  }
+
+  it('leaves no 4+ character prefix of the spliced secret in the output, across hundreds of randomized hostile-Unicode splices', () => {
+    const SEED = 0xc0ffee;
+    const ITERATIONS = 300;
+    const rand = mulberry32(SEED);
+
+    for (let i = 0; i < ITERATIONS; i++) {
+      const before = randomFiller(rand, Math.floor(rand() * 12));
+      const after = randomFiller(rand, Math.floor(rand() * 12));
+      const { tokens, spliced } = pickVariant(rand);
+
+      const text = `${before}${spliced}${after}`;
+      const out = scrubSecrets(text, tokens);
+
+      for (let len = 4; len <= spliced.length; len++) {
+        const prefix = spliced.slice(0, len);
+        if (out.includes(prefix)) {
+          throw new Error(
+            `iteration ${i} (seed 0x${SEED.toString(16)}) leaked a ${len}-character ` +
+              `prefix of the spliced secret. before.length=${before.length}, ` +
+              `after.length=${after.length}, spliced=${JSON.stringify(spliced)}`,
+          );
+        }
+      }
+    }
   });
 });
