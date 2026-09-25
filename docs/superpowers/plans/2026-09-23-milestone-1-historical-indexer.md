@@ -60,8 +60,17 @@
 ### Task 1: Project scaffold and configuration
 
 **Files:**
-- Create: `package.json`, `tsconfig.json`, `vitest.config.ts`, `.env.example`, `config/chains.json`, `src/types.ts`, `src/errors.ts`, `src/config.ts`
-- Test: `test/unit/config.test.ts`
+- Create: `package.json`, `tsconfig.json`, `tsconfig.build.json`, `vitest.config.ts`, `.env.example`, `config/chains.json`, `src/types.ts`, `src/errors.ts`, `src/config.ts`, `src/chain/probeErrors.ts`, `scripts/verify-archive-probes.ts`, `test/setup.ts`
+- Test: `test/unit/config.test.ts`, `test/unit/probeErrors.test.ts`
+
+**Scope added during execution** (recorded so the plan matches what shipped):
+`.env` loading was missing entirely — `loadConfig()` defaults to `process.env` and
+nothing populated it, so every entrypoint threw `ConfigError`. Fixed with Node's
+`--env-file-if-exists` in the npm scripts plus a vitest `setupFiles` hook.
+`src/chain/probeErrors.ts` was added here rather than in Task 11 because the
+verification gate needs it: a pruned node throws rather than returning empty
+bytes, and a transient timeout throws too — conflating them would report a healthy
+archive endpoint as non-archive. Task 11 consumes it.
 
 **Interfaces:**
 - Consumes: nothing
@@ -2444,10 +2453,10 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `test/unit/deployBlock.test.ts`
 
 **Interfaces:**
-- Consumes: `DeployBlockUnavailableError` (Task 1); `ChainConfig` (Task 1); `Address` (Task 1)
+- Consumes: `DeployBlockUnavailableError` (Task 1); `ChainConfig` (Task 1); `Address` (Task 1); `classifyProbeError`, `ProbeOutcome` from `src/chain/probeErrors.ts` (built in Task 1's fix round, already tested there — do not rewrite it)
 - Produces:
   - `interface CodeReader { (a: { address: Address; blockNumber: bigint }): Promise<string> }`
-  - `probeArchive(getCode: CodeReader, probe: { address: Address; block: number }): Promise<boolean>`
+  - `probeArchive(getCode: CodeReader, probe: { address: Address; block: number }, opts?: { attempts?: number }): Promise<boolean>`
   - `binarySearchDeployBlock(getCode: CodeReader, address: Address, safeHead: bigint): Promise<bigint>`
   - `fetchCreationBlockFromExplorer(a: { chainId, address, apiKey, fetchFn? }): Promise<number | undefined>`
   - `resolveDeployBlock(a: { getCode, chainId, address, safeHead, archiveProbe, override?, etherscanApiKey?, fetchFn? }): Promise<{ block: number; source: DeployBlockSource }>`
@@ -2515,9 +2524,56 @@ describe('probeArchive', () => {
     expect(await probeArchive(prunedNode(20000000n), PROBE)).toBe(false);
   });
 
-  it('fails rather than throwing when the call errors', async () => {
-    const throwing = async () => { throw new Error('missing trie node'); };
+  // A pruned node usually THROWS rather than returning empty bytes, and the
+  // wording varies by client. Both shapes must mean the same thing: probe
+  // fails, binary search is disabled, the run continues.
+  it.each([
+    'missing trie node 0xabc (path )',
+    'state not available for block 100000',
+    'Requested resource not found.',
+    'header not found',
+  ])('treats a thrown state-unavailable error as a failed probe: %s', async (message) => {
+    const throwing = async () => { throw new Error(message); };
     expect(await probeArchive(throwing, PROBE)).toBe(false);
+  });
+
+  it('does not throw out of probeArchive on any error', async () => {
+    const throwing = async () => { throw new Error('missing trie node'); };
+    await expect(probeArchive(throwing, PROBE)).resolves.toBe(false);
+  });
+
+  // A timeout is not evidence about archive capability, so it is retried
+  // before the probe gives up — otherwise one slow cold read would wrongly
+  // disable deploy-block search for the whole chain.
+  it('retries a transient error, then succeeds', async () => {
+    let calls = 0;
+    const flaky = async ({ blockNumber }: { blockNumber: bigint }) => {
+      calls += 1;
+      if (calls === 1) throw new Error('The request took too long to respond.');
+      return blockNumber >= 4000000n ? '0xdeadbeef' : '0x';
+    };
+    expect(await probeArchive(flaky, PROBE, { attempts: 3 })).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it('gives up after the attempt cap on a persistently transient error', async () => {
+    let calls = 0;
+    const timingOut = async () => {
+      calls += 1;
+      throw new Error('ETIMEDOUT');
+    };
+    expect(await probeArchive(timingOut, PROBE, { attempts: 3 })).toBe(false);
+    expect(calls).toBe(3);
+  });
+
+  it('does not retry a state-unavailable error — it is a verdict, not a blip', async () => {
+    let calls = 0;
+    const pruned = async () => {
+      calls += 1;
+      throw new Error('missing trie node');
+    };
+    expect(await probeArchive(pruned, PROBE, { attempts: 3 })).toBe(false);
+    expect(calls).toBe(1);
   });
 });
 
@@ -2582,6 +2638,7 @@ Expected: FAIL — cannot resolve `../../src/chain/deployBlock.js`.
 
 ```ts
 import { DeployBlockUnavailableError } from '../errors.js';
+import { classifyProbeError } from './probeErrors.js';
 import type { Address, DeployBlockSource } from '../types.js';
 
 export interface CodeReader {
@@ -2601,13 +2658,24 @@ const hasCode = (code: string): boolean => code !== '0x' && code.length > 2;
 export async function probeArchive(
   getCode: CodeReader,
   probe: { address: Address; block: number },
+  opts: { attempts?: number } = {},
 ): Promise<boolean> {
-  try {
-    const code = await getCode({ address: probe.address, blockNumber: BigInt(probe.block) });
-    return hasCode(code);
-  } catch {
-    return false;
+  const attempts = Math.max(1, opts.attempts ?? 3);
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const code = await getCode({ address: probe.address, blockNumber: BigInt(probe.block) });
+      return hasCode(code);
+    } catch (err) {
+      // A pruned node throws rather than returning empty bytes, with wording
+      // that varies by client. That is a verdict — stop and report failure.
+      if (classifyProbeError(err) === 'state_unavailable') return false;
+      // A timeout says nothing about archive capability, so retry rather than
+      // wrongly disabling deploy-block search for the whole chain.
+      if (attempt === attempts) return false;
+    }
   }
+  return false;
 }
 
 /** Lowest block at which the address has code. Assumes archive state. */
