@@ -2,7 +2,7 @@
 import { createPublicClient, http } from 'viem';
 import { loadConfig } from '../src/config.js';
 import { classifyProbeError } from '../src/chain/probeErrors.js';
-import { deriveSecretTokens, scrubUnknown } from '../src/secrets.js';
+import { deriveSecretTokens, scrubSecrets } from '../src/secrets.js';
 
 const config = loadConfig();
 
@@ -31,7 +31,10 @@ for (const [chainId, chain] of config.chains) {
   } catch (err) {
     const outcome = classifyProbeError(err);
     verdict = outcome === 'state_unavailable' ? 'FAIL' : 'INCONCLUSIVE';
-    detail = scrubUnknown(err, tokens);
+    // Message only, not the shared scrubUnknown's stack-preferring form: this
+    // is a human-facing gate, and a full stack trace on every probe failure
+    // would flood the console.
+    detail = scrubSecrets(err instanceof Error ? err.message : String(err), tokens);
   }
 
   results.push({ chainId, name: chain.name, verdict });

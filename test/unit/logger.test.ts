@@ -1,7 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import { Writable } from 'node:stream';
-import type { Logger } from 'pino';
+import pino, { type Logger } from 'pino';
 import { createLogger } from '../../src/logger.js';
+
+/**
+ * `createLogger`'s public surface only returns a `Logger`, so the internal
+ * scrubbing Writable that wraps the caller's target stream isn't otherwise
+ * reachable. Pino stores its destination under this documented internal
+ * symbol; using it here is the only way to observe that the wrapper's own
+ * write-completion callback actually received the target's error (rather
+ * than just observing Node's separate, unrelated auto-emission of 'error' on
+ * the target stream itself, which happens regardless of this fix).
+ */
+const streamSym = pino.symbols.streamSym;
+function internalStream(log: Logger): Writable {
+  const value = (log as unknown as Record<symbol, unknown>)[streamSym];
+  if (!(value instanceof Writable)) {
+    throw new Error('expected pino to expose its destination stream internally');
+  }
+  return value;
+}
 
 // A bare token, not a URL: the fallback patterns must not match it, or the
 // control assertions below could pass for the wrong reason.
@@ -102,5 +120,45 @@ describe('createLogger', () => {
     const { stream, output } = capture();
     createLogger([SECRET], stream).info('hello world');
     expect(output()).toContain('hello world');
+  });
+});
+
+// Important 5: a failing destination must not vanish silently, and must not
+// turn into an exception in business code (e.g. EPIPE on a closed stdout).
+describe('createLogger — write failure handling', () => {
+  it('surfaces a write callback error instead of dropping it silently', () => {
+    const failing = new Writable({
+      write(_chunk, _enc, cb) {
+        cb(new Error('boom-write'));
+      },
+    });
+    // Node auto-emits 'error' on the target itself whenever its own write
+    // callback receives one; that is unrelated to the wrapper under test.
+    failing.on('error', () => {});
+
+    const log = createLogger([], failing);
+    let scrubbingSawError = false;
+    internalStream(log).on('error', () => {
+      scrubbingSawError = true;
+    });
+
+    log.info('hello');
+
+    return new Promise<void>((resolve) => {
+      setImmediate(() => {
+        expect(scrubbingSawError).toBe(true);
+        resolve();
+      });
+    });
+  });
+
+  it('does not throw out of the log call when the target write throws synchronously', () => {
+    const throwing = new Writable({
+      write() {
+        throw new Error('sync-boom');
+      },
+    });
+    const log = createLogger([], throwing);
+    expect(() => log.info('hello')).not.toThrow();
   });
 });
