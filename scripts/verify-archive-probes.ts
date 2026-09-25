@@ -2,28 +2,16 @@
 import { createPublicClient, http } from 'viem';
 import { loadConfig } from '../src/config.js';
 import { classifyProbeError } from '../src/chain/probeErrors.js';
+import { deriveSecretTokens, scrubUnknown } from '../src/secrets.js';
 
 const config = loadConfig();
 
 /**
  * viem embeds the request URL — which carries the API key — in transport error
  * messages, so nothing from an error (or any config-derived string) reaches
- * stdout unscrubbed. The real scrubbing logger arrives in the next task; this
- * is the same rule, inlined.
+ * stdout unscrubbed.
  */
-function scrub(value: string): string {
-  let out = value;
-  for (const secret of config.secrets) {
-    if (!secret) continue;
-    out = out.split(secret).join('[redacted]');
-  }
-  return out;
-}
-
-/** Scrubs whatever an unknown thrown value stringifies to, never trusting its shape. */
-function scrubUnknown(err: unknown): string {
-  return scrub(err instanceof Error ? err.message : String(err));
-}
+const tokens = deriveSecretTokens(config.secrets);
 
 type Verdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
@@ -43,7 +31,7 @@ for (const [chainId, chain] of config.chains) {
   } catch (err) {
     const outcome = classifyProbeError(err);
     verdict = outcome === 'state_unavailable' ? 'FAIL' : 'INCONCLUSIVE';
-    detail = scrubUnknown(err);
+    detail = scrubUnknown(err, tokens);
   }
 
   results.push({ chainId, name: chain.name, verdict });
