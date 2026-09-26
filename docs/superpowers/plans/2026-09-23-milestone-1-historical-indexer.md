@@ -38,6 +38,7 @@
 | `src/secrets.ts` | token derivation + scrubbing (pure, no deps; shared with scripts) |
 | `src/logger.ts` | pino wired to scrub every serialized line |
 | `src/clock.ts` | injectable epoch-ms clock (one time source, no SQLite datetime()) |
+| `src/jobId.ts` | per-run lock-owner identity |
 | `src/db/paths.ts` | repo-root and migrations-dir resolution |
 | `src/db/connection.ts` | better-sqlite3 handle, WAL, busy_timeout, foreign_keys ON |
 | `src/db/migrate.ts` | migration runner, checksum-verified, one txn per file |
@@ -1709,8 +1710,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 4: Collections repository — locking, cleanup, guarded reads
 
 **Files:**
-- Create: `src/db/repositories/collections.ts`
-- Test: `test/unit/collections.repo.test.ts`
+- Create: `src/jobId.ts`, `src/db/repositories/collections.ts`
+- Test: `test/unit/jobId.test.ts`, `test/unit/collections.repo.test.ts`
 
 **Interfaces:**
 - Consumes: `openDb`, `runMigrations`, `Clock`, `manualClock` (Task 3); `Standard`, `DeployBlockSource` (Task 1)
@@ -1720,12 +1721,105 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   - `releaseCollection(db, a: { chainId, contract, jobId }): void`
   - `deleteUnbootstrapped(db, a: { chainId, contract, jobId }): void`
   - `finishBootstrap(db, a: { chainId, contract, standard, deployBlock, deployBlockSource, name }): void`
+  - `newJobId(): string` (from `src/jobId.ts`)
   - `getCollection(db, chainId: number, contract: string): CollectionState`
   - `advanceWatermark(db, a: { chainId, contract, jobId, toBlock: number, clock: Clock }): void`
 
+**Three properties this task must prove, not merely implement:**
+
+**Stale-lock stealing is atomic.** The staleness condition lives inside the claim
+statement's `ON CONFLICT ... DO UPDATE ... WHERE`, so testing staleness and taking the
+lock are one statement and `changes` decides the winner. A `SELECT` to check staleness
+followed by an `UPDATE` would let two jobs both observe the same stale lock and both
+steal it. The property needs a test with two racing steals, not just one successful steal.
+
+**Release is identity-checked.** `WHERE ... AND locked_by = @jobId`. If job A's lock goes
+stale and job B steals it, A finishing later must not clear B's lock — otherwise the
+collection is silently unlocked while B is still writing to it. Needs its own test.
+
+**`locked_by` is unique per RUN.** Not per collection, not a process name, not a bare pid:
+a restarted process could then steal or release its own predecessor's lock by accident.
+`newJobId()` combines hostname and pid (for diagnosability in logs) with a uuid (for
+uniqueness).
+
+**On the guarded read returning two states, not three.** `getCollection` returns
+`indexed | not_indexed`, and a claimed-but-unbootstrapped row — lock held or not — reads
+as `not_indexed`. No "in progress" state reaches callers from this function. Milestone 2's
+analysis paths (`firstMinters`, `overlap`) must treat such a row as un-indexed, and a
+two-state union makes that impossible to get wrong.
+
+Milestone 2's `/status` command *does* genuinely want the distinction — replying
+"not indexed" to someone who just ran `/index` is misleading. That is served by a separate,
+explicitly named `getCollectionStatus()` returning
+`not_indexed | bootstrapping | indexed`, added in Milestone 2 where the caller exists. Two
+functions, so the state that matters for correctness cannot arrive through the one used for
+analysis. It is not built now: M1 has no status surface, and inventing the caller-free
+version first is how unused third states end up mishandled.
+
 This repository deliberately exposes **no** raw "get row by address". `getCollection` returns a tagged union, so a caller cannot forget the `standard IS NOT NULL` filter — an unbootstrapped row must never surface as an indexed collection with zero transfers.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing job-id test**
+
+`test/unit/jobId.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { hostname } from 'node:os';
+import { newJobId } from '../../src/jobId.js';
+
+describe('newJobId', () => {
+  it('is unique per call', () => {
+    expect(newJobId()).not.toBe(newJobId());
+  });
+
+  it('stays unique across many calls', () => {
+    const ids = new Set(Array.from({ length: 1000 }, () => newJobId()));
+    expect(ids.size).toBe(1000);
+  });
+
+  // hostname and pid are for reading logs; the uuid is what makes it unique.
+  it('carries the hostname and pid for diagnosability', () => {
+    const id = newJobId();
+    expect(id).toContain(hostname());
+    expect(id).toContain(String(process.pid));
+  });
+
+  // A bare pid or process name would let a restarted process steal or release
+  // its own predecessor's lock.
+  it('ends in a uuid, so it is per-run rather than per-process', () => {
+    const segments = newJobId().split(':');
+    expect(segments.length).toBeGreaterThanOrEqual(3);
+    expect(segments.at(-1)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  });
+});
+```
+
+- [ ] **Step 2: Run it to verify it fails, then write `src/jobId.ts`**
+
+Run: `npx vitest run test/unit/jobId.test.ts` — FAIL, module missing.
+
+```ts
+import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
+
+/**
+ * A lock-owner identity, unique per RUN.
+ *
+ * Deliberately not derived from the collection, the process name, or a bare pid:
+ * pids are reused, so a restarted process could steal or release its own
+ * predecessor's lock by accident. The hostname and pid are there to make a held
+ * lock diagnosable from logs; the uuid is what guarantees uniqueness.
+ */
+export function newJobId(): string {
+  return `${hostname()}:${process.pid}:${randomUUID()}`;
+}
+```
+
+Re-run: PASS, 4 tests.
+
+- [ ] **Step 3: Write the failing collections test**
 
 `test/unit/collections.repo.test.ts`:
 
@@ -1779,10 +1873,44 @@ describe('claimCollection', () => {
     expect(claim('job-b', T0 + 600_000)).toBe(true);   // 10 min later: stale
   });
 
+  // Two jobs must not both steal the same stale lock. This passes only because
+  // the staleness test lives inside the claim statement's WHERE: a SELECT-then-
+  // UPDATE would let both observe the stale lock and both take it.
+  it('resolves two racing steals of one stale lock to exactly one winner', () => {
+    claim('job-a', T0);
+    const steals = [claim('job-b', T0 + 600_000), claim('job-c', T0 + 600_000)];
+    expect(steals.filter(Boolean)).toHaveLength(1);
+    const row = db.prepare('SELECT locked_by FROM collections').get() as { locked_by: string };
+    expect(['job-b', 'job-c']).toContain(row.locked_by);
+  });
+
   it('lets a new job claim after release', () => {
     claim('job-a');
     releaseCollection(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'job-a' });
     expect(claim('job-b')).toBe(true);
+  });
+});
+
+describe('releaseCollection', () => {
+  // If A's lock went stale and B stole it, A finishing late must not unlock the
+  // collection underneath B — which would leave B writing to an unlocked row.
+  it('does not let a job whose lock was stolen release the new holder', () => {
+    claim('job-a', T0);
+    expect(claim('job-b', T0 + 600_000)).toBe(true);
+
+    releaseCollection(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'job-a' });
+
+    const row = db.prepare('SELECT locked_by FROM collections').get() as { locked_by: string | null };
+    expect(row.locked_by).toBe('job-b');
+    // B's lock is still effective against a newcomer.
+    expect(claim('job-c', T0 + 600_001)).toBe(false);
+  });
+
+  it('is a no-op for a job that never held the lock', () => {
+    claim('job-a', T0);
+    releaseCollection(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'never-held' });
+    const row = db.prepare('SELECT locked_by FROM collections').get() as { locked_by: string };
+    expect(row.locked_by).toBe('job-a');
   });
 });
 
@@ -1795,6 +1923,16 @@ describe('getCollection', () => {
   // or callers get silently empty results instead of an error.
   it('reports not_indexed for a claimed but unbootstrapped row', () => {
     claim('job-a');
+    expect(getCollection(db, CHAIN, CONTRACT)).toEqual({ state: 'not_indexed' });
+  });
+
+  // Deliberate: no third "in progress" state reaches callers. M2's analysis
+  // paths must see an unbootstrapped row as un-indexed whether or not a job
+  // currently holds the lock.
+  it('still reports not_indexed while the lock is actively held', () => {
+    expect(claim('job-a', T0)).toBe(true);
+    const held = db.prepare('SELECT locked_by FROM collections').get() as { locked_by: string };
+    expect(held.locked_by).toBe('job-a');
     expect(getCollection(db, CHAIN, CONTRACT)).toEqual({ state: 'not_indexed' });
   });
 
@@ -1879,12 +2017,12 @@ describe('advanceWatermark', () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 4: Run the test to verify it fails**
 
 Run: `npx vitest run test/unit/collections.repo.test.ts`
 Expected: FAIL — cannot resolve `../../src/db/repositories/collections.js`.
 
-- [ ] **Step 3: Write `src/db/repositories/collections.ts`**
+- [ ] **Step 5: Write `src/db/repositories/collections.ts`**
 
 ```ts
 import type Database from 'better-sqlite3';
@@ -2025,15 +2163,15 @@ export function advanceWatermark(
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `npx vitest run test/unit/collections.repo.test.ts && npm run typecheck`
-Expected: PASS, 12 tests.
+Run: `npx vitest run test/unit/jobId.test.ts test/unit/collections.repo.test.ts && npm run typecheck`
+Expected: PASS — 4 job-id tests and 17 collections tests.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/db/repositories/collections.ts test/unit/collections.repo.test.ts
+git add src/jobId.ts src/db/repositories/collections.ts test/unit/jobId.test.ts test/unit/collections.repo.test.ts
 git commit -m "feat: collections repository with lock lifecycle and guarded reads
 
 Claim is an atomic upsert so two concurrent first-runs on a never-seen
@@ -4122,9 +4260,8 @@ Expected: FAIL — cannot resolve `../../src/indexer/backfill.js`.
 - [ ] **Step 3: Write `src/indexer/backfill.ts`**
 
 ```ts
-import { randomUUID } from 'node:crypto';
-import { hostname } from 'node:os';
 import type Database from 'better-sqlite3';
+import { newJobId } from '../jobId.js';
 import type { ChainConfig } from '../config.js';
 import { CollectionLockedError } from '../errors.js';
 import type { Address, Standard, TransferRow, TxInfo } from '../types.js';
@@ -4197,7 +4334,7 @@ export async function backfill(
 ): Promise<BackfillResult> {
   const contract = options.contract.toLowerCase();
   const address = contract as Address;
-  const jobId = options.jobId ?? `${hostname()}:${process.pid}:${randomUUID()}`;
+  const jobId = options.jobId ?? newJobId();
   const staleMs = options.staleLockMs ?? 300_000;
   const maxHeadExtensions = options.maxHeadExtensions ?? 3;
   const { chainId, chain } = options;
