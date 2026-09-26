@@ -1812,6 +1812,29 @@ describe('getCollection', () => {
 });
 
 describe('deleteUnbootstrapped', () => {
+  // transfers has ON DELETE CASCADE to collections, so an unguarded
+  // DELETE FROM collections silently destroys every transfer for that
+  // collection with no recovery path. These two tests pin the guards.
+  it('does not cascade away transfers of a bootstrapped collection', () => {
+    claim('job-a');
+    finishBootstrap(db, {
+      chainId: CHAIN, contract: CONTRACT, standard: '721',
+      deployBlock: 100, deployBlockSource: 'override', name: null,
+    });
+    db.prepare(`
+      INSERT INTO transfers
+        (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
+         block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
+      VALUES (@chainId, @contract, '1', '1', '0x0', '0xaaa', '0xtx',
+              1, 0, 0, '0xaaa', '0', 'mint')
+    `).run({ chainId: CHAIN, contract: CONTRACT });
+
+    deleteUnbootstrapped(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'job-a' });
+
+    const n = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
+    expect(n.n).toBe(1);
+  });
+
   it('removes the row a failed bootstrap created', () => {
     claim('job-a');
     deleteUnbootstrapped(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'job-a' });
