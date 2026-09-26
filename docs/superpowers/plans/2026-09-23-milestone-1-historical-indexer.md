@@ -16,6 +16,8 @@
 - `strict: true` in tsconfig. No `any` in committed code; use `unknown` plus narrowing.
 - All addresses stored **lowercase**. All inserts idempotent (`INSERT OR IGNORE`).
 - `token_id`, `amount`, `tx_value_wei` are **TEXT** in SQLite — they are `uint256` and exceed `Number.MAX_SAFE_INTEGER`. Convert via `bigint`, never `Number()`.
+- `PRAGMA foreign_keys = ON` belongs in the connection factory, never a migration: SQLite defaults it OFF per connection.
+- Timestamps are INTEGER epoch ms from the injected `Clock`. SQLite's `datetime()`/`unixepoch()` are used nowhere.
 - Migration `.sql` files live at repo-root `db/migrations/`. `src/db/` holds connection, runner, repositories. The runner resolves the repo root by walking up for `package.json`, **never** from `__dirname`.
 - RPC URLs contain API keys in the path. **Nothing may log an RPC URL or the explorer key unredacted.**
 - `npm test` and `npm run typecheck` must both pass before the milestone is called done.
@@ -35,9 +37,10 @@
 | `src/config.ts` | zod-validated env + chains.json — the only reader of `process.env` |
 | `src/secrets.ts` | token derivation + scrubbing (pure, no deps; shared with scripts) |
 | `src/logger.ts` | pino wired to scrub every serialized line |
+| `src/clock.ts` | injectable epoch-ms clock (one time source, no SQLite datetime()) |
 | `src/db/paths.ts` | repo-root and migrations-dir resolution |
-| `src/db/connection.ts` | better-sqlite3 handle, WAL, busy_timeout |
-| `src/db/migrate.ts` | migration runner |
+| `src/db/connection.ts` | better-sqlite3 handle, WAL, busy_timeout, foreign_keys ON |
+| `src/db/migrate.ts` | migration runner, checksum-verified, one txn per file |
 | `db/migrations/001_init.sql` | schema |
 | `src/db/chunked.ts` | bound-variable chunking helper |
 | `src/db/repositories/collections.ts` | claim, release, cleanup, bootstrap, guarded reads |
@@ -991,107 +994,156 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 3: Database connection, migration runner, and schema
 
 **Files:**
-- Create: `src/db/paths.ts`, `src/db/connection.ts`, `src/db/migrate.ts`, `db/migrations/001_init.sql`
-- Test: `test/unit/migrate.test.ts`
+- Create: `src/clock.ts`, `src/db/paths.ts`, `src/db/connection.ts`, `src/db/migrate.ts`, `db/migrations/001_init.sql`
+- Modify: `src/errors.ts` — add `MigrationError`
+- Test: `test/unit/clock.test.ts`, `test/unit/connection.test.ts`, `test/unit/migrate.test.ts`
 
 **Interfaces:**
-- Consumes: nothing
-- Produces: `repoRoot(): string`, `migrationsDir(): string`, `openDb(path: string): Database.Database`, `runMigrations(db: Database.Database): string[]` (returns applied filenames)
+- Consumes: `ConfigError` (Task 1)
+- Produces:
+  - `interface Clock { now(): number }` — epoch milliseconds
+  - `systemClock: Clock`, `manualClock(startMs?: number): Clock & { advance(ms: number): void; set(ms: number): void }`
+  - `repoRoot(): string`, `migrationsDir(): string`
+  - `openDb(path: string): Database.Database`
+  - `interface AppliedMigration { filename: string; checksum: string }`
+  - `runMigrations(db: Database.Database): AppliedMigration[]`
+  - `MigrationError` (from `src/errors.ts`)
 
-- [ ] **Step 1: Write the failing test**
+**Four requirements driving this task's design:**
 
-`test/unit/migrate.test.ts`:
+**1. `PRAGMA foreign_keys = ON` per connection, and a foreign key that makes it matter.**
+SQLite defaults foreign-key enforcement OFF on *every new connection*, so setting it
+in a migration would silently stop applying the moment anything reopens the database.
+It belongs in the connection factory beside WAL and `busy_timeout`.
+
+There is currently **no foreign key in the schema at all**, so the pragma guards
+nothing. This task adds one: `transfers` references `collections (chain_id, contract)`
+with `ON DELETE CASCADE`. That is the real data model — a transfer cannot belong to a
+collection that does not exist — and it means dropping a collection cleans up its rows
+instead of orphaning them. The parent key is `collections`' primary key, so the
+required unique index already exists.
+
+**The test must prove enforcement, not configuration.** Asserting `PRAGMA foreign_keys`
+returns `1` only proves a pragma was set. Assert that inserting a transfer for a
+non-existent collection is **rejected** — that is the behaviour anyone cares about, and
+it fails if either the pragma or the constraint goes missing.
+
+**2. A `schema_migrations` ledger with a content checksum, one transaction per file.**
+Filename and applied-at are not enough. If an already-applied migration's content
+changes, the runner skips it by filename and the database silently diverges from the
+repo — a drift bug that surfaces months later as an inexplicable missing column. So
+store a SHA-256 of each file's content and fail loudly when a recorded checksum no
+longer matches. Also fail when a recorded migration has vanished from disk, which is
+the same drift in the other direction. Each migration applies inside its own
+transaction, so a file that fails halfway leaves no partial schema and no ledger row.
+
+**3. One injectable clock, epoch milliseconds, INTEGER columns.**
+Mixing SQLite's `datetime()` with JS time gives two clocks that disagree, and makes
+lock tests depend on sleeping. `locked_at` and `indexed_at` become `INTEGER` epoch
+milliseconds, and a single `Clock` is passed in and used for both writing a timestamp
+and computing a staleness cutoff. Contended- and stale-lock tests then set the time
+explicitly instead of waiting.
+
+**4. TEXT numeric columns sort lexicographically — say so in the schema.**
+`token_id`, `amount`, and `tx_value_wei` are TEXT because they are `uint256` and
+exceed `Number.MAX_SAFE_INTEGER`. That means `ORDER BY token_id` gives `'10'` before
+`'9'`. Milestone 1 never orders by them (ordering is by `block_number, log_index,
+batch_index`), but it is a trap for anyone adding a query later, so the schema
+comments must warn about it explicitly.
+
+- [ ] **Step 1: Write the failing clock test**
+
+`test/unit/clock.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { openDb } from '../../src/db/connection.js';
-import { migrationsDir, repoRoot } from '../../src/db/paths.js';
-import { runMigrations } from '../../src/db/migrate.js';
+import { manualClock, systemClock } from '../../src/clock.js';
 
-describe('paths', () => {
-  it('resolves a repo root that contains package.json', () => {
-    expect(existsSync(join(repoRoot(), 'package.json'))).toBe(true);
-  });
-
-  it('points migrationsDir at repo-root db/migrations', () => {
-    expect(migrationsDir()).toBe(join(repoRoot(), 'db', 'migrations'));
-    expect(existsSync(migrationsDir())).toBe(true);
+describe('systemClock', () => {
+  it('returns epoch milliseconds', () => {
+    const before = Date.now();
+    const now = systemClock.now();
+    expect(now).toBeGreaterThanOrEqual(before);
+    expect(Number.isInteger(now)).toBe(true);
   });
 });
 
-describe('runMigrations', () => {
-  it('creates both tables and records what it applied', () => {
-    const db = openDb(':memory:');
-    const applied = runMigrations(db);
-    expect(applied).toContain('001_init.sql');
-
-    const tables = db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-      .all() as Array<{ name: string }>;
-    const names = tables.map((t) => t.name);
-    expect(names).toContain('collections');
-    expect(names).toContain('transfers');
+describe('manualClock', () => {
+  it('starts at the given time and does not move on its own', () => {
+    const clock = manualClock(1_000);
+    expect(clock.now()).toBe(1_000);
+    expect(clock.now()).toBe(1_000);
   });
 
-  it('is idempotent — a second run applies nothing', () => {
-    const db = openDb(':memory:');
-    runMigrations(db);
-    expect(runMigrations(db)).toEqual([]);
+  it('advances by an explicit amount', () => {
+    const clock = manualClock(1_000);
+    clock.advance(500);
+    expect(clock.now()).toBe(1_500);
   });
 
-  it('gives transfers a primary key that includes batch_index', () => {
-    const db = openDb(':memory:');
-    runMigrations(db);
-    const pk = (db.prepare('PRAGMA table_info(transfers)').all() as Array<{
-      name: string; pk: number;
-    }>)
-      .filter((c) => c.pk > 0)
-      .sort((a, b) => a.pk - b.pk)
-      .map((c) => c.name);
-    expect(pk).toEqual(['chain_id', 'tx_hash', 'log_index', 'batch_index']);
+  it('can be set to an absolute time', () => {
+    const clock = manualClock(1_000);
+    clock.set(9_999);
+    expect(clock.now()).toBe(9_999);
   });
 
-  it('accepts two rows differing only by batch_index', () => {
-    const db = openDb(':memory:');
-    runMigrations(db);
-    const insert = db.prepare(`
-      INSERT OR IGNORE INTO transfers
-        (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
-         block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
-      VALUES (@chainId, @contract, @tokenId, '1', @from, @to, @txHash,
-              1, 0, @batchIndex, @from, '0', 'mint')
-    `);
-    const base = {
-      chainId: 1, contract: '0xabc', tokenId: '1',
-      from: '0x0', to: '0xdef', txHash: '0xtx',
-    };
-    insert.run({ ...base, batchIndex: 0 });
-    insert.run({ ...base, tokenId: '2', batchIndex: 1 });
-    const count = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
-    expect(count.n).toBe(2);
-  });
-
-  it('enables WAL', () => {
-    // :memory: cannot use WAL, so this uses a temp file.
-    const path = join(process.env.TMPDIR ?? process.env.TEMP ?? '.', `byakugan-${Date.now()}.db`);
-    const db = openDb(path);
-    const mode = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
-    expect(mode.journal_mode).toBe('wal');
-    db.close();
+  it('defaults to 0 so tests are reproducible without passing a start', () => {
+    expect(manualClock().now()).toBe(0);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run it to verify it fails**
 
-Run: `npx vitest run test/unit/migrate.test.ts`
-Expected: FAIL — cannot resolve `../../src/db/connection.js`.
+Run: `npx vitest run test/unit/clock.test.ts`
+Expected: FAIL — cannot resolve `../../src/clock.js`.
 
-- [ ] **Step 3: Write `src/db/paths.ts`**
+- [ ] **Step 3: Write `src/clock.ts`**
 
-`__dirname` moves between `src/` and `dist/`, so walk up to the `package.json` instead.
+```ts
+/**
+ * A source of epoch milliseconds.
+ *
+ * Everything that records or compares a timestamp takes one of these, so the
+ * lock lifecycle can be tested by setting the time rather than sleeping. Note
+ * that nothing in this project uses SQLite's own `datetime()`/`unixepoch()`:
+ * two clocks that can disagree is exactly the bug this avoids.
+ */
+export interface Clock {
+  now(): number;
+}
+
+export const systemClock: Clock = {
+  now: () => Date.now(),
+};
+
+export interface ManualClock extends Clock {
+  advance(ms: number): void;
+  set(ms: number): void;
+}
+
+/** A clock that only moves when a test moves it. */
+export function manualClock(startMs = 0): ManualClock {
+  let current = startMs;
+  return {
+    now: () => current,
+    advance: (ms) => { current += ms; },
+    set: (ms) => { current = ms; },
+  };
+}
+```
+
+- [ ] **Step 4: Add `MigrationError` to `src/errors.ts`**
+
+Append to the existing file, leaving the other classes untouched:
+
+```ts
+export class MigrationError extends ByakuganError {}
+```
+
+- [ ] **Step 5: Write `src/db/paths.ts`**
+
+`__dirname` moves between `src/` and `dist/`, so walk up to the `package.json`.
 
 ```ts
 import { existsSync } from 'node:fs';
@@ -1116,18 +1168,191 @@ export function repoRoot(): string {
   }
 }
 
+/** `MIGRATIONS_DIR` exists so tests can point the runner at a fixture directory. */
 export function migrationsDir(): string {
   return process.env.MIGRATIONS_DIR ?? join(repoRoot(), 'db', 'migrations');
 }
 ```
 
-- [ ] **Step 4: Write `src/db/connection.ts`**
+- [ ] **Step 6: Write `db/migrations/001_init.sql`**
+
+```sql
+-- Byakugan initial schema.
+--
+-- NUMERIC VALUES STORED AS TEXT: token_id, amount and tx_value_wei are uint256
+-- and exceed Number.MAX_SAFE_INTEGER, so they are TEXT to avoid precision loss.
+-- CONSEQUENCE: they sort LEXICOGRAPHICALLY, not numerically — '10' orders before
+-- '9', and '100' before '2'. Milestone 1 never orders by them (ordering is always
+-- block_number, log_index, batch_index). Anyone adding an ORDER BY or a range
+-- comparison on these columns must zero-pad or CAST, or the results will be wrong
+-- in a way that looks plausible.
+--
+-- TIMESTAMPS: locked_at and indexed_at are INTEGER epoch milliseconds, written
+-- from the injected Clock. SQLite's own datetime()/unixepoch() are deliberately
+-- not used anywhere — one clock, not two.
+
+CREATE TABLE IF NOT EXISTS collections (
+  chain_id            INTEGER NOT NULL,
+  contract            TEXT    NOT NULL,
+  -- NULL until bootstrap completes. `standard IS NULL` means "claimed, not yet
+  -- bootstrapped"; every read path must filter it out, or an unbootstrapped row
+  -- surfaces as an indexed collection holding zero transfers.
+  standard            TEXT    CHECK (standard IN ('721','1155')),
+  name                TEXT,
+  deploy_block        INTEGER,
+  deploy_block_source TEXT    CHECK (deploy_block_source IN
+                                     ('override','explorer','binary_search')),
+  last_indexed_block  INTEGER,
+  indexed_at          INTEGER,   -- epoch ms
+  locked_by           TEXT,
+  locked_at           INTEGER,   -- epoch ms
+  PRIMARY KEY (chain_id, contract)
+);
+
+CREATE TABLE IF NOT EXISTS transfers (
+  chain_id     INTEGER NOT NULL,
+  contract     TEXT    NOT NULL,
+  token_id     TEXT    NOT NULL,   -- uint256 as TEXT: sorts lexicographically
+  amount       TEXT    NOT NULL DEFAULT '1',
+  from_addr    TEXT    NOT NULL,
+  to_addr      TEXT    NOT NULL,
+  tx_hash      TEXT    NOT NULL,
+  block_number INTEGER NOT NULL,
+  log_index    INTEGER NOT NULL,
+  -- 0 for ERC-721 and TransferSingle; array position for TransferBatch. An
+  -- ERC-1155 TransferBatch is ONE log carrying ids[], so without this column
+  -- every token after the first collides on the primary key and is dropped.
+  batch_index  INTEGER NOT NULL DEFAULT 0,
+  tx_from      TEXT    NOT NULL,
+  tx_value_wei TEXT    NOT NULL,   -- uint256 as TEXT: sorts lexicographically
+  kind         TEXT    NOT NULL CHECK (kind IN ('mint','buy','transfer','burn')),
+  PRIMARY KEY (chain_id, tx_hash, log_index, batch_index),
+  -- Enforced only while PRAGMA foreign_keys = ON, which SQLite defaults OFF per
+  -- connection — see src/db/connection.ts.
+  FOREIGN KEY (chain_id, contract)
+    REFERENCES collections (chain_id, contract)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS transfers_contract_kind_pos
+  ON transfers (contract, kind, block_number, log_index);
+
+CREATE INDEX IF NOT EXISTS transfers_to_addr
+  ON transfers (to_addr);
+```
+
+- [ ] **Step 7: Write the failing connection test**
+
+`test/unit/connection.test.ts`:
+
+```ts
+import { afterEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type Database from 'better-sqlite3';
+import { openDb } from '../../src/db/connection.js';
+import { runMigrations } from '../../src/db/migrate.js';
+
+const temps: string[] = [];
+function tempDbPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'byakugan-'));
+  temps.push(dir);
+  return join(dir, 'test.db');
+}
+afterEach(() => {
+  while (temps.length) rmSync(temps.pop()!, { recursive: true, force: true });
+});
+
+describe('openDb', () => {
+  it('enables WAL on a file database', () => {
+    const db = openDb(tempDbPath());
+    const mode = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
+    expect(mode.journal_mode).toBe('wal');
+    db.close();
+  });
+
+  it('sets a busy timeout', () => {
+    const db = openDb(':memory:');
+    const timeout = db.prepare('PRAGMA busy_timeout').get() as { timeout: number };
+    expect(timeout.timeout).toBeGreaterThan(0);
+  });
+
+  it('turns foreign key enforcement on', () => {
+    const db = openDb(':memory:');
+    const fk = db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number };
+    expect(fk.foreign_keys).toBe(1);
+  });
+
+  // The assertion that matters. A pragma reading 1 only proves a pragma was set;
+  // this proves the constraint is actually enforced, and fails if either the
+  // pragma or the FOREIGN KEY clause disappears.
+  it('rejects a transfer whose collection does not exist', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    expect(() =>
+      db.prepare(`
+        INSERT INTO transfers
+          (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
+           block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
+        VALUES (1, '0xdoesnotexist', '1', '1', '0x0', '0xaaa', '0xtx',
+                1, 0, 0, '0xaaa', '0', 'mint')
+      `).run(),
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('accepts a transfer once its collection exists', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc');
+    expect(() =>
+      db.prepare(`
+        INSERT INTO transfers
+          (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
+           block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
+        VALUES (1, '0xabc', '1', '1', '0x0', '0xaaa', '0xtx',
+                1, 0, 0, '0xaaa', '0', 'mint')
+      `).run(),
+    ).not.toThrow();
+  });
+
+  it('cascades a collection delete to its transfers', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc');
+    db.prepare(`
+      INSERT INTO transfers
+        (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
+         block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
+      VALUES (1, '0xabc', '1', '1', '0x0', '0xaaa', '0xtx', 1, 0, 0, '0xaaa', '0', 'mint')
+    `).run();
+    db.prepare('DELETE FROM collections WHERE chain_id = 1 AND contract = ?').run('0xabc');
+    const left = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
+    expect(left.n).toBe(0);
+  });
+
+  it('creates the parent directory for a nested path', () => {
+    const nested = join(mkdtempSync(join(tmpdir(), 'byakugan-')), 'a', 'b', 'test.db');
+    temps.push(nested);
+    expect(() => openDb(nested).close()).not.toThrow();
+  });
+});
+```
+
+- [ ] **Step 8: Write `src/db/connection.ts`**
 
 ```ts
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 
+/**
+ * Opens the database with the pragmas this project depends on.
+ *
+ * `foreign_keys` is set HERE and not in a migration because SQLite defaults it
+ * OFF on every new connection: a migration would set it once and every later
+ * process would run unenforced. WAL and busy_timeout are likewise per-connection.
+ */
 export function openDb(path: string): Database.Database {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
@@ -1138,108 +1363,343 @@ export function openDb(path: string): Database.Database {
 }
 ```
 
-- [ ] **Step 5: Write `db/migrations/001_init.sql`**
+- [ ] **Step 9: Run the connection tests to verify they fail, then pass**
 
-`standard`, `deploy_block`, `deploy_block_source`, and `last_indexed_block` are nullable because a job claims a collection *before* bootstrap determines them. `standard IS NULL` means "claimed, not yet bootstrapped".
+Run: `npx vitest run test/unit/connection.test.ts`
+Expected first: FAIL (modules missing). After Steps 8 and 11: PASS, 7 tests.
 
-```sql
-CREATE TABLE IF NOT EXISTS collections (
-  chain_id            INTEGER NOT NULL,
-  contract            TEXT    NOT NULL,
-  standard            TEXT    CHECK (standard IN ('721','1155')),
-  name                TEXT,
-  deploy_block        INTEGER,
-  deploy_block_source TEXT    CHECK (deploy_block_source IN
-                                     ('override','explorer','binary_search')),
-  last_indexed_block  INTEGER,
-  indexed_at          TEXT,
-  locked_by           TEXT,
-  locked_at           TEXT,
-  PRIMARY KEY (chain_id, contract)
-);
+- [ ] **Step 10: Write the failing migration test**
 
-CREATE TABLE IF NOT EXISTS transfers (
-  chain_id     INTEGER NOT NULL,
-  contract     TEXT    NOT NULL,
-  token_id     TEXT    NOT NULL,
-  amount       TEXT    NOT NULL DEFAULT '1',
-  from_addr    TEXT    NOT NULL,
-  to_addr      TEXT    NOT NULL,
-  tx_hash      TEXT    NOT NULL,
-  block_number INTEGER NOT NULL,
-  log_index    INTEGER NOT NULL,
-  batch_index  INTEGER NOT NULL DEFAULT 0,
-  tx_from      TEXT    NOT NULL,
-  tx_value_wei TEXT    NOT NULL,
-  kind         TEXT    NOT NULL CHECK (kind IN ('mint','buy','transfer','burn')),
-  PRIMARY KEY (chain_id, tx_hash, log_index, batch_index)
-);
-
-CREATE INDEX IF NOT EXISTS transfers_contract_kind_pos
-  ON transfers (contract, kind, block_number, log_index);
-
-CREATE INDEX IF NOT EXISTS transfers_to_addr
-  ON transfers (to_addr);
-```
-
-- [ ] **Step 6: Write `src/db/migrate.ts`**
+`test/unit/migrate.test.ts`:
 
 ```ts
+import { afterEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openDb } from '../../src/db/connection.js';
+import { migrationsDir, repoRoot } from '../../src/db/paths.js';
+import { runMigrations } from '../../src/db/migrate.js';
+import { MigrationError } from '../../src/errors.js';
+
+const dirs: string[] = [];
+function fixtureDir(files: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), 'byakugan-mig-'));
+  dirs.push(dir);
+  for (const [name, sql] of Object.entries(files)) writeFileSync(join(dir, name), sql);
+  return dir;
+}
+afterEach(() => {
+  delete process.env.MIGRATIONS_DIR;
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+});
+
+describe('paths', () => {
+  it('resolves a repo root containing package.json', () => {
+    expect(existsSync(join(repoRoot(), 'package.json'))).toBe(true);
+  });
+
+  it('points migrationsDir at repo-root db/migrations by default', () => {
+    expect(migrationsDir()).toBe(join(repoRoot(), 'db', 'migrations'));
+    expect(existsSync(migrationsDir())).toBe(true);
+  });
+
+  it('honours MIGRATIONS_DIR', () => {
+    process.env.MIGRATIONS_DIR = '/tmp/elsewhere';
+    expect(migrationsDir()).toBe('/tmp/elsewhere');
+  });
+});
+
+describe('runMigrations — real schema', () => {
+  it('creates both tables and reports what it applied', () => {
+    const db = openDb(':memory:');
+    const applied = runMigrations(db);
+    expect(applied.map((a) => a.filename)).toContain('001_init.sql');
+    expect(applied[0]?.checksum).toMatch(/^[0-9a-f]{64}$/);
+
+    const names = (db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+    ).all() as Array<{ name: string }>).map((t) => t.name);
+    expect(names).toContain('collections');
+    expect(names).toContain('transfers');
+    expect(names).toContain('schema_migrations');
+  });
+
+  it('is idempotent — a second run applies nothing', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    expect(runMigrations(db)).toEqual([]);
+  });
+
+  it('gives transfers a primary key including batch_index', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    const pk = (db.prepare('PRAGMA table_info(transfers)').all() as Array<{
+      name: string; pk: number;
+    }>)
+      .filter((c) => c.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((c) => c.name);
+    expect(pk).toEqual(['chain_id', 'tx_hash', 'log_index', 'batch_index']);
+  });
+
+  it('accepts two rows differing only by batch_index', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc');
+    const insert = db.prepare(`
+      INSERT OR IGNORE INTO transfers
+        (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
+         block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
+      VALUES (1, '0xabc', @tokenId, '1', '0x0', '0xaaa', '0xbatch',
+              1, 4, @batchIndex, '0xaaa', '0', 'mint')
+    `);
+    insert.run({ tokenId: '10', batchIndex: 0 });
+    insert.run({ tokenId: '11', batchIndex: 1 });
+    const n = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
+    expect(n.n).toBe(2);
+  });
+
+  it('declares the timestamp columns as INTEGER epoch ms', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    const cols = (db.prepare('PRAGMA table_info(collections)').all() as Array<{
+      name: string; type: string;
+    }>);
+    expect(cols.find((c) => c.name === 'locked_at')?.type).toBe('INTEGER');
+    expect(cols.find((c) => c.name === 'indexed_at')?.type).toBe('INTEGER');
+  });
+});
+
+describe('runMigrations — checksum ledger', () => {
+  it('records a checksum per applied file', () => {
+    process.env.MIGRATIONS_DIR = fixtureDir({ '001_a.sql': 'CREATE TABLE a (x);' });
+    const db = openDb(':memory:');
+    runMigrations(db);
+    const row = db.prepare(
+      'SELECT filename, checksum, applied_at FROM schema_migrations',
+    ).get() as { filename: string; checksum: string; applied_at: number };
+    expect(row.filename).toBe('001_a.sql');
+    expect(row.checksum).toMatch(/^[0-9a-f]{64}$/);
+    expect(Number.isInteger(row.applied_at)).toBe(true);
+  });
+
+  // The drift bug this exists to prevent: skipping by filename lets an edited
+  // migration diverge the database from the repo, invisibly, for months.
+  it('fails loudly when an applied migration has been edited', () => {
+    const dir = fixtureDir({ '001_a.sql': 'CREATE TABLE a (x);' });
+    process.env.MIGRATIONS_DIR = dir;
+    const db = openDb(':memory:');
+    runMigrations(db);
+    writeFileSync(join(dir, '001_a.sql'), 'CREATE TABLE a (x, y);');
+    expect(() => runMigrations(db)).toThrow(MigrationError);
+    expect(() => runMigrations(db)).toThrow(/001_a\.sql/);
+  });
+
+  it('fails loudly when an applied migration has vanished from disk', () => {
+    const dir = fixtureDir({ '001_a.sql': 'CREATE TABLE a (x);' });
+    process.env.MIGRATIONS_DIR = dir;
+    const db = openDb(':memory:');
+    runMigrations(db);
+    rmSync(join(dir, '001_a.sql'));
+    expect(() => runMigrations(db)).toThrow(MigrationError);
+  });
+
+  it('does not flag an unchanged file on re-run', () => {
+    process.env.MIGRATIONS_DIR = fixtureDir({ '001_a.sql': 'CREATE TABLE a (x);' });
+    const db = openDb(':memory:');
+    runMigrations(db);
+    expect(() => runMigrations(db)).not.toThrow();
+  });
+});
+
+describe('runMigrations — one transaction per file', () => {
+  it('applies files in sorted order', () => {
+    process.env.MIGRATIONS_DIR = fixtureDir({
+      '002_b.sql': 'CREATE TABLE b (x);',
+      '001_a.sql': 'CREATE TABLE a (x);',
+    });
+    const db = openDb(':memory:');
+    expect(runMigrations(db).map((a) => a.filename)).toEqual(['001_a.sql', '002_b.sql']);
+  });
+
+  // A failure inside one file must leave no partial schema and no ledger row for
+  // it, while earlier files stay applied.
+  it('rolls back a failing file completely, keeping earlier files', () => {
+    process.env.MIGRATIONS_DIR = fixtureDir({
+      '001_a.sql': 'CREATE TABLE a (x);',
+      '002_bad.sql': 'CREATE TABLE b (x); THIS IS NOT SQL;',
+    });
+    const db = openDb(':memory:');
+    expect(() => runMigrations(db)).toThrow(MigrationError);
+
+    const names = (db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table'",
+    ).all() as Array<{ name: string }>).map((t) => t.name);
+    expect(names).toContain('a');
+    expect(names).not.toContain('b');
+
+    const recorded = (db.prepare(
+      'SELECT filename FROM schema_migrations',
+    ).all() as Array<{ filename: string }>).map((r) => r.filename);
+    expect(recorded).toEqual(['001_a.sql']);
+  });
+
+  it('resumes from where a failure stopped once the file is fixed', () => {
+    const dir = fixtureDir({
+      '001_a.sql': 'CREATE TABLE a (x);',
+      '002_bad.sql': 'THIS IS NOT SQL;',
+    });
+    process.env.MIGRATIONS_DIR = dir;
+    const db = openDb(':memory:');
+    expect(() => runMigrations(db)).toThrow(MigrationError);
+    writeFileSync(join(dir, '002_bad.sql'), 'CREATE TABLE b (x);');
+    expect(runMigrations(db).map((a) => a.filename)).toEqual(['002_bad.sql']);
+  });
+
+  it('ignores non-sql files', () => {
+    process.env.MIGRATIONS_DIR = fixtureDir({
+      '001_a.sql': 'CREATE TABLE a (x);',
+      'README.md': 'not a migration',
+    });
+    const db = openDb(':memory:');
+    expect(runMigrations(db).map((a) => a.filename)).toEqual(['001_a.sql']);
+  });
+});
+```
+
+- [ ] **Step 11: Write `src/db/migrate.ts`**
+
+```ts
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
+import { MigrationError } from '../errors.js';
+import { systemClock, type Clock } from '../clock.js';
 import { migrationsDir } from './paths.js';
 
-export function runMigrations(db: Database.Database): string[] {
+export interface AppliedMigration {
+  filename: string;
+  checksum: string;
+}
+
+const checksum = (sql: string): string =>
+  createHash('sha256').update(sql, 'utf8').digest('hex');
+
+/**
+ * Applies pending migrations, each in its own transaction.
+ *
+ * The ledger stores a content checksum, not just a filename, because skipping
+ * by filename alone lets an edited migration silently diverge the database from
+ * the repo — a drift bug that surfaces much later as an inexplicably missing
+ * column. A changed or missing file is therefore a hard failure, never a skip.
+ */
+export function runMigrations(
+  db: Database.Database,
+  clock: Clock = systemClock,
+): AppliedMigration[] {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
-      filename   TEXT PRIMARY KEY,
-      applied_at TEXT NOT NULL
+      filename   TEXT    PRIMARY KEY,
+      checksum   TEXT    NOT NULL,
+      applied_at INTEGER NOT NULL   -- epoch ms, from the injected Clock
     )
   `);
 
   const dir = migrationsDir();
   const files = readdirSync(dir).filter((f) => f.endsWith('.sql')).sort();
-  const seen = new Set(
-    (db.prepare('SELECT filename FROM schema_migrations').all() as Array<{ filename: string }>)
-      .map((r) => r.filename),
+  const onDisk = new Map(files.map((f) => [f, readFileSync(join(dir, f), 'utf8')]));
+
+  const recorded = new Map(
+    (db.prepare('SELECT filename, checksum FROM schema_migrations').all() as Array<{
+      filename: string; checksum: string;
+    }>).map((r) => [r.filename, r.checksum]),
   );
 
-  const applied: string[] = [];
-  const record = db.prepare(
-    'INSERT INTO schema_migrations (filename, applied_at) VALUES (?, ?)',
-  );
-
-  for (const file of files) {
-    if (seen.has(file)) continue;
-    const sql = readFileSync(join(dir, file), 'utf8');
-    db.transaction(() => {
-      db.exec(sql);
-      record.run(file, new Date().toISOString());
-    })();
-    applied.push(file);
+  // Verify every already-applied migration before applying anything new, so a
+  // drifted repo fails before it can layer more schema on top.
+  for (const [filename, recordedChecksum] of recorded) {
+    const sql = onDisk.get(filename);
+    if (sql === undefined) {
+      throw new MigrationError(
+        `migration ${filename} is recorded as applied but is missing from ${dir}. ` +
+        'The database and the repo have diverged; restore the file or reset the database.',
+      );
+    }
+    const actual = checksum(sql);
+    if (actual !== recordedChecksum) {
+      throw new MigrationError(
+        `migration ${filename} has changed since it was applied ` +
+        `(recorded ${recordedChecksum.slice(0, 12)}…, found ${actual.slice(0, 12)}…). ` +
+        'Applied migrations are immutable: add a new migration instead of editing this one.',
+      );
+    }
   }
+
+  const record = db.prepare(
+    'INSERT INTO schema_migrations (filename, checksum, applied_at) VALUES (?, ?, ?)',
+  );
+
+  const applied: AppliedMigration[] = [];
+  for (const filename of files) {
+    if (recorded.has(filename)) continue;
+    const sql = onDisk.get(filename);
+    if (sql === undefined) continue;
+    const sum = checksum(sql);
+
+    try {
+      // One transaction per file: a failure halfway leaves no partial schema
+      // and no ledger row, so a fixed file applies cleanly on the next run.
+      db.transaction(() => {
+        db.exec(sql);
+        record.run(filename, sum, clock.now());
+      })();
+    } catch (err) {
+      throw new MigrationError(
+        `migration ${filename} failed and was rolled back: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
+    applied.push({ filename, checksum: sum });
+  }
+
   return applied;
 }
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 12: Run every test and typecheck**
 
-Run: `npx vitest run test/unit/migrate.test.ts && npm run typecheck`
-Expected: PASS, 7 tests.
+Run: `npx vitest run test/unit/clock.test.ts test/unit/connection.test.ts test/unit/migrate.test.ts && npm run typecheck`
+Expected: PASS — 4 clock, 7 connection, 16 migration. Then `npm test` for the whole suite.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
-git add src/db/ db/migrations/ test/unit/migrate.test.ts
-git commit -m "feat: SQLite connection, migration runner, and initial schema
+git add src/clock.ts src/db/ src/errors.ts db/migrations/ test/unit/clock.test.ts test/unit/connection.test.ts test/unit/migrate.test.ts
+git commit -m "feat: SQLite connection, checksummed migration runner, and schema
 
-transfers PK is (chain_id, tx_hash, log_index, batch_index): an ERC-1155
-TransferBatch is one log carrying ids[], so without batch_index INSERT OR
-IGNORE would keep the first token and silently drop the rest.
+foreign_keys is set per connection, not in a migration: SQLite defaults
+it OFF on every new connection, so a migration would set it once and
+every later process would run unenforced. transfers now actually has a
+composite FK to collections with ON DELETE CASCADE, so the pragma guards
+something — and the test asserts an orphan insert is REJECTED rather than
+asserting the pragma reads 1.
 
-The runner resolves migrations by walking up for package.json, since
-__dirname differs between src/ and dist/.
+schema_migrations stores a SHA-256 of each file. Skipping by filename
+alone lets an edited migration silently diverge the database from the
+repo; a changed or vanished file is now a hard failure. Each file applies
+in its own transaction, so a partial failure leaves no schema and no
+ledger row.
+
+Timestamps are INTEGER epoch ms from an injected Clock. SQLite's
+datetime() is used nowhere — two clocks that can disagree is the bug.
+
+The schema comments record that token_id, amount and tx_value_wei are
+TEXT and therefore sort lexicographically, which is a trap for anyone
+adding an ORDER BY later.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -1253,15 +1713,15 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `test/unit/collections.repo.test.ts`
 
 **Interfaces:**
-- Consumes: `openDb`, `runMigrations` (Task 3); `Standard`, `DeployBlockSource` (Task 1)
+- Consumes: `openDb`, `runMigrations`, `Clock`, `manualClock` (Task 3); `Standard`, `DeployBlockSource` (Task 1)
 - Produces:
   - `type CollectionState = { state: 'not_indexed' } | { state: 'indexed'; standard: Standard; deployBlock: number; lastIndexedBlock: number; name: string | null }`
-  - `claimCollection(db, a: { chainId, contract, jobId, now: Date, staleMs: number }): boolean`
+  - `claimCollection(db, a: { chainId, contract, jobId, clock: Clock, staleMs: number }): boolean`
   - `releaseCollection(db, a: { chainId, contract, jobId }): void`
   - `deleteUnbootstrapped(db, a: { chainId, contract, jobId }): void`
   - `finishBootstrap(db, a: { chainId, contract, standard, deployBlock, deployBlockSource, name }): void`
   - `getCollection(db, chainId: number, contract: string): CollectionState`
-  - `advanceWatermark(db, a: { chainId, contract, jobId, toBlock: number, now: Date }): void`
+  - `advanceWatermark(db, a: { chainId, contract, jobId, toBlock: number, clock: Clock }): void`
 
 This repository deliberately exposes **no** raw "get row by address". `getCollection` returns a tagged union, so a caller cannot forget the `standard IS NOT NULL` filter — an unbootstrapped row must never surface as an indexed collection with zero transfers.
 
@@ -1274,6 +1734,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type Database from 'better-sqlite3';
 import { openDb } from '../../src/db/connection.js';
 import { runMigrations } from '../../src/db/migrate.js';
+import { manualClock } from '../../src/clock.js';
 import {
   advanceWatermark, claimCollection, deleteUnbootstrapped,
   finishBootstrap, getCollection, releaseCollection,
@@ -1282,6 +1743,7 @@ import {
 const CHAIN = 1;
 const CONTRACT = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
 const STALE_MS = 300_000;
+const T0 = 1_774_000_000_000;   // fixed epoch ms; no wall clock in these tests
 
 let db: Database.Database;
 beforeEach(() => {
@@ -1289,8 +1751,13 @@ beforeEach(() => {
   runMigrations(db);
 });
 
-const claim = (jobId: string, now = new Date('2026-09-23T12:00:00Z')) =>
-  claimCollection(db, { chainId: CHAIN, contract: CONTRACT, jobId, now, staleMs: STALE_MS });
+// One injected clock drives both the timestamp written and the staleness cutoff,
+// so these tests set the time instead of sleeping.
+const claim = (jobId: string, atMs = T0) =>
+  claimCollection(db, {
+    chainId: CHAIN, contract: CONTRACT, jobId,
+    clock: manualClock(atMs), staleMs: STALE_MS,
+  });
 
 describe('claimCollection', () => {
   it('creates the row and acquires the lock when no row exists', () => {
@@ -1308,8 +1775,8 @@ describe('claimCollection', () => {
   });
 
   it('grants a claim over a stale lock', () => {
-    claim('job-a', new Date('2026-09-23T12:00:00Z'));
-    expect(claim('job-b', new Date('2026-09-23T12:10:00Z'))).toBe(true);
+    claim('job-a', T0);
+    expect(claim('job-b', T0 + 600_000)).toBe(true);   // 10 min later: stale
   });
 
   it('lets a new job claim after release', () => {
@@ -1372,19 +1839,19 @@ describe('deleteUnbootstrapped', () => {
 
 describe('advanceWatermark', () => {
   it('moves the watermark and refreshes the lock together', () => {
-    claim('job-a', new Date('2026-09-23T12:00:00Z'));
+    claim('job-a', T0);
     finishBootstrap(db, {
       chainId: CHAIN, contract: CONTRACT, standard: '721',
       deployBlock: 100, deployBlockSource: 'override', name: null,
     });
     advanceWatermark(db, {
       chainId: CHAIN, contract: CONTRACT, jobId: 'job-a',
-      toBlock: 500, now: new Date('2026-09-23T12:04:00Z'),
+      toBlock: 500, clock: manualClock(T0 + 240_000),   // 4 min later
     });
     const state = getCollection(db, CHAIN, CONTRACT);
     expect(state).toMatchObject({ state: 'indexed', lastIndexedBlock: 500 });
     // The refreshed lock means a competing claim still fails at 12:06.
-    expect(claim('job-b', new Date('2026-09-23T12:06:00Z'))).toBe(false);
+    expect(claim('job-b', T0 + 360_000)).toBe(false);   // 6 min: heartbeat kept it fresh
   });
 });
 ```
@@ -1398,6 +1865,7 @@ Expected: FAIL — cannot resolve `../../src/db/repositories/collections.js`.
 
 ```ts
 import type Database from 'better-sqlite3';
+import type { Clock } from '../../clock.js';
 import type { DeployBlockSource, Standard } from '../../types.js';
 
 export type CollectionState =
@@ -1421,21 +1889,23 @@ export type CollectionState =
  */
 export function claimCollection(
   db: Database.Database,
-  a: { chainId: number; contract: string; jobId: string; now: Date; staleMs: number },
+  a: { chainId: number; contract: string; jobId: string; clock: Clock; staleMs: number },
 ): boolean {
-  const nowIso = a.now.toISOString();
-  const staleCutoff = new Date(a.now.getTime() - a.staleMs).toISOString();
+  // Both values come from ONE clock read, so the write and the cutoff cannot
+  // disagree. Epoch ms INTEGER throughout — SQLite's datetime() is never used.
+  const nowMs = a.clock.now();
+  const staleCutoff = nowMs - a.staleMs;
   const result = db
     .prepare(`
       INSERT INTO collections (chain_id, contract, locked_by, locked_at)
-      VALUES (@chainId, @contract, @jobId, @nowIso)
+      VALUES (@chainId, @contract, @jobId, @nowMs)
       ON CONFLICT (chain_id, contract) DO UPDATE
          SET locked_by = excluded.locked_by,
              locked_at = excluded.locked_at
        WHERE collections.locked_by IS NULL
           OR collections.locked_at < @staleCutoff
     `)
-    .run({ ...a, nowIso, staleCutoff });
+    .run({ chainId: a.chainId, contract: a.contract, jobId: a.jobId, nowMs, staleCutoff });
   return result.changes === 1;
 }
 
@@ -1519,16 +1989,16 @@ export function getCollection(
 
 export function advanceWatermark(
   db: Database.Database,
-  a: { chainId: number; contract: string; jobId: string; toBlock: number; now: Date },
+  a: { chainId: number; contract: string; jobId: string; toBlock: number; clock: Clock },
 ): void {
-  const nowIso = a.now.toISOString();
+  const nowMs = a.clock.now();
   db.prepare(`
     UPDATE collections
        SET last_indexed_block = @toBlock,
-           indexed_at = @nowIso,
-           locked_at = @nowIso
+           indexed_at = @nowMs,
+           locked_at = @nowMs
      WHERE chain_id = @chainId AND contract = @contract AND locked_by = @jobId
-  `).run({ ...a, nowIso });
+  `).run({ chainId: a.chainId, contract: a.contract, jobId: a.jobId, toBlock: a.toBlock, nowMs });
 }
 ```
 
@@ -1562,6 +2032,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `TransferRow`, `TxInfo` (Task 1); `openDb`, `runMigrations` (Task 3)
+
+**Note on the foreign key:** `transfers` references `collections (chain_id, contract)` and
+`foreign_keys` enforcement is ON, so every test in this file must insert a parent
+`collections` row first. The repository itself needs no change — in production, bootstrap
+always creates the collection before any transfer is inserted.
 - Produces:
   - `chunked<T>(items: T[], size?: number): T[][]` (default size 500)
   - `insertTransfers(db, rows: TransferRow[]): number` (rows actually inserted)
@@ -1635,6 +2110,10 @@ let db: Database.Database;
 beforeEach(() => {
   db = openDb(':memory:');
   runMigrations(db);
+  // transfers has a composite FK to collections (chain_id, contract) with
+  // foreign_keys enforcement ON, so a parent row must exist before any insert.
+  // Without this every test here fails on FOREIGN KEY constraint.
+  db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run(CONTRACT);
 });
 
 describe('insertTransfers', () => {
