@@ -1907,8 +1907,21 @@ describe('claimCollection', () => {
   });
 });
 
-// Cross-connection contention. The sequential test above cannot distinguish a
-// single-statement claim from a check-then-claim, so this is the one that does.
+// Cross-connection behaviour.
+//
+// HONEST SCOPE: this does NOT distinguish a single-statement claim from a
+// check-then-claim either, and that was verified rather than assumed. Swapping a
+// check-then-claim in as the implementation still yields one winner, because its
+// own SELECT runs AFTER B's commit and therefore sees the fresh lock. The only
+// way to make it steal is to decompose it by hand so its read straddles B's
+// commit — which is the test author constructing the interleaving, not the test
+// detecting it. Genuine detection needs real concurrency (two OS threads inside
+// one call), which a synchronous single-process driver cannot produce.
+//
+// What this test DOES prove: a claim is immediately visible across connections,
+// and a stale pre-read does not authorise a steal in the real implementation.
+// The single-statement property itself is pinned by the statement-count test
+// below, which is deterministic and does discriminate.
 //
 // JOURNAL MODE: WAL, which `openDb` sets for any file path. That matters and is
 // not incidental — under WAL a reader does not block a writer, so a read issued
@@ -1954,7 +1967,7 @@ describe('claimCollection — cross-connection atomicity', () => {
       clock: manualClock(atMs), staleMs: STALE_MS,
     });
 
-  it('does not let a stale read on one connection steal a lock another just took', () => {
+  it('does not steal on the strength of a stale pre-read', () => {
     // job-a holds a lock that will go stale.
     expect(claimOn(connB, 'job-a', T0)).toBe(true);
     const stale = T0 + 600_000;
@@ -1985,6 +1998,71 @@ describe('claimCollection — cross-connection atomicity', () => {
   it('makes a claim on one connection immediately visible to the other', () => {
     expect(claimOn(connB, 'job-a', T0)).toBe(true);
     expect(claimOn(connC, 'job-b', T0 + 1)).toBe(false);
+  });
+});
+
+// THE DISCRIMINATOR for the atomicity property.
+//
+// The property is "the staleness predicate is evaluated in the same statement
+// that writes the lock". That is a statement-count property, so test it directly
+// instead of trying to manufacture an interleaving a synchronous driver cannot
+// produce. A counting Proxy over the Database records every prepared statement:
+// the real claim prepares exactly ONE, a check-then-claim prepares two.
+//
+// Mutation-verified: real implementation 1 statement, check-then-claim 2.
+describe('claimCollection — single-statement atomicity', () => {
+  function countingDb(target: Database.Database): {
+    proxy: Database.Database; statements: string[];
+  } {
+    const statements: string[] = [];
+    const proxy = new Proxy(target, {
+      get(obj, prop, receiver) {
+        const value = Reflect.get(obj, prop, receiver);
+        if (prop === 'prepare') {
+          return (sql: string) => {
+            statements.push(sql);
+            return (value as Database.Database['prepare']).call(obj, sql);
+          };
+        }
+        return typeof value === 'function' ? value.bind(obj) : value;
+      },
+    }) as Database.Database;
+    return { proxy, statements };
+  }
+
+  it('prepares exactly one statement, so staleness cannot be tested separately', () => {
+    const { proxy, statements } = countingDb(db);
+    claimCollection(proxy, {
+      chainId: CHAIN, contract: CONTRACT, jobId: 'job-a',
+      clock: manualClock(T0), staleMs: STALE_MS,
+    });
+    // Two or more means the staleness check and the write are separable, which
+    // is exactly the check-then-claim bug.
+    expect(statements).toHaveLength(1);
+  });
+
+  it('that one statement both tests staleness and writes the lock', () => {
+    const { proxy, statements } = countingDb(db);
+    claimCollection(proxy, {
+      chainId: CHAIN, contract: CONTRACT, jobId: 'job-a',
+      clock: manualClock(T0), staleMs: STALE_MS,
+    });
+    const sql = statements[0] ?? '';
+    expect(sql).toMatch(/ON CONFLICT/i);       // creates or takes over in one go
+    expect(sql).toMatch(/locked_by IS NULL/i); // the staleness predicate...
+    expect(sql).toMatch(/locked_at\s*</i);     // ...lives in the same statement
+    expect(sql).toMatch(/SET\s+locked_by/i);   // and so does the write
+  });
+
+  it('still prepares one statement when stealing a stale lock', () => {
+    claim('job-a', T0);
+    const { proxy, statements } = countingDb(db);
+    const won = claimCollection(proxy, {
+      chainId: CHAIN, contract: CONTRACT, jobId: 'job-b',
+      clock: manualClock(T0 + 600_000), staleMs: STALE_MS,
+    });
+    expect(won).toBe(true);
+    expect(statements).toHaveLength(1);
   });
 });
 
@@ -2263,9 +2341,9 @@ export function advanceWatermark(
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `npx vitest run test/unit/jobId.test.ts test/unit/collections.repo.test.ts && npm run typecheck`
-Expected: PASS — 4 job-id tests and 19 collections tests.
+Expected: PASS — 4 job-id tests and 22 collections tests.
 
-**Then mutation-verify the cross-connection test, which is not optional** (see
+**Then mutation-verify the statement-count test, which is not optional** (see
 CLAUDE.md, "Mutation verification is mandatory for property tests"). In a scratch
 file OUTSIDE `src/`, write a check-then-claim shaped like the real bug:
 
@@ -2289,9 +2367,10 @@ function badClaim(db: Database.Database, jobId: string, atMs: number): boolean {
 }
 ```
 
-Run the same cross-connection scenario against `badClaim` and report both
-outcomes: the real claim must leave `job-b` holding the lock, and the mutant must
-let `job-c` steal it. **If the mutant also produces the correct result, the test
+Run it through the counting Proxy and report both statement counts: the real
+`claimCollection` must prepare exactly 1, and `badClaim` must prepare 2. That is
+the comparison that settles the property. Do NOT use the cross-connection
+scenario as the mutation check — it was verified not to discriminate. **If the mutant also produces the correct result, the test
 does not pin the property — say so plainly and record it as a gap rather than
 shipping a test that cannot fail.** Delete the scratch file afterwards.
 
