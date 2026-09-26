@@ -1,7 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { openDb } from '../../src/db/connection.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -21,11 +18,8 @@ beforeEach(() => {
   db = openDb(':memory:');
   runMigrations(db);
 });
-// Push the mkdtemp ROOT, never a nested path: pushing the leaf leaked an empty
-// tree per run in Task 3.
-const tempRoots: string[] = [];
 afterEach(() => {
-  while (tempRoots.length) rmSync(tempRoots.pop()!, { recursive: true, force: true });
+  db.close();
 });
 
 // One injected clock drives both the timestamp written and the staleness cutoff,
@@ -65,7 +59,7 @@ describe('claimCollection', () => {
   // synchronous and single-process, so the first attempt's write always
   // commits before the second attempt's read, and the interleaving that
   // breaks check-then-claim is unreachable on one connection. The
-  // cross-connection test below is the one that pins the property.
+  // single-statement atomicity test below is the one that pins the property.
   it('leaves exactly one holder after two sequential steal attempts', () => {
     claim('job-a', T0);
     const steals = [claim('job-b', T0 + 600_000), claim('job-c', T0 + 600_000)];
@@ -81,109 +75,53 @@ describe('claimCollection', () => {
   });
 });
 
-// Cross-connection behaviour.
-//
-// HONEST SCOPE: this does NOT distinguish a single-statement claim from a
-// check-then-claim either, and that was verified rather than assumed. Swapping a
-// check-then-claim in as the implementation still yields one winner, because its
-// own SELECT runs AFTER B's commit and therefore sees the fresh lock. The only
-// way to make it steal is to decompose it by hand so its read straddles B's
-// commit — which is the test author constructing the interleaving, not the test
-// detecting it. Genuine detection needs real concurrency (two OS threads inside
-// one call), which a synchronous single-process driver cannot produce.
-//
-// What this test DOES prove: a claim is immediately visible across connections,
-// and a stale pre-read does not authorise a steal in the real implementation.
-// The single-statement property itself is pinned by the statement-count test
-// below, which is deterministic and does discriminate.
-//
-// JOURNAL MODE: WAL, which `openDb` sets for any file path. That matters and is
-// not incidental — under WAL a reader does not block a writer, so a read issued
-// while another connection holds an open write transaction sees the last
-// COMMITTED snapshot rather than blocking. That is what makes a stale read
-// reachable, and therefore what makes the check-then-claim bug demonstrable.
-// Under `journal_mode = DELETE` the reader would block instead, and the test
-// would pass for a reason unrelated to atomicity.
-//
-// `:memory:` cannot be used here: separate connections cannot share it.
-describe('claimCollection — cross-connection atomicity', () => {
-  let connB: Database.Database;
-  let connC: Database.Database;
-
-  beforeEach(() => {
-    const root = mkdtempSync(join(tmpdir(), 'byakugan-lock-'));
-    tempRoots.push(root);
-    const dbPath = join(root, 'lock.db');
-
-    const setup = openDb(dbPath);
-    runMigrations(setup);
-    setup.close();
-
-    connB = openDb(dbPath);
-    connC = openDb(dbPath);
-    // Generous and explicit: a blocked statement must wait for the other
-    // connection rather than returning SQLITE_BUSY, or the result becomes a
-    // timing coin-flip instead of a verdict.
-    for (const conn of [connB, connC]) conn.pragma('busy_timeout = 30000');
-
-    expect((connB.prepare('PRAGMA journal_mode').get() as { journal_mode: string })
-      .journal_mode).toBe('wal');
-  });
-
-  afterEach(() => {
-    connB.close();
-    connC.close();
-  });
-
-  const claimOn = (conn: Database.Database, jobId: string, atMs: number) =>
-    claimCollection(conn, {
-      chainId: CHAIN, contract: CONTRACT, jobId,
-      clock: manualClock(atMs), staleMs: STALE_MS,
-    });
-
-  it('does not steal on the strength of a stale pre-read', () => {
-    // job-a holds a lock that will go stale.
-    expect(claimOn(connB, 'job-a', T0)).toBe(true);
-    const stale = T0 + 600_000;
-
-    // C reads the world at `stale`: the lock IS stale here, so a
-    // check-then-claim implementation would decide to steal from this read.
-    const seenByC = connC
-      .prepare('SELECT locked_by, locked_at FROM collections WHERE chain_id = ? AND contract = ?')
-      .get(CHAIN, CONTRACT) as { locked_by: string; locked_at: number };
-    expect(seenByC.locked_by).toBe('job-a');
-    expect(seenByC.locked_at).toBeLessThan(stale - STALE_MS);
-
-    // B steals it first and commits.
-    expect(claimOn(connB, 'job-b', stale)).toBe(true);
-
-    // C now acts on the decision implied by its earlier read. The real claim
-    // re-evaluates staleness inside the same statement that writes, so it sees
-    // job-b's fresh lock and loses. A check-then-claim would blindly UPDATE and
-    // steal from job-b.
-    expect(claimOn(connC, 'job-c', stale)).toBe(false);
-
-    const holder = connB
-      .prepare('SELECT locked_by FROM collections WHERE chain_id = ? AND contract = ?')
-      .get(CHAIN, CONTRACT) as { locked_by: string };
-    expect(holder.locked_by).toBe('job-b');
-  });
-
-  it('makes a claim on one connection immediately visible to the other', () => {
-    expect(claimOn(connB, 'job-a', T0)).toBe(true);
-    expect(claimOn(connC, 'job-b', T0 + 1)).toBe(false);
-  });
-});
-
 // THE DISCRIMINATOR for the atomicity property.
 //
 // The property is "the staleness predicate is evaluated in the same statement
 // that writes the lock". That is a statement-count property, so test it directly
 // instead of trying to manufacture an interleaving a synchronous driver cannot
-// produce. A counting Proxy over the Database records every prepared statement:
-// the real claim prepares exactly ONE, a check-then-claim prepares two.
+// produce.
 //
+// WHY statement count is a valid proxy, not just a smell test: better-sqlite3's
+// `db.prepare()` rejects multi-statement SQL outright, so one call to `prepare`
+// can only ever correspond to one SQL statement, which SQLite runs as one
+// implicit transaction. One `prepare` therefore *is* one atomic unit of work —
+// there is no way for `claimCollection` to prepare once and still have split
+// its check and its write across two transactions.
+//
+// A counting Proxy over the Database records every prepared statement: the
+// real claim prepares exactly ONE, a check-then-claim prepares two.
 // Mutation-verified: real implementation 1 statement, check-then-claim 2.
+//
+// HONEST SCOPE — what this actually pins, and what it doesn't:
+// - It pins "`claimCollection` calls `db.prepare` exactly once", which is not
+//   literally the same claim as "the claim is atomic" — it is a proxy for it,
+//   justified by the `prepare`-is-one-statement fact above. A contrived mutant
+//   using `db.exec()` for the write plus a read from a statement *prepared
+//   outside* `claimCollection` (so the count seen by this Proxy is 0 or 1
+//   depending on where you place the boundary) can pass all three tests here;
+//   this was built and confirmed during review. It is not a plausible accident
+//   — it requires a hoisted statement AND string-interpolated `exec` — but the
+//   tests do not rule it out, so this comment should not claim they do.
+// - A future refactor that caches a prepared statement across calls (a common,
+//   legitimate perf pattern for a hot path) would make the count seen here 0
+//   and fail test 3 (`still prepares one statement when stealing a stale
+//   lock`), even though such a refactor could be perfectly atomic. That is a
+//   false alarm, not a false pass — but whoever hits it should know why this
+//   test is objecting rather than assume the refactor broke locking.
+// - The SQL-text regexes in the second test are the only thing here that would
+//   catch a single-`prepare` mutant built around a bare `UPDATE` with no
+//   staleness `WHERE` at all — they are load-bearing, not decorative. They are
+//   also brittle: a correct reordering like `SET locked_at = ..., locked_by =
+//   ...` would fail `/SET\s+locked_by/i`, and staleness-related text sitting
+//   inside a SQL comment would satisfy the same regex without being a real
+//   predicate.
+// - Genuine concurrent detection (two OS processes racing real writes against
+//   one WAL-mode file) is out of scope for this suite, not impossible — it was
+//   previously described here as something a synchronous driver "cannot
+//   produce", which overstated the case: multi-process concurrency against a
+//   shared file WOULD be able to detect the interleaving this property
+//   protects against; it is simply not exercised by this unit test suite.
 describe('claimCollection — single-statement atomicity', () => {
   function countingDb(target: Database.Database): {
     proxy: Database.Database; statements: string[];
