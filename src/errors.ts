@@ -10,3 +10,4 @@ export class UnsupportedStandardError extends ByakuganError {}
 export class DeployBlockUnavailableError extends ByakuganError {}
 export class RangeExhaustedError extends ByakuganError {}
 export class CollectionLockedError extends ByakuganError {}
+export class MigrationError extends ByakuganError {}
