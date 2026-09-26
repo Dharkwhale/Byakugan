@@ -84,8 +84,95 @@ describe('openDb', () => {
   });
 
   it('creates the parent directory for a nested path', () => {
-    const nested = join(mkdtempSync(join(tmpdir(), 'byakugan-')), 'a', 'b', 'test.db');
-    temps.push(nested);
+    const root = mkdtempSync(join(tmpdir(), 'byakugan-'));
+    temps.push(root);
+    const nested = join(root, 'a', 'b', 'test.db');
     expect(() => openDb(nested).close()).not.toThrow();
+  });
+});
+
+// A mixed-case address stored once makes Milestone 2's `overlap` and
+// `firstMinters` queries silently miss matches (they compare addresses as
+// text), producing a plausible-looking wrong answer instead of an error. The
+// CHECK constraints below turn that into a loud INSERT failure. Asserting on
+// rejection, not on the constraint's presence in sqlite_master: a schema-text
+// grep would pass even if the constraint were unenforced.
+describe('lowercase address enforcement', () => {
+  it('rejects a collection with a mixed-case contract', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    expect(() =>
+      db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xABC'),
+    ).toThrow(/CHECK constraint failed/i);
+  });
+
+  it('accepts a collection with an all-lowercase contract', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    expect(() =>
+      db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc'),
+    ).not.toThrow();
+  });
+
+  interface TransferRow {
+    chainId: number;
+    contract: string;
+    tokenId: string;
+    amount: string;
+    fromAddr: string;
+    toAddr: string;
+    txHash: string;
+    blockNumber: number;
+    logIndex: number;
+    batchIndex: number;
+    txFrom: string;
+    txValueWei: string;
+    kind: string;
+  }
+
+  const baseTransfer: TransferRow = {
+    chainId: 1,
+    contract: '0xabc',
+    tokenId: '1',
+    amount: '1',
+    fromAddr: '0xfrom',
+    toAddr: '0xto',
+    txHash: '0xtx',
+    blockNumber: 1,
+    logIndex: 0,
+    batchIndex: 0,
+    txFrom: '0xfrom',
+    txValueWei: '0',
+    kind: 'mint',
+  };
+
+  function insertTransfer(db: Database.Database, overrides: Partial<TransferRow>): void {
+    const row = { ...baseTransfer, ...overrides };
+    db.prepare(`
+      INSERT INTO transfers
+        (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
+         block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
+      VALUES (@chainId, @contract, @tokenId, @amount, @fromAddr, @toAddr, @txHash,
+              @blockNumber, @logIndex, @batchIndex, @txFrom, @txValueWei, @kind)
+    `).run(row);
+  }
+
+  it.each<[string, Partial<TransferRow>]>([
+    ['contract', { contract: '0xABC' }],
+    ['from_addr', { fromAddr: '0xFROM' }],
+    ['to_addr', { toAddr: '0xTO' }],
+    ['tx_from', { txFrom: '0xFROM' }],
+  ])('rejects a transfer with a mixed-case %s', (_column, overrides) => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc');
+    expect(() => insertTransfer(db, overrides)).toThrow(/CHECK constraint failed/i);
+  });
+
+  it('accepts a transfer whose contract, from_addr, to_addr and tx_from are all lowercase', () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc');
+    expect(() => insertTransfer(db, {})).not.toThrow();
   });
 });
