@@ -1824,7 +1824,10 @@ Re-run: PASS, 4 tests.
 `test/unit/collections.repo.test.ts`:
 
 ```ts
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { openDb } from '../../src/db/connection.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -1843,6 +1846,12 @@ let db: Database.Database;
 beforeEach(() => {
   db = openDb(':memory:');
   runMigrations(db);
+});
+// Push the mkdtemp ROOT, never a nested path: pushing the leaf leaked an empty
+// tree per run in Task 3.
+const tempRoots: string[] = [];
+afterEach(() => {
+  while (tempRoots.length) rmSync(tempRoots.pop()!, { recursive: true, force: true });
 });
 
 // One injected clock drives both the timestamp written and the staleness cutoff,
@@ -1873,10 +1882,17 @@ describe('claimCollection', () => {
     expect(claim('job-b', T0 + 600_000)).toBe(true);   // 10 min later: stale
   });
 
-  // Two jobs must not both steal the same stale lock. This passes only because
-  // the staleness test lives inside the claim statement's WHERE: a SELECT-then-
-  // UPDATE would let both observe the stale lock and both take it.
-  it('resolves two racing steals of one stale lock to exactly one winner', () => {
+  // Two sequential steal attempts against one stale lock leave exactly one
+  // holder, because the winning claim writes locked_at in the same statement
+  // that tests it, so the second attempt sees a fresh lock.
+  //
+  // This does NOT prove atomicity. It was mutation-tested and passes
+  // identically against a check-then-claim implementation: better-sqlite3 is
+  // synchronous and single-process, so the first attempt's write always
+  // commits before the second attempt's read, and the interleaving that
+  // breaks check-then-claim is unreachable on one connection. The
+  // cross-connection test below is the one that pins the property.
+  it('leaves exactly one holder after two sequential steal attempts', () => {
     claim('job-a', T0);
     const steals = [claim('job-b', T0 + 600_000), claim('job-c', T0 + 600_000)];
     expect(steals.filter(Boolean)).toHaveLength(1);
@@ -1888,6 +1904,87 @@ describe('claimCollection', () => {
     claim('job-a');
     releaseCollection(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'job-a' });
     expect(claim('job-b')).toBe(true);
+  });
+});
+
+// Cross-connection contention. The sequential test above cannot distinguish a
+// single-statement claim from a check-then-claim, so this is the one that does.
+//
+// JOURNAL MODE: WAL, which `openDb` sets for any file path. That matters and is
+// not incidental — under WAL a reader does not block a writer, so a read issued
+// while another connection holds an open write transaction sees the last
+// COMMITTED snapshot rather than blocking. That is what makes a stale read
+// reachable, and therefore what makes the check-then-claim bug demonstrable.
+// Under `journal_mode = DELETE` the reader would block instead, and the test
+// would pass for a reason unrelated to atomicity.
+//
+// `:memory:` cannot be used here: separate connections cannot share it.
+describe('claimCollection — cross-connection atomicity', () => {
+  let connB: Database.Database;
+  let connC: Database.Database;
+
+  beforeEach(() => {
+    const root = mkdtempSync(join(tmpdir(), 'byakugan-lock-'));
+    tempRoots.push(root);
+    const dbPath = join(root, 'lock.db');
+
+    const setup = openDb(dbPath);
+    runMigrations(setup);
+    setup.close();
+
+    connB = openDb(dbPath);
+    connC = openDb(dbPath);
+    // Generous and explicit: a blocked statement must wait for the other
+    // connection rather than returning SQLITE_BUSY, or the result becomes a
+    // timing coin-flip instead of a verdict.
+    for (const conn of [connB, connC]) conn.pragma('busy_timeout = 30000');
+
+    expect((connB.prepare('PRAGMA journal_mode').get() as { journal_mode: string })
+      .journal_mode).toBe('wal');
+  });
+
+  afterEach(() => {
+    connB.close();
+    connC.close();
+  });
+
+  const claimOn = (conn: Database.Database, jobId: string, atMs: number) =>
+    claimCollection(conn, {
+      chainId: CHAIN, contract: CONTRACT, jobId,
+      clock: manualClock(atMs), staleMs: STALE_MS,
+    });
+
+  it('does not let a stale read on one connection steal a lock another just took', () => {
+    // job-a holds a lock that will go stale.
+    expect(claimOn(connB, 'job-a', T0)).toBe(true);
+    const stale = T0 + 600_000;
+
+    // C reads the world at `stale`: the lock IS stale here, so a
+    // check-then-claim implementation would decide to steal from this read.
+    const seenByC = connC
+      .prepare('SELECT locked_by, locked_at FROM collections WHERE chain_id = ? AND contract = ?')
+      .get(CHAIN, CONTRACT) as { locked_by: string; locked_at: number };
+    expect(seenByC.locked_by).toBe('job-a');
+    expect(seenByC.locked_at).toBeLessThan(stale - STALE_MS);
+
+    // B steals it first and commits.
+    expect(claimOn(connB, 'job-b', stale)).toBe(true);
+
+    // C now acts on the decision implied by its earlier read. The real claim
+    // re-evaluates staleness inside the same statement that writes, so it sees
+    // job-b's fresh lock and loses. A check-then-claim would blindly UPDATE and
+    // steal from job-b.
+    expect(claimOn(connC, 'job-c', stale)).toBe(false);
+
+    const holder = connB
+      .prepare('SELECT locked_by FROM collections WHERE chain_id = ? AND contract = ?')
+      .get(CHAIN, CONTRACT) as { locked_by: string };
+    expect(holder.locked_by).toBe('job-b');
+  });
+
+  it('makes a claim on one connection immediately visible to the other', () => {
+    expect(claimOn(connB, 'job-a', T0)).toBe(true);
+    expect(claimOn(connC, 'job-b', T0 + 1)).toBe(false);
   });
 });
 
@@ -2166,7 +2263,37 @@ export function advanceWatermark(
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `npx vitest run test/unit/jobId.test.ts test/unit/collections.repo.test.ts && npm run typecheck`
-Expected: PASS — 4 job-id tests and 17 collections tests.
+Expected: PASS — 4 job-id tests and 19 collections tests.
+
+**Then mutation-verify the cross-connection test, which is not optional** (see
+CLAUDE.md, "Mutation verification is mandatory for property tests"). In a scratch
+file OUTSIDE `src/`, write a check-then-claim shaped like the real bug:
+
+```ts
+// The mutant must be a BARE SELECT then a BARE UPDATE, each in its own implicit
+// transaction. Wrapping both in one explicit transaction makes the mutant
+// accidentally correct under WAL — the write would fail with SQLITE_BUSY_SNAPSHOT
+// because the transaction read an older snapshot — and the test would then pass
+// against a "bug" that cannot actually occur.
+function badClaim(db: Database.Database, jobId: string, atMs: number): boolean {
+  const row = db.prepare(
+    'SELECT locked_by, locked_at FROM collections WHERE chain_id = ? AND contract = ?',
+  ).get(CHAIN, CONTRACT) as { locked_by: string | null; locked_at: number | null } | undefined;
+  if (!row) { /* insert and return true */ }
+  const stale = row.locked_by === null || (row.locked_at ?? 0) < atMs - STALE_MS;
+  if (!stale) return false;
+  db.prepare(
+    'UPDATE collections SET locked_by = ?, locked_at = ? WHERE chain_id = ? AND contract = ?',
+  ).run(jobId, atMs, CHAIN, CONTRACT);
+  return true;
+}
+```
+
+Run the same cross-connection scenario against `badClaim` and report both
+outcomes: the real claim must leave `job-b` holding the lock, and the mutant must
+let `job-c` steal it. **If the mutant also produces the correct result, the test
+does not pin the property — say so plainly and record it as a gap rather than
+shipping a test that cannot fail.** Delete the scratch file afterwards.
 
 - [ ] **Step 7: Commit**
 
