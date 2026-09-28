@@ -26,8 +26,9 @@ tests from Milestone 3.
 
 ### Mutation verification is mandatory for property tests
 
-**Any test claiming to pin a concurrency, security, or idempotency property
-is not done until it has been mutation-verified.** Write the plausible wrong
+**Any test claiming to pin a concurrency, security, idempotency, or
+transactional-atomicity property is not done until it has been
+mutation-verified.** Write the plausible wrong
 implementation, run the test against it, and report both results. A test that
 passes against the bug it names is worse than no test: it advertises a
 guarantee that does not exist.
