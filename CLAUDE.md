@@ -101,8 +101,14 @@ dependent on timing.
 - `token_id`, `amount` and `tx_value_wei` are TEXT (uint256 exceeds
   `Number.MAX_SAFE_INTEGER`) and therefore sort **lexicographically**. Any
   `ORDER BY` or range comparison on them must zero-pad or `CAST`.
-- All inserts idempotent (`INSERT OR IGNORE`). Never index to head: stop at
-  `head - confirmations[chainId]`.
+- Inserts are idempotent via `ON CONFLICT (<pk cols>) DO NOTHING`, **not**
+  `INSERT OR IGNORE`. Both absorb a duplicate-key replay, but `OR IGNORE`
+  suppresses every constraint class: measured against this schema, a
+  mixed-case address and an invalid `kind` both return 0 changes and are
+  dropped silently, which leaves the `CHECK` constraints above unable to
+  report anything. Targeting the primary key alone keeps the replay free and
+  makes a malformed row loud. A foreign-key violation throws under both.
+- Never index to head: stop at `head - confirmations[chainId]`.
 - `transfers` cascades on a `collections` delete, so every `DELETE FROM
   collections` must be scoped — an unguarded one destroys transfer history.
 

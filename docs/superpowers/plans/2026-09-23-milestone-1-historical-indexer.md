@@ -14,7 +14,7 @@
 
 - **No private keys anywhere in this repo or its config.** No signing, minting, buying, selling, or marketplace code. Read-only chain access only.
 - `strict: true` in tsconfig. No `any` in committed code; use `unknown` plus narrowing.
-- All addresses stored **lowercase**. All inserts idempotent (`INSERT OR IGNORE`).
+- All addresses stored **lowercase**. All inserts idempotent via `ON CONFLICT (pk) DO NOTHING` — not `INSERT OR IGNORE`, which also suppresses CHECK violations and would drop a malformed row silently.
 - `token_id`, `amount`, `tx_value_wei` are **TEXT** in SQLite — they are `uint256` and exceed `Number.MAX_SAFE_INTEGER`. Convert via `bigint`, never `Number()`.
 - `PRAGMA foreign_keys = ON` belongs in the connection factory, never a migration: SQLite defaults it OFF per connection.
 - Timestamps are INTEGER epoch ms from the injected `Clock`. SQLite's `datetime()`/`unixepoch()` are used nowhere.
@@ -2398,19 +2398,48 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `test/unit/chunked.test.ts`, `test/unit/transfers.repo.test.ts`
 
 **Interfaces:**
-- Consumes: `TransferRow`, `TxInfo` (Task 1); `openDb`, `runMigrations` (Task 3)
+- Consumes: `TransferRow`, `TxInfo`, `Kind` (Task 1); `openDb`, `runMigrations` (Task 3)
+- Produces:
+  - `chunked<T>(items: T[], size?: number): T[][]` (default size 500)
+  - `insertTransfers(db, rows: TransferRow[]): number`
+  - `findKnownTxs(db, chainId: number, hashes: string[]): Map<string, TxInfo>`
+  - `countByKind(db, chainId: number, contract: string): Record<Kind, number>`
 
 **Note on the foreign key:** `transfers` references `collections (chain_id, contract)` and
 `foreign_keys` enforcement is ON, so every test in this file must insert a parent
 `collections` row first. The repository itself needs no change — in production, bootstrap
 always creates the collection before any transfer is inserted.
-- Produces:
-  - `chunked<T>(items: T[], size?: number): T[][]` (default size 500)
-  - `insertTransfers(db, rows: TransferRow[]): number` (rows actually inserted)
-  - `findKnownTxs(db, chainId: number, hashes: string[]): Map<string, TxInfo>`
-  - `countByKind(db, chainId: number, contract: string): Record<Kind, number>`
 
-- [ ] **Step 1: Write the failing tests**
+---
+
+**`ON CONFLICT DO NOTHING`, not `INSERT OR IGNORE` — a change to a documented decision.**
+
+The spec and CLAUDE.md both say inserts are idempotent via `INSERT OR IGNORE`. That is
+being changed here, deliberately, because `OR IGNORE` suppresses *every* constraint class
+rather than only the primary-key conflict we want to absorb. Measured against this schema:
+
+| Insert | `INSERT OR IGNORE` | `ON CONFLICT (pk) DO NOTHING` |
+|---|---|---|
+| duplicate primary key | no error, 0 changes | no error, 0 changes |
+| mixed-case address | **no error, 0 changes — silently dropped** | throws `CHECK constraint failed: to_addr = lower(to_addr)` |
+| invalid `kind` | **no error, 0 changes — silently dropped** | throws `CHECK constraint failed: kind IN (…)` |
+| orphan foreign key | throws | throws |
+
+So `OR IGNORE` defeats the lowercase-address CHECK added in Task 3: a bug that produced a
+mixed-case address would lose rows silently instead of failing, and the backstop would
+report nothing. `ON CONFLICT (chain_id, tx_hash, log_index, batch_index) DO NOTHING`
+targets only the uniqueness conflict, so re-running a backfill is still free while a
+malformed row is loud. Idempotency is unchanged; only the blast radius narrows.
+
+**One transaction per batch, one prepared statement.** `insertTransfers` prepares the
+statement once and runs the whole batch inside a single `db.transaction(...)`. Two reasons:
+a transaction per row would fsync per row, and — more importantly — a mid-batch failure
+must roll back the *whole* batch. Task 13 commits rows and the watermark together, so a
+partially-inserted chunk sitting under an advanced watermark would mean permanently
+missing transfers that a rerun would never re-fetch. better-sqlite3 nests via savepoints,
+so this composes correctly inside Task 13's outer transaction.
+
+- [ ] **Step 1: Write the failing `chunked` tests**
 
 `test/unit/chunked.test.ts`:
 
@@ -2446,8 +2475,61 @@ describe('chunked', () => {
   it('honours an explicit size', () => {
     expect(chunked(range(5), 2).map((g) => g.length)).toEqual([2, 2, 1]);
   });
+
+  // Counts cannot catch an off-by-one in chunk assembly: a group that starts or
+  // ends one element early still has a plausible length. These assert the
+  // CONTENTS round-trip, which is what actually breaks.
+  it.each([0, 1, 2, 499, 500, 501, 999, 1000, 1001])(
+    'reassembles exactly the original list for length %i',
+    (n) => {
+      const input = range(n);
+      expect(chunked(input).flat()).toEqual(input);
+    },
+  );
+
+  it('puts the boundary elements in the right groups', () => {
+    const groups = chunked(range(1001));
+    expect(groups[0]?.[0]).toBe(0);
+    expect(groups[0]?.at(-1)).toBe(499);   // last of the first chunk
+    expect(groups[1]?.[0]).toBe(500);      // first of the second chunk
+    expect(groups[1]?.at(-1)).toBe(999);
+    expect(groups[2]).toEqual([1000]);
+  });
+
+  it('never emits an empty group', () => {
+    for (const n of [1, 500, 501, 1000, 1001]) {
+      expect(chunked(range(n)).every((g) => g.length > 0)).toBe(true);
+    }
+  });
+
+  it('rejects a size below 1 rather than looping forever', () => {
+    expect(() => chunked([1, 2], 0)).toThrow();
+  });
 });
 ```
+
+- [ ] **Step 2: Run to verify failure, then write `src/db/chunked.ts`**
+
+Run: `npx vitest run test/unit/chunked.test.ts` — FAIL, module missing.
+
+```ts
+/**
+ * Splits a list so an `IN (...)` clause stays under SQLite's bound-variable
+ * limit. 500 is well below the 32766 of modern SQLite and safe on older builds.
+ */
+export function chunked<T>(items: T[], size = 500): T[][] {
+  if (size < 1) throw new Error('chunk size must be at least 1');
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+```
+
+Re-run: PASS.
+
+- [ ] **Step 3: Write the failing transfers-repository tests**
 
 `test/unit/transfers.repo.test.ts`:
 
@@ -2462,15 +2544,34 @@ import {
 import type { TransferRow } from '../../src/types.js';
 
 const CONTRACT = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
+const MINTER = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const ZERO = '0x0000000000000000000000000000000000000000';
 
 function row(over: Partial<TransferRow> = {}): TransferRow {
   return {
     chainId: 1, contract: CONTRACT, tokenId: '1', amount: '1',
-    fromAddr: '0x0000000000000000000000000000000000000000',
-    toAddr: '0xaaa', txHash: '0xtx1', blockNumber: 100,
-    logIndex: 0, batchIndex: 0, txFrom: '0xaaa',
-    txValueWei: '0', kind: 'mint', ...over,
+    fromAddr: ZERO, toAddr: MINTER, txHash: '0xtx1', blockNumber: 100,
+    logIndex: 0, batchIndex: 0, txFrom: MINTER, txValueWei: '0',
+    kind: 'mint', ...over,
   };
+}
+
+/** Every row of one ERC-1155 TransferBatch log: same tx, same log index. */
+function batchRows(count = 5, over: Partial<TransferRow> = {}): TransferRow[] {
+  return Array.from({ length: count }, (_, i) =>
+    row({
+      txHash: '0xbatchtx', logIndex: 7, batchIndex: i,
+      tokenId: String(100 + i), amount: String(i + 1), ...over,
+    }),
+  );
+}
+
+/** Full contents, deterministically ordered, for identity comparisons. */
+function dump(db: Database.Database): unknown[] {
+  return db.prepare(`
+    SELECT * FROM transfers
+     ORDER BY chain_id, tx_hash, log_index, batch_index
+  `).all();
 }
 
 let db: Database.Database;
@@ -2488,19 +2589,9 @@ describe('insertTransfers', () => {
     expect(insertTransfers(db, [row(), row({ txHash: '0xtx2', tokenId: '2' })])).toBe(2);
   });
 
-  it('is idempotent — re-inserting the same rows changes nothing', () => {
-    const rows = [row(), row({ txHash: '0xtx2', tokenId: '2' })];
-    insertTransfers(db, rows);
-    expect(insertTransfers(db, rows)).toBe(0);
-    const n = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
-    expect(n.n).toBe(2);
-  });
-
-  it('keeps every token of an ERC-1155 batch', () => {
-    const batch = [0, 1, 2].map((i) =>
-      row({ tokenId: String(i + 10), batchIndex: i, txHash: '0xbatch', logIndex: 4 }),
-    );
-    expect(insertTransfers(db, batch)).toBe(3);
+  it('returns 0 and touches nothing for an empty batch', () => {
+    expect(insertTransfers(db, [])).toBe(0);
+    expect(dump(db)).toEqual([]);
   });
 
   it('stores a uint256 token id without precision loss', () => {
@@ -2510,27 +2601,200 @@ describe('insertTransfers', () => {
       .get('0xbig') as { token_id: string };
     expect(got.token_id).toBe(big);
   });
+
+  it('stores a uint256 wei value without precision loss', () => {
+    const big = (2n ** 200n).toString();
+    insertTransfers(db, [row({ txValueWei: big, txHash: '0xwei', kind: 'buy' })]);
+    const got = db.prepare('SELECT tx_value_wei FROM transfers WHERE tx_hash = ?')
+      .get('0xwei') as { tx_value_wei: string };
+    expect(got.tx_value_wei).toBe(big);
+  });
+});
+
+// The composite primary key exists for exactly this shape. An ERC-1155
+// TransferBatch is ONE log carrying ids[], so all its rows share tx_hash AND
+// log_index; without batch_index in the key, four of these five would be
+// absorbed as duplicate-key conflicts and batch mints would undercount
+// silently. Pinned here at the repository layer, not only at decode.
+describe('insertTransfers — ERC-1155 TransferBatch', () => {
+  it('keeps all five rows of one batch log', () => {
+    expect(insertTransfers(db, batchRows(5))).toBe(5);
+    const n = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
+    expect(n.n).toBe(5);
+  });
+
+  it('stores them sharing tx_hash and log_index, differing only by batch_index', () => {
+    insertTransfers(db, batchRows(5));
+    const rows = db.prepare(`
+      SELECT tx_hash, log_index, batch_index, token_id, amount
+        FROM transfers ORDER BY batch_index
+    `).all() as Array<{
+      tx_hash: string; log_index: number; batch_index: number;
+      token_id: string; amount: string;
+    }>;
+    expect(new Set(rows.map((r) => r.tx_hash)).size).toBe(1);
+    expect(new Set(rows.map((r) => r.log_index)).size).toBe(1);
+    expect(rows.map((r) => r.batch_index)).toEqual([0, 1, 2, 3, 4]);
+    expect(rows.map((r) => r.token_id)).toEqual(['100', '101', '102', '103', '104']);
+    expect(rows.map((r) => r.amount)).toEqual(['1', '2', '3', '4', '5']);
+  });
+
+  it('re-inserting the same batch adds nothing and changes nothing', () => {
+    insertTransfers(db, batchRows(5));
+    const before = dump(db);
+    expect(insertTransfers(db, batchRows(5))).toBe(0);
+    expect(dump(db)).toEqual(before);
+  });
+
+  it('extends a batch with a later index without disturbing the first five', () => {
+    insertTransfers(db, batchRows(5));
+    expect(insertTransfers(db, [batchRows(6)[5]!])).toBe(1);
+    const n = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
+    expect(n.n).toBe(6);
+  });
+});
+
+// IDEMPOTENCY. Mutation-verify before calling this done (see CLAUDE.md): drop the
+// ON CONFLICT clause in a scratch copy and confirm every test in this block
+// fails. Row counts alone are not enough — contents must be identical too, or a
+// re-insert that overwrote a column would pass.
+describe('insertTransfers — idempotency', () => {
+  const batch = () => [
+    row({ txHash: '0xa', tokenId: '1' }),
+    row({ txHash: '0xb', tokenId: '2', kind: 'transfer', fromAddr: MINTER, toAddr: ZERO }),
+    ...batchRows(3),
+  ];
+
+  it('leaves identical counts and identical contents when the same batch is inserted twice', () => {
+    expect(insertTransfers(db, batch())).toBe(5);
+    const first = dump(db);
+
+    expect(insertTransfers(db, batch())).toBe(0);
+    expect(dump(db)).toEqual(first);
+    expect(dump(db)).toHaveLength(5);
+  });
+
+  it('is idempotent across overlapping batches', () => {
+    const a = [row({ txHash: '0x1' }), row({ txHash: '0x2' }), row({ txHash: '0x3' })];
+    const b = [row({ txHash: '0x3' }), row({ txHash: '0x4' })];   // 0x3 overlaps
+
+    expect(insertTransfers(db, a)).toBe(3);
+    expect(insertTransfers(db, b)).toBe(1);                       // only 0x4 is new
+    expect(dump(db)).toHaveLength(4);
+
+    // Replaying both in the other order must reach the same state.
+    const state = dump(db);
+    insertTransfers(db, b);
+    insertTransfers(db, a);
+    expect(dump(db)).toEqual(state);
+  });
+
+  it('does not let a re-insert overwrite an existing row', () => {
+    insertTransfers(db, [row({ txHash: '0xz', tokenId: '1', kind: 'mint' })]);
+    const before = dump(db);
+    // Same key, different payload: DO NOTHING must keep the original.
+    insertTransfers(db, [row({ txHash: '0xz', tokenId: '999', kind: 'burn' })]);
+    expect(dump(db)).toEqual(before);
+  });
+
+  it('tolerates a duplicate appearing twice within one batch', () => {
+    expect(insertTransfers(db, [row({ txHash: '0xdup' }), row({ txHash: '0xdup' })])).toBe(1);
+    expect(dump(db)).toHaveLength(1);
+  });
+});
+
+// A mid-batch failure must roll back the WHOLE batch. Task 13 commits rows and
+// the watermark in one transaction, so a partially-inserted chunk under an
+// advanced watermark would mean permanently missing transfers that a rerun
+// never re-fetches.
+describe('insertTransfers — all-or-nothing', () => {
+  it('rolls the whole batch back when a later row violates the foreign key', () => {
+    const rows = [
+      row({ txHash: '0xok1' }),
+      row({ txHash: '0xok2' }),
+      row({ txHash: '0xbad', contract: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }),
+      row({ txHash: '0xok3' }),
+    ];
+    expect(() => insertTransfers(db, rows)).toThrow(/FOREIGN KEY/i);
+    expect(dump(db)).toEqual([]);   // not 3 rows — zero
+  });
+
+  it('leaves an earlier successful batch intact when a later batch fails', () => {
+    expect(insertTransfers(db, [row({ txHash: '0xfirst' })])).toBe(1);
+    expect(() =>
+      insertTransfers(db, [
+        row({ txHash: '0xsecond' }),
+        row({ txHash: '0xorphan', contract: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }),
+      ]),
+    ).toThrow();
+    const rows = dump(db) as Array<{ tx_hash: string }>;
+    expect(rows.map((r) => r.tx_hash)).toEqual(['0xfirst']);
+  });
+});
+
+// ON CONFLICT DO NOTHING absorbs only the primary-key conflict. INSERT OR IGNORE
+// would swallow these two as well, dropping the rows silently — which would make
+// the lowercase CHECK added in Task 3 unable to report anything.
+describe('insertTransfers — malformed rows are loud, not dropped', () => {
+  it('throws on a mixed-case address instead of silently skipping it', () => {
+    expect(() => insertTransfers(db, [row({ toAddr: MINTER.toUpperCase() })]))
+      .toThrow(/CHECK constraint failed/i);
+  });
+
+  it('throws on an invalid kind instead of silently skipping it', () => {
+    expect(() => insertTransfers(db, [row({ kind: 'nonsense' as TransferRow['kind'] })]))
+      .toThrow(/CHECK constraint failed/i);
+  });
 });
 
 describe('findKnownTxs', () => {
   it('returns tx info already stored, so a resume re-fetches nothing', () => {
-    insertTransfers(db, [row({ txHash: '0xknown', txFrom: '0xbbb', txValueWei: '1000' })]);
+    insertTransfers(db, [row({ txHash: '0xknown', txFrom: MINTER, txValueWei: '1000' })]);
     const found = findKnownTxs(db, 1, ['0xknown', '0xmissing']);
-    expect(found.get('0xknown')).toEqual({ from: '0xbbb', value: 1000n });
+    expect(found.get('0xknown')).toEqual({ from: MINTER, value: 1000n });
     expect(found.has('0xmissing')).toBe(false);
-  });
-
-  it('handles more hashes than the bound-variable chunk size', () => {
-    const rows = Array.from({ length: 600 }, (_, i) =>
-      row({ txHash: `0x${i}`, tokenId: String(i) }),
-    );
-    insertTransfers(db, rows);
-    const found = findKnownTxs(db, 1, rows.map((r) => r.txHash));
-    expect(found.size).toBe(600);
   });
 
   it('returns an empty map for no hashes', () => {
     expect(findKnownTxs(db, 1, []).size).toBe(0);
+  });
+
+  it('does not return rows from another chain', () => {
+    insertTransfers(db, [row({ txHash: '0xsame' })]);
+    expect(findKnownTxs(db, 999, ['0xsame']).size).toBe(0);
+  });
+
+  // Crossing the bound-variable chunk boundary. A count-only assertion would
+  // pass while an off-by-one dropped the first or last hash of a chunk, so these
+  // name specific hashes on both sides of the split.
+  it('finds hashes in every chunk, including the boundary elements', () => {
+    const rows = Array.from({ length: 1001 }, (_, i) =>
+      row({ txHash: `0x${i}`, tokenId: String(i) }),
+    );
+    insertTransfers(db, rows);
+
+    const found = findKnownTxs(db, 1, rows.map((r) => r.txHash));
+    expect(found.size).toBe(1001);
+    for (const hash of ['0x0', '0x499', '0x500', '0x999', '0x1000']) {
+      expect(found.has(hash)).toBe(true);
+    }
+  });
+
+  it('dedupes a hash that appears in more than one chunk', () => {
+    insertTransfers(db, [row({ txHash: '0xrepeat', txFrom: MINTER, txValueWei: '77' })]);
+    // Same hash at index 0 and index 500 — different chunks after the split.
+    const hashes = Array.from({ length: 501 }, (_, i) =>
+      i === 0 || i === 500 ? '0xrepeat' : `0xfiller${i}`,
+    );
+    const found = findKnownTxs(db, 1, hashes);
+    expect(found.size).toBe(1);
+    expect(found.get('0xrepeat')).toEqual({ from: MINTER, value: 77n });
+  });
+
+  it('returns each stored hash once even when asked for it many times', () => {
+    insertTransfers(db, [row({ txHash: '0xone' })]);
+    const found = findKnownTxs(db, 1, Array.from({ length: 1200 }, () => '0xone'));
+    expect(found.size).toBe(1);
   });
 });
 
@@ -2539,65 +2803,79 @@ describe('countByKind', () => {
     insertTransfers(db, [
       row({ txHash: '0x1', kind: 'mint' }),
       row({ txHash: '0x2', kind: 'mint' }),
-      row({ txHash: '0x3', kind: 'burn' }),
+      row({ txHash: '0x3', kind: 'burn', fromAddr: MINTER, toAddr: ZERO }),
     ]);
     expect(countByKind(db, 1, CONTRACT)).toEqual({ mint: 2, buy: 0, transfer: 0, burn: 1 });
+  });
+
+  it('counts every row of a batch log separately', () => {
+    insertTransfers(db, batchRows(5));
+    expect(countByKind(db, 1, CONTRACT).mint).toBe(5);
+  });
+
+  it('returns all zeros for an unknown contract', () => {
+    expect(countByKind(db, 1, '0x0000000000000000000000000000000000000000'))
+      .toEqual({ mint: 0, buy: 0, transfer: 0, burn: 0 });
   });
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 4: Run to verify failure, then write `src/db/repositories/transfers.ts`**
 
-Run: `npx vitest run test/unit/chunked.test.ts test/unit/transfers.repo.test.ts`
-Expected: FAIL — modules not found.
-
-- [ ] **Step 3: Write `src/db/chunked.ts`**
-
-```ts
-/**
- * Splits a list so an `IN (...)` clause stays under SQLite's bound-variable
- * limit. 500 is well below the 32766 of modern SQLite and safe on older builds.
- */
-export function chunked<T>(items: T[], size = 500): T[][] {
-  if (size < 1) throw new Error('chunk size must be at least 1');
-  const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) {
-    out.push(items.slice(i, i + size));
-  }
-  return out;
-}
-```
-
-- [ ] **Step 4: Write `src/db/repositories/transfers.ts`**
+Run: `npx vitest run test/unit/transfers.repo.test.ts` — FAIL, module missing.
 
 ```ts
 import type Database from 'better-sqlite3';
 import type { Kind, TransferRow, TxInfo } from '../../types.js';
 import { chunked } from '../chunked.js';
 
+/**
+ * `ON CONFLICT (pk) DO NOTHING` rather than `INSERT OR IGNORE`.
+ *
+ * Both make a replayed backfill free, but `OR IGNORE` suppresses EVERY
+ * constraint class: a mixed-case address or an invalid `kind` would be dropped
+ * silently, leaving the Task 3 CHECK constraints unable to report anything.
+ * Targeting the primary key alone keeps idempotency and makes a malformed row
+ * loud. A foreign-key violation throws under both.
+ */
 const INSERT_SQL = `
-  INSERT OR IGNORE INTO transfers
+  INSERT INTO transfers
     (chain_id, contract, token_id, amount, from_addr, to_addr, tx_hash,
      block_number, log_index, batch_index, tx_from, tx_value_wei, kind)
   VALUES
     (@chainId, @contract, @tokenId, @amount, @fromAddr, @toAddr, @txHash,
      @blockNumber, @logIndex, @batchIndex, @txFrom, @txValueWei, @kind)
+  ON CONFLICT (chain_id, tx_hash, log_index, batch_index) DO NOTHING
 `;
 
-/** @returns how many rows were actually inserted (duplicates are ignored). */
+/**
+ * Inserts a batch in ONE transaction using ONE prepared statement.
+ *
+ * All-or-nothing matters beyond tidiness: Task 13 commits rows and the
+ * watermark together, so a partially-inserted chunk under an advanced watermark
+ * would mean permanently missing transfers that a rerun never re-fetches.
+ * better-sqlite3 nests transactions via savepoints, so this composes inside
+ * Task 13's outer transaction.
+ *
+ * @returns how many rows were actually inserted; duplicates count 0.
+ */
 export function insertTransfers(db: Database.Database, rows: TransferRow[]): number {
   if (rows.length === 0) return 0;
   const stmt = db.prepare(INSERT_SQL);
-  let inserted = 0;
-  for (const row of rows) {
-    inserted += stmt.run(row).changes;
-  }
-  return inserted;
+  return db.transaction(() => {
+    let inserted = 0;
+    for (const row of rows) {
+      inserted += stmt.run(row).changes;
+    }
+    return inserted;
+  })();
 }
 
 /**
  * Tx data already stored, so a resumed or overlapping backfill re-fetches
- * nothing. The IN list is chunked to stay under the bound-variable limit.
+ * nothing. The `IN` list is chunked to stay under the bound-variable limit, and
+ * the results are unioned into one Map — which also dedupes a hash that appears
+ * in more than one chunk.
  */
 export function findKnownTxs(
   db: Database.Database,
@@ -2643,19 +2921,56 @@ export function countByKind(
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests and typecheck**
 
 Run: `npx vitest run test/unit/chunked.test.ts test/unit/transfers.repo.test.ts && npm run typecheck`
-Expected: PASS, 14 tests.
+Expected: PASS. Then `npm test` for the whole suite.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Mutation-verify idempotency — mandatory, not optional**
+
+CLAUDE.md requires that any test claiming an idempotency property be run against the
+plausible wrong implementation, with both results reported. In a scratch file OUTSIDE
+`src/`, copy `insertTransfers` and **delete the `ON CONFLICT … DO NOTHING` clause**, leaving
+a plain `INSERT`. Run the whole `insertTransfers — idempotency` block plus
+`re-inserting the same batch adds nothing and changes nothing` against it.
+
+Expected: every one of those cases fails (a plain `INSERT` raises
+`UNIQUE constraint failed` on the second pass). Report which cases failed and how many.
+
+Then run a second mutant that keeps idempotency but **replaces `DO NOTHING` with
+`DO UPDATE SET token_id = excluded.token_id, kind = excluded.kind`**. Expected: counts stay
+identical but `does not let a re-insert overwrite an existing row` fails. This is the check
+that proves the contents comparison is load-bearing and not decorative — a count-only test
+would pass against it.
+
+If either mutant passes the whole block, the tests do not pin idempotency: say so plainly
+and record it as a gap rather than shipping them. Delete the scratch file afterwards.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/db/chunked.ts src/db/repositories/transfers.ts test/unit/chunked.test.ts test/unit/transfers.repo.test.ts
-git commit -m "feat: transfers repository with idempotent insert and chunked IN lookup
+git commit -m "feat: transfers repository, chunked IN lookup, all-or-nothing batch insert
 
-findKnownTxs chunks its IN list at 500 bound variables; a large chunk of
-unique tx hashes would otherwise exceed SQLite's limit.
+ON CONFLICT (pk) DO NOTHING replaces the spec's INSERT OR IGNORE. Both
+make a replayed backfill free, but OR IGNORE suppresses every constraint
+class — a mixed-case address or an invalid kind was dropped silently,
+which left Task 3's CHECK constraints unable to report anything. Measured:
+OR IGNORE returns 0 changes for both; DO NOTHING throws.
+
+The batch runs as one prepared statement in one transaction, so a
+mid-batch failure rolls back entirely. Task 13 commits rows and the
+watermark together, so a partial chunk under an advanced watermark would
+mean permanently missing transfers a rerun never re-fetches.
+
+chunked is asserted by contents, not counts: an off-by-one in chunk
+assembly leaves plausible lengths. findKnownTxs names hashes on both
+sides of the 500-element split and pins that a hash appearing in two
+chunks is deduped rather than double-counted.
+
+An ERC-1155 TransferBatch fixture pins five rows sharing tx_hash and
+log_index at the repository layer, which is the shape the composite
+primary key exists for.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
