@@ -87,6 +87,22 @@ describe('insertTransfers — ERC-1155 TransferBatch', () => {
     expect(n.n).toBe(5);
   });
 
+  // batchRows varies token_id alongside batch_index, so it would pass just as
+  // well under a schema keyed on (chain_id, tx_hash, log_index, token_id) —
+  // it does not isolate batch_index as the discriminator. A TransferBatch may
+  // legally carry the same id in more than one slot (e.g. two transfers of id
+  // 100 within one batch), so rows that share tx_hash, log_index, AND
+  // token_id, differing ONLY by batch_index, are a real shape, not a
+  // contrivance. This is what actually pins batch_index in the key.
+  it('keeps rows that share tx_hash, log_index, AND token_id, differing only by batch_index', () => {
+    const rows = Array.from({ length: 5 }, (_, i) =>
+      row({ txHash: '0xsametoken', logIndex: 7, batchIndex: i, tokenId: '100' }),
+    );
+    expect(insertTransfers(db, rows)).toBe(5);
+    const n = db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
+    expect(n.n).toBe(5);
+  });
+
   it('stores them sharing tx_hash and log_index, differing only by batch_index', () => {
     insertTransfers(db, batchRows(5));
     const rows = db.prepare(`
@@ -201,13 +217,16 @@ describe('insertTransfers — all-or-nothing', () => {
 // the lowercase CHECK added in Task 3 unable to report anything.
 describe('insertTransfers — malformed rows are loud, not dropped', () => {
   it('throws on a mixed-case address instead of silently skipping it', () => {
+    // Matches the specific column's CHECK, not merely "some CHECK fired" —
+    // /CHECK constraint failed/i alone would pass even if an unrelated
+    // constraint (e.g. kind) tripped for the wrong reason.
     expect(() => insertTransfers(db, [row({ toAddr: MINTER.toUpperCase() })]))
-      .toThrow(/CHECK constraint failed/i);
+      .toThrow(/to_addr = lower\(to_addr\)/i);
   });
 
   it('throws on an invalid kind instead of silently skipping it', () => {
     expect(() => insertTransfers(db, [row({ kind: 'nonsense' as TransferRow['kind'] })]))
-      .toThrow(/CHECK constraint failed/i);
+      .toThrow(/kind IN/i);
   });
 });
 

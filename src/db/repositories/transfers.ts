@@ -60,7 +60,7 @@ export function findKnownTxs(
     const placeholders = group.map(() => '?').join(',');
     const rows = db
       .prepare(`
-        SELECT DISTINCT tx_hash, tx_from, tx_value_wei
+        SELECT tx_hash, tx_from, tx_value_wei
           FROM transfers
          WHERE chain_id = ? AND tx_hash IN (${placeholders})
       `)
