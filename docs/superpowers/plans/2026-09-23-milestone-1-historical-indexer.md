@@ -2980,22 +2980,85 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 6: Log decoding for ERC-721 and ERC-1155
 
 **Files:**
-- Create: `src/indexer/decode.ts`, `test/fixtures/logs-721.json`, `test/fixtures/logs-1155-single.json`, `test/fixtures/logs-1155-batch.json`
+- Create: `src/indexer/decode.ts`
+- Modify: `src/errors.ts` — add `DecodeError`
+- Create fixtures: `test/fixtures/logs-721.json`, `logs-721-max-uint256.json`,
+  `logs-erc20-transfer.json`, `logs-unrelated-topic.json`, `logs-1155-single.json`,
+  `logs-1155-batch.json`
 - Test: `test/unit/decode.test.ts`
 
 **Interfaces:**
-- Consumes: `DecodedTransfer`, `Standard`, `Address`, `Hash` (Task 1)
+- Consumes: `DecodedTransfer`, `Standard`, `Address`, `Hash` (Task 1); `DecodeError`
 - Produces:
-  - `TRANSFER_TOPICS: Record<Standard, Hash[]>` — topic0 filters to pass to `getLogs`
+  - `TRANSFER_TOPICS: Record<Standard, Hash[]>` — topic0 filters for `getLogs`
+  - `interface RawLog { topics: Hash[]; data: Hash; transactionHash: Hash; blockNumber: bigint; logIndex: number }`
   - `decodeTransferLog(log: RawLog, standard: Standard): DecodedTransfer[]`
   - `decodeLogs(logs: RawLog[], standard: Standard): DecodedTransfer[]`
-  - `interface RawLog { topics: Hash[]; data: Hash; transactionHash: Hash; blockNumber: bigint; logIndex: number }`
 
-Fixtures in this task are hand-written from the event ABIs so decoding can be tested before any RPC access exists. Task 14 adds fixtures captured from a real chain and asserts the decoder agrees with them.
+---
 
-- [ ] **Step 1: Write the fixtures**
+**Six properties this task must pin. Three were measured against viem before being
+written down, and two of those corrected an assumption.**
 
-`test/fixtures/logs-721.json` — one ERC-721 `Transfer`, a mint of token 1 to `0xaaa…aaa`. All three arguments are indexed, so `data` is empty.
+**1. The ERC-721 / ERC-20 topic-count guard — and what it actually prevents.**
+`Transfer(address,address,uint256)` is byte-identical for ERC-721 and ERC-20, so both
+produce the same `topic0`. ERC-721 indexes `tokenId`, giving **4 topics**; ERC-20 puts
+`value` in `data`, giving **3**. A guard on topic count is therefore mandatory.
+
+Measured correction to the expected failure mode: with viem and a 3-indexed ABI, an
+ERC-20 log does **not** quietly decode as a mint — `decodeEventLog` throws
+`DecodeLogTopicsMismatch: Expected a topic for indexed event parameter "tokenId"`. So
+without the guard the indexer **crashes on the first ERC-20 Transfer it meets**, which is
+a different bug from a misdecode and a worse one operationally: a backfill dies rather
+than producing a wrong row. The guard's job is to make such a log skip quietly.
+
+The misdecode risk is real but conditional: it appears the moment anyone adds a
+non-indexed-`tokenId` ABI to support early ERC-721s, because then a 3-topic ERC-20 log
+decodes cleanly with `value` read as `tokenId`. That is why the limitation below is worth
+writing down rather than treating as an oversight.
+
+**Known limitation to record:** non-compliant early ERC-721s that emit a *non-indexed*
+`tokenId` (3 topics) are rejected by this guard and will index as zero transfers. Detecting
+them would require an ABI that cannot be distinguished from ERC-20, so the guard is the
+correct trade. Goes in the README's limitations list.
+
+**2. Mismatched `ids[]` / `values[]` must throw, not zip.** Measured: viem decodes a
+`TransferBatch` with 3 ids and 2 values **without complaint** — the arrays are decoded
+independently, so nothing upstream catches it. Zipping to the shorter array would silently
+drop a transfer; padding with `0n` would silently invent one with a zero amount. Both are
+the malformed-but-decodable shape. So the length check is ours to make, and it throws.
+
+**3. Empty `ids[]` emits zero rows** — no crash, and no single row with undefined fields.
+Measured: viem decodes empty arrays cleanly, so this is purely about our own mapping.
+
+**4. `batchIndex` sequencing, including a duplicate `tokenId` in one batch.** A
+`TransferBatch` may legally carry the same id in more than one slot, and then
+`batch_index` is the *only* thing keeping those rows distinct under the composite primary
+key. Pinned here as well as at the repository layer.
+
+**5. Nothing touches JS `number`.** `tokenId`, `amount` and `value` stay `bigint` through
+decode and become strings only at the repository boundary. A max-uint256 fixture round-trips
+exactly, because precision loss here produces rows that look entirely plausible.
+
+**6. An unrelated `topic0` is skipped, not thrown on.** A collection's address can emit
+other events; encountering one is normal, not exceptional.
+
+Also worth a test: viem returns **checksummed** addresses (measured — it returned
+`0xaAaAaAaa…` for a lowercase input), so the `lower()` calls are doing real work rather
+than being belt-and-braces.
+
+- [ ] **Step 1: Add `DecodeError` to `src/errors.ts`**
+
+Append, leaving every other class untouched:
+
+```ts
+export class DecodeError extends ByakuganError {}
+```
+
+- [ ] **Step 2: Write the committed fixtures**
+
+`test/fixtures/logs-721.json` — one ERC-721 `Transfer`, a mint of token 1. All three
+arguments are indexed, so `data` is empty and there are 4 topics.
 
 ```json
 [
@@ -3014,7 +3077,66 @@ Fixtures in this task are hand-written from the event ABIs so decoding can be te
 ]
 ```
 
-`test/fixtures/logs-1155-single.json` — `TransferSingle`, id 7, amount 3. `operator`, `from`, `to` are indexed; `id` and `value` are in `data`.
+`test/fixtures/logs-721-max-uint256.json` — `tokenId` = 2^256 − 1. Anything that routes
+this through a JS `number` loses precision and yields a plausible-looking wrong id.
+
+```json
+[
+  {
+    "topics": [
+      "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    ],
+    "data": "0x",
+    "transactionHash": "0x4444444444444444444444444444444444444444444444444444444444444444",
+    "blockNumber": "400",
+    "logIndex": 2
+  }
+]
+```
+
+`test/fixtures/logs-erc20-transfer.json` — a real-shaped ERC-20 `Transfer`: same `topic0`,
+**3 topics**, `value` in `data`. This must decode to zero rows.
+
+```json
+[
+  {
+    "topics": [
+      "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+    "transactionHash": "0x5555555555555555555555555555555555555555555555555555555555555555",
+    "blockNumber": "500",
+    "logIndex": 3
+  }
+]
+```
+
+`test/fixtures/logs-unrelated-topic.json` — an `Approval`-shaped log from the same address.
+
+```json
+[
+  {
+    "topics": [
+      "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+      "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ],
+    "data": "0x",
+    "transactionHash": "0x6666666666666666666666666666666666666666666666666666666666666666",
+    "blockNumber": "600",
+    "logIndex": 4
+  }
+]
+```
+
+`test/fixtures/logs-1155-single.json` — `TransferSingle`, id 7, amount 3. `operator`,
+`from`, `to` indexed; `id` and `value` in `data`.
 
 ```json
 [
@@ -3033,7 +3155,9 @@ Fixtures in this task are hand-written from the event ABIs so decoding can be te
 ]
 ```
 
-`test/fixtures/logs-1155-batch.json` — `TransferBatch`, ids `[10, 11]`, values `[1, 2]`. `data` holds two dynamic arrays: offsets `0x40` and `0xa0`, then each array's length followed by its elements.
+`test/fixtures/logs-1155-batch.json` — `TransferBatch`, ids `[10, 11]`, values `[1, 2]`.
+`data` holds two dynamic arrays: offsets `0x40` and `0xa0`, then each array's length
+followed by its elements.
 
 ```json
 [
@@ -3052,20 +3176,43 @@ Fixtures in this task are hand-written from the event ABIs so decoding can be te
 ]
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 3: Write the failing test**
 
-`test/unit/decode.test.ts`:
+`test/unit/decode.test.ts`. The batch **variants** (empty, duplicate id, mismatched
+lengths) are synthesised with `encodeAbiParameters` rather than committed as hex, because
+a mismatched batch cannot be captured from a compliant chain and hand-computing ABI
+offsets is its own source of bugs. The encoder being correct by construction is a feature
+here: the thing under test is our guard logic, not viem's codec.
 
 ```ts
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { decodeLogs, type RawLog } from '../../src/indexer/decode.js';
+import { encodeAbiParameters, type Hex } from 'viem';
+import { decodeLogs, decodeTransferLog, TRANSFER_TOPICS, type RawLog } from '../../src/indexer/decode.js';
+import { DecodeError } from '../../src/errors.js';
 
 function load(name: string): RawLog[] {
   const raw = JSON.parse(
     readFileSync(new URL(`../fixtures/${name}.json`, import.meta.url), 'utf8'),
   ) as Array<Record<string, unknown>>;
   return raw.map((l) => ({ ...l, blockNumber: BigInt(l.blockNumber as string) })) as RawLog[];
+}
+
+const TOPIC_1155_BATCH =
+  '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb' as Hex;
+const OPERATOR = '0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Hex;
+const ZERO_TOPIC = `0x${'0'.repeat(64)}` as Hex;
+const TO = '0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Hex;
+
+/** A TransferBatch log with arbitrary ids/values — including invalid pairings. */
+function batchLog(ids: bigint[], values: bigint[]): RawLog {
+  return {
+    topics: [TOPIC_1155_BATCH, OPERATOR, ZERO_TOPIC, TO],
+    data: encodeAbiParameters([{ type: 'uint256[]' }, { type: 'uint256[]' }], [ids, values]),
+    transactionHash: `0x${'7'.repeat(64)}` as Hex,
+    blockNumber: 700n,
+    logIndex: 11,
+  };
 }
 
 describe('decodeLogs — ERC-721', () => {
@@ -3083,9 +3230,81 @@ describe('decodeLogs — ERC-721', () => {
     });
   });
 
+  // viem returns CHECKSUMMED addresses, so these calls are load-bearing.
   it('lowercases addresses', () => {
     const [t] = decodeLogs(load('logs-721'), '721');
     expect(t?.to).toBe(t?.to.toLowerCase());
+    expect(t?.from).toBe(t?.from.toLowerCase());
+  });
+});
+
+// ERC-721 and ERC-20 Transfer share topic0 byte-for-byte. ERC-721 indexes tokenId
+// (4 topics); ERC-20 puts value in data (3 topics). Without the topic-count guard
+// viem THROWS DecodeLogTopicsMismatch on the ERC-20 log — measured — so the
+// indexer would die on the first one rather than mis-decode it. The guard makes
+// it skip quietly.
+describe('decodeLogs — ERC-20 Transfer must be skipped, not decoded or thrown on', () => {
+  it('decodes an ERC-20 Transfer to zero rows', () => {
+    expect(decodeLogs(load('logs-erc20-transfer'), '721')).toEqual([]);
+  });
+
+  it('does not throw on it', () => {
+    expect(() => decodeLogs(load('logs-erc20-transfer'), '721')).not.toThrow();
+  });
+
+  it('skips it while still decoding a real 721 log in the same batch', () => {
+    const mixed = [...load('logs-erc20-transfer'), ...load('logs-721')];
+    const out = decodeLogs(mixed, '721');
+    expect(out).toHaveLength(1);
+    expect(out[0]?.tokenId).toBe(1n);
+  });
+});
+
+describe('decodeLogs — unrelated topic0', () => {
+  it('skips it rather than throwing', () => {
+    expect(decodeLogs(load('logs-unrelated-topic'), '721')).toEqual([]);
+    expect(decodeLogs(load('logs-unrelated-topic'), '1155')).toEqual([]);
+  });
+
+  it('skips a log with no topics at all', () => {
+    const empty: RawLog = {
+      topics: [], data: '0x', transactionHash: `0x${'8'.repeat(64)}` as Hex,
+      blockNumber: 1n, logIndex: 0,
+    };
+    expect(decodeTransferLog(empty, '721')).toEqual([]);
+  });
+});
+
+// Precision loss here is silent and produces rows that look entirely plausible.
+describe('decodeLogs — uint256 precision', () => {
+  it('round-trips a max-uint256 tokenId exactly', () => {
+    const max = 2n ** 256n - 1n;
+    const [t] = decodeLogs(load('logs-721-max-uint256'), '721');
+    expect(t?.tokenId).toBe(max);
+    expect(t?.tokenId.toString()).toBe(
+      '115792089237316195423570985008687907853269984665640564039457584007913129639935',
+    );
+  });
+
+  it('keeps a tokenId above Number.MAX_SAFE_INTEGER exact as a string', () => {
+    const [t] = decodeLogs(load('logs-721-max-uint256'), '721');
+    const asString = t!.tokenId.toString();
+    // Routing through a JS number would silently round this.
+    expect(asString).not.toBe(String(Number(asString)));
+    expect(BigInt(asString)).toBe(t?.tokenId);
+  });
+
+  it('keeps a max-uint256 amount exact in a batch', () => {
+    const max = 2n ** 256n - 1n;
+    const out = decodeTransferLog(batchLog([max], [max]), '1155');
+    expect(out[0]?.tokenId).toBe(max);
+    expect(out[0]?.amount).toBe(max);
+  });
+
+  it('types tokenId and amount as bigint, never number', () => {
+    const [t] = decodeLogs(load('logs-1155-single'), '1155');
+    expect(typeof t?.tokenId).toBe('bigint');
+    expect(typeof t?.amount).toBe('bigint');
   });
 });
 
@@ -3099,18 +3318,73 @@ describe('decodeLogs — ERC-1155 TransferSingle', () => {
 
 describe('decodeLogs — ERC-1155 TransferBatch', () => {
   it('expands one log into one transfer per id', () => {
-    const out = decodeLogs(load('logs-1155-batch'), '1155');
-    expect(out).toHaveLength(2);
+    expect(decodeLogs(load('logs-1155-batch'), '1155')).toHaveLength(2);
   });
 
   // The whole reason batch_index exists: these rows share tx_hash and log_index.
-  it('numbers batch_index by array position while sharing tx hash and log index', () => {
+  it('numbers batchIndex by array position while sharing tx hash and log index', () => {
     const out = decodeLogs(load('logs-1155-batch'), '1155');
     expect(out.map((t) => t.batchIndex)).toEqual([0, 1]);
     expect(out.map((t) => t.tokenId)).toEqual([10n, 11n]);
     expect(out.map((t) => t.amount)).toEqual([1n, 2n]);
     expect(new Set(out.map((t) => t.logIndex)).size).toBe(1);
     expect(new Set(out.map((t) => t.txHash)).size).toBe(1);
+  });
+
+  it('numbers batchIndex sequentially across a longer batch', () => {
+    const out = decodeTransferLog(batchLog([1n, 2n, 3n, 4n, 5n], [1n, 1n, 1n, 1n, 1n]), '1155');
+    expect(out.map((t) => t.batchIndex)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  // A batch may legally carry the same id twice. batch_index is then the ONLY
+  // thing keeping the rows distinct under the composite primary key, so a
+  // decoder emitting a constant batchIndex would collapse them at insert time.
+  it('distinguishes two slots carrying the same tokenId', () => {
+    const out = decodeTransferLog(batchLog([100n, 100n, 100n], [1n, 2n, 3n]), '1155');
+    expect(out.map((t) => t.tokenId)).toEqual([100n, 100n, 100n]);
+    expect(out.map((t) => t.batchIndex)).toEqual([0, 1, 2]);
+    expect(out.map((t) => t.amount)).toEqual([1n, 2n, 3n]);
+    // The composite-key tuple must be unique across the three rows.
+    const keys = out.map((t) => `${t.txHash}:${t.logIndex}:${t.batchIndex}`);
+    expect(new Set(keys).size).toBe(3);
+  });
+
+  it('emits zero rows for an empty batch without crashing', () => {
+    expect(decodeTransferLog(batchLog([], []), '1155')).toEqual([]);
+  });
+
+  it('does not emit a row with undefined fields for an empty batch', () => {
+    const out = decodeTransferLog(batchLog([], []), '1155');
+    expect(out).toHaveLength(0);
+    expect(out.some((t) => t === undefined || t.tokenId === undefined)).toBe(false);
+  });
+});
+
+// Malformed-but-decodable is the silent-corruption shape. Measured: viem decodes a
+// mismatched TransferBatch WITHOUT complaint, so this guard is ours alone. Zipping
+// to the shorter array drops a transfer; padding with 0n invents one.
+describe('decodeLogs — malformed TransferBatch throws rather than zipping', () => {
+  it('throws when there are more ids than values', () => {
+    expect(() => decodeTransferLog(batchLog([1n, 2n, 3n], [1n, 2n]), '1155'))
+      .toThrow(DecodeError);
+  });
+
+  it('throws when there are more values than ids', () => {
+    expect(() => decodeTransferLog(batchLog([1n, 2n], [1n, 2n, 3n]), '1155'))
+      .toThrow(DecodeError);
+  });
+
+  it('names both lengths and the log in the error, so it is diagnosable', () => {
+    expect(() => decodeTransferLog(batchLog([1n, 2n, 3n], [1n]), '1155'))
+      .toThrow(/3 ids.*1 value|1 value.*3 ids/i);
+    expect(() => decodeTransferLog(batchLog([1n, 2n, 3n], [1n]), '1155'))
+      .toThrow(/7{8}/);   // the fixture tx hash appears in the message
+  });
+
+  it('throws rather than silently returning the shorter zip', () => {
+    let out: unknown = 'not-called';
+    try { out = decodeTransferLog(batchLog([1n, 2n, 3n], [1n, 2n]), '1155'); } catch { /* expected */ }
+    expect(out).toBe('not-called');
   });
 });
 
@@ -3123,17 +3397,27 @@ describe('decodeLogs — standard isolation', () => {
     expect(decodeLogs(load('logs-721'), '1155')).toEqual([]);
   });
 });
+
+describe('TRANSFER_TOPICS', () => {
+  it('lists one topic for 721 and two for 1155', () => {
+    expect(TRANSFER_TOPICS['721']).toHaveLength(1);
+    expect(TRANSFER_TOPICS['1155']).toHaveLength(2);
+  });
+
+  it('gives 721 and 1155 no topic in common', () => {
+    const overlap = TRANSFER_TOPICS['721'].filter((t) => TRANSFER_TOPICS['1155'].includes(t));
+    expect(overlap).toEqual([]);
+  });
+});
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 4: Run to verify failure, then write `src/indexer/decode.ts`**
 
-Run: `npx vitest run test/unit/decode.test.ts`
-Expected: FAIL — cannot resolve `../../src/indexer/decode.js`.
-
-- [ ] **Step 4: Write `src/indexer/decode.ts`**
+Run: `npx vitest run test/unit/decode.test.ts` — FAIL, module missing.
 
 ```ts
 import { decodeEventLog, parseAbi } from 'viem';
+import { DecodeError } from '../errors.js';
 import type { Address, DecodedTransfer, Hash, Standard } from '../types.js';
 
 export interface RawLog {
@@ -3159,6 +3443,12 @@ const TOPIC_1155_SINGLE =
 const TOPIC_1155_BATCH =
   '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb' as const;
 
+/**
+ * ERC-721 `Transfer` has three indexed arguments, so a compliant log carries
+ * topic0 plus three — four in total.
+ */
+const ERC721_TOPIC_COUNT = 4;
+
 /** topic0 filters to pass to getLogs, per standard. */
 export const TRANSFER_TOPICS: Record<Standard, Hash[]> = {
   '721': [TOPIC_721_TRANSFER],
@@ -3169,6 +3459,7 @@ const lower = (a: string): Address => a.toLowerCase() as Address;
 
 export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTransfer[] {
   const topic0 = log.topics[0];
+  // An unrelated event from the same address is normal, not exceptional.
   if (!topic0 || !TRANSFER_TOPICS[standard].includes(topic0)) return [];
 
   const common = {
@@ -3178,9 +3469,18 @@ export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTrans
   };
 
   if (standard === '721') {
-    // An ERC-721 Transfer has three indexed args, so topics.length is 4. An
-    // ERC-20 Transfer shares topic0 but indexes only two, so this rejects it.
-    if (log.topics.length !== 4) return [];
+    // ERC-20's Transfer(address,address,uint256) hashes to the SAME topic0, but
+    // indexes only two arguments, so its logs carry three topics. Skipping on
+    // topic count is what keeps an ERC-20 log out of the index — and, with a
+    // three-indexed ABI, what stops viem throwing DecodeLogTopicsMismatch and
+    // killing the backfill on the first one it meets.
+    //
+    // KNOWN LIMITATION: a non-compliant early ERC-721 that emits a NON-indexed
+    // tokenId also has three topics and is therefore skipped. Accepting it would
+    // require an ABI indistinguishable from ERC-20, so those collections index
+    // as zero transfers. Recorded in the README.
+    if (log.topics.length !== ERC721_TOPIC_COUNT) return [];
+
     const { args } = decodeEventLog({ abi: ERC721_ABI, topics: log.topics, data: log.data });
     return [{
       ...common,
@@ -3207,16 +3507,44 @@ export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTrans
 
   const { args } = decodeEventLog({ abi: ERC1155_ABI, topics: log.topics, data: log.data });
   if (!('ids' in args)) return [];
+
+  // viem decodes the two arrays independently and does NOT object when their
+  // lengths differ (measured). Zipping to the shorter one silently drops a
+  // transfer; padding with 0n silently invents one. Neither is acceptable for an
+  // index, so a malformed batch is a hard error.
+  if (args.ids.length !== args.values.length) {
+    throw new DecodeError(
+      `ERC-1155 TransferBatch in ${log.transactionHash} log ${log.logIndex} carries ` +
+      `${args.ids.length} ids and ${args.values.length} values. Refusing to decode: ` +
+      'zipping to the shorter array would drop transfers and padding would invent them.',
+    );
+  }
+
   // One log, many tokens. batchIndex disambiguates rows that otherwise share
-  // (chain_id, tx_hash, log_index) and would collide on the primary key.
-  return args.ids.map((tokenId, i) => ({
-    ...common,
-    tokenId,
-    amount: args.values[i] ?? 0n,
-    from: lower(args.from),
-    to: lower(args.to),
-    batchIndex: i,
-  }));
+  // (chain_id, tx_hash, log_index) — including two slots carrying the same id,
+  // where it is the only thing keeping them distinct.
+  const out: DecodedTransfer[] = [];
+  for (const [i, tokenId] of args.ids.entries()) {
+    const amount = args.values[i];
+    if (amount === undefined) {
+      // Unreachable after the length check above; present because
+      // noUncheckedIndexedAccess makes the possibility visible, and a silent
+      // fallback here is exactly the bug the length check exists to prevent.
+      throw new DecodeError(
+        `ERC-1155 TransferBatch in ${log.transactionHash} log ${log.logIndex} has no ` +
+        `value at index ${i} despite matching array lengths.`,
+      );
+    }
+    out.push({
+      ...common,
+      tokenId,
+      amount,
+      from: lower(args.from),
+      to: lower(args.to),
+      batchIndex: i,
+    });
+  }
+  return out;
 }
 
 export function decodeLogs(logs: RawLog[], standard: Standard): DecodedTransfer[] {
@@ -3224,22 +3552,61 @@ export function decodeLogs(logs: RawLog[], standard: Standard): DecodedTransfer[
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [ ] **Step 5: Run the tests and typecheck**
 
 Run: `npx vitest run test/unit/decode.test.ts && npm run typecheck`
-Expected: PASS, 7 tests.
+Then `npm test` for the whole suite.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Mutation-verify all three guards — mandatory**
+
+CLAUDE.md requires mutation verification for any test claiming an idempotency,
+concurrency, security or transactional-atomicity property; these three guards are the same
+class of silent-corruption defence, so they get the same treatment. In a scratch file
+OUTSIDE `src/`, copy `decode.ts` and produce three mutants, reporting each result:
+
+- **Mutant A — remove the topic-count guard** (`if (log.topics.length !== ERC721_TOPIC_COUNT) return [];`).
+  Expected: the ERC-20 tests fail. Report *how* they fail — the prediction is that viem
+  throws `DecodeLogTopicsMismatch` rather than returning a wrong row, so
+  `decodes an ERC-20 Transfer to zero rows` and `does not throw on it` should both fail.
+  If instead it returns a decoded row, say so — that would mean the misdecode risk is live
+  today and not merely conditional.
+- **Mutant B — emit a constant `batchIndex: 0`** instead of `i`. Expected: the sequencing
+  test and the duplicate-`tokenId` test both fail. This is the mutant that proves
+  `batch_index` is genuinely pinned at the decode layer.
+- **Mutant C — replace the length check with a zip** (`amount: args.values[i] ?? 0n`, no
+  throw). Expected: all four malformed-batch tests fail, and the mismatched log decodes to
+  the shorter length with a `0n` amount — report the row count and amounts it produced, so
+  the silent corruption is on the record.
+
+If any mutant passes the tests it should break, say so plainly and record it as a gap
+rather than shipping. Delete the scratch file afterwards.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/indexer/decode.ts test/fixtures/ test/unit/decode.test.ts
+git add src/indexer/decode.ts src/errors.ts test/fixtures/ test/unit/decode.test.ts
 git commit -m "feat: decode ERC-721 Transfer and ERC-1155 TransferSingle/Batch
 
-TransferBatch expands one log into one transfer per id, numbered by
-batchIndex, since those rows share tx_hash and log_index.
+ERC-721 and ERC-20 Transfer share topic0 byte-for-byte; ERC-721 indexes
+tokenId (4 topics), ERC-20 puts value in data (3). Measured: without a
+topic-count guard viem throws DecodeLogTopicsMismatch on an ERC-20 log,
+so the backfill would die on the first one rather than mis-decode it. The
+guard makes it skip quietly, proven by a real-shaped ERC-20 fixture
+asserted to zero rows.
 
-721 decoding requires four topics, which rejects ERC-20 Transfer events
-that share the same topic0 but index only two arguments.
+Known limitation: a non-compliant early ERC-721 emitting a non-indexed
+tokenId also has 3 topics and is skipped. Accepting it needs an ABI
+indistinguishable from ERC-20, so the guard is the correct trade.
+
+Measured: viem decodes a TransferBatch with mismatched ids/values lengths
+without complaint. Zipping to the shorter array drops transfers and
+padding invents them, so a mismatch is now a hard DecodeError naming both
+lengths and the log.
+
+batchIndex is pinned including a batch carrying the same tokenId in
+several slots, where it is the only thing keeping those rows distinct
+under the composite primary key. A max-uint256 fixture pins that nothing
+routes a uint256 through a JS number.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -5465,7 +5832,7 @@ Expected: every unit suite passes. Integration tests run if `RPC_URL_8453` is se
 
 - [ ] **Step 5: Write the README**
 
-`README.md` must contain: what the project is, the Milestone 1 scope, setup (`.env` from `.env.example`, `npm install`, `npm run migrate`), usage (`npm run index -- --chain 8453 --contract 0x…`), how to run tests, and a **Known limitations** section reproducing verbatim the seven limitations from the spec's "Known limitations" section — including that ERC-20/WETH sales read as `transfer`, that `burn` detects only `0x0`, that reorgs are handled by confirmation lag with no rewrite of indexed rows, and that the deploy-block binary search assumes code presence is monotonic and therefore breaks for self-destructed or CREATE2-redeployed addresses.
+`README.md` must contain: what the project is, the Milestone 1 scope, setup (`.env` from `.env.example`, `npm install`, `npm run migrate`), usage (`npm run index -- --chain 8453 --contract 0x…`), how to run tests, and a **Known limitations** section reproducing verbatim the seven limitations from the spec's "Known limitations" section, PLUS the one discovered during Task 6: a non-compliant early ERC-721 that emits a **non-indexed** `tokenId` produces a 3-topic log indistinguishable from an ERC-20 `Transfer`, so the topic-count guard skips it and such a collection indexes as zero transfers — including that ERC-20/WETH sales read as `transfer`, that `burn` detects only `0x0`, that reorgs are handled by confirmation lag with no rewrite of indexed rows, and that the deploy-block binary search assumes code presence is monotonic and therefore breaks for self-destructed or CREATE2-redeployed addresses.
 
 - [ ] **Step 6: Commit**
 

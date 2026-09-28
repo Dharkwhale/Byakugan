@@ -455,6 +455,10 @@ Recorded in the README, not left implicit:
 - ERC-20 / WETH-paid sales classify as `transfer`. Acknowledged in the project
   spec; fixed when a sale decoder lands.
 - `burn` detects `0x0` only, not `0x…dEaD` and other burn sinks.
+- Non-compliant early ERC-721s that emit a **non-indexed** `tokenId` produce a
+  3-topic log byte-indistinguishable from an ERC-20 `Transfer`, so the topic-count
+  guard skips them and such a collection indexes as zero transfers. Accepting them
+  would require an ABI that cannot be told apart from ERC-20. (Found in Task 6.)
 - `buy` misses purchases where `tx.from != to_addr` — routers, or a token bought
   for another wallet.
 - Reorgs are handled by confirmation lag only. Already-indexed rows are never
