@@ -85,10 +85,10 @@ describe('classify — checksummed input must still match', () => {
       .toBe('buy');
   });
 
-  it('recognises a checksummed zero address as a mint', () => {
-    const checksummedZero = ZERO_ADDRESS.toUpperCase().replace('0X', '0x') as Address;
-    expect(classify({ from: checksummedZero, to: BUYER }, tx())).toBe('mint');
-  });
+  // No "checksummed zero address" test: the zero address has no letters, so
+  // ZERO_ADDRESS.toUpperCase() is a no-op and there is no case variation of
+  // it to exercise. The plain-mint test above already covers this input;
+  // the property is not merely untested here, it is untestable.
 
   it('does not match two different addresses that differ only beyond case', () => {
     expect(classify({ from: SELLER, to: BUYER }, tx({ from: SELLER, value: 10n })))
@@ -146,6 +146,41 @@ describe('classify — tx.value is a bigint, never a string or number', () => {
       { from: SELLER, to: BUYER },
       { from: BUYER, value: '10' as unknown as bigint },
     )).toThrow(/string/i);
+  });
+
+  // These four are the inputs the guard actually exists for. Measured: a
+  // NUMERIC string compares correctly against 0n ('10' is paid, '0' is not),
+  // so that was never the risk. But undefined, null, '' and a non-numeric
+  // string all compare as false against 0n WITHOUT throwing — so a missing or
+  // malformed tx.value (an absent field on a real row, a provider returning
+  // nothing) silently reads as unpaid and downgrades a genuine buy to a
+  // transfer. Unlike the numeric-string case, there is no lucky coercion here.
+  it('throws on undefined rather than reading a missing value as unpaid', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: undefined as unknown as bigint },
+    )).toThrow(ClassifyError);
+  });
+
+  it('throws on null rather than reading a missing value as unpaid', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: null as unknown as bigint },
+    )).toThrow(ClassifyError);
+  });
+
+  it('throws on an empty string rather than reading it as unpaid', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: '' as unknown as bigint },
+    )).toThrow(ClassifyError);
+  });
+
+  it('throws on a non-numeric string rather than reading it as unpaid', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: 'abc' as unknown as bigint },
+    )).toThrow(ClassifyError);
   });
 });
 

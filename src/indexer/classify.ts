@@ -28,16 +28,31 @@ export function classify(
   tx: TxInfo,
 ): Kind {
   // TxInfo.value is typed bigint, but the repository stores tx_value_wei as
-  // TEXT. A caller handing over a raw database row would pass a string, and a
-  // coercing comparison would misclassify silently instead of failing — '0' is
-  // a non-empty string. Fail loudly at the boundary instead.
+  // TEXT, so a caller handing over a raw row passes a string.
+  //
+  // Measured: a NUMERIC string compares correctly ('10' > 0n is true, '0' is
+  // false), so that is not the risk. The risk is that `undefined`, `null`, ''
+  // and any non-numeric string ALL compare as false against 0n WITHOUT
+  // throwing — so a missing or malformed value reads as unpaid and silently
+  // downgrades a genuine buy to a transfer. Numeric strings happening to work
+  // is precisely why trusting the comparison rather than the type is fragile.
   if (typeof tx.value !== 'bigint') {
     throw new ClassifyError(
-      `tx.value must be a bigint, received ${typeof tx.value}. ` +
-      'Convert with BigInt() before classifying; a string comparison misclassifies silently.',
+      `tx.value must be a bigint, received ${typeof tx.value}. A non-bigint ` +
+      'value cannot be compared reliably, and a missing or malformed one ' +
+      "(undefined, null, '', or a non-numeric string) would silently read as " +
+      'unpaid and downgrade a genuine buy to a transfer. Convert with BigInt() ' +
+      'before classifying.',
     );
   }
 
+  // Both sides are normalised as a habit — lowercasing costs nothing — but
+  // only `to` is load-bearing. `from` is compared only against ZERO_ADDRESS,
+  // which has no letters, so no case variation of `from` changes the result;
+  // there is no test behind that half, and none is possible (see the deleted
+  // "checksummed zero address" test). `to` is compared against `tx.from` in
+  // the buy rule below, where case genuinely matters — that pairing is the
+  // one Mutant B (dropping toLowerCase on tx.from) demonstrates breaks.
   const from = transfer.from.toLowerCase();
   const to = transfer.to.toLowerCase();
 
