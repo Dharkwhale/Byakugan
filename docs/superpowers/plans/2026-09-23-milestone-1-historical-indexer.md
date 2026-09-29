@@ -48,8 +48,8 @@
 | `src/db/repositories/transfers.ts` | idempotent insert, known-tx lookup, counts |
 | `src/indexer/decode.ts` | raw log → `DecodedTransfer[]` (pure) |
 | `src/indexer/classify.ts` | transfer + tx → `Kind` (pure) |
-| `src/chain/rateLimit.ts` | token bucket |
-| `src/chain/client.ts` | memoized viem public client per chain |
+| `src/chain/rateLimit.ts` | elapsed-time token bucket, injected clock + sleep |
+| `src/chain/client.ts` | memoized {client, limit} pair per chain |
 | `src/indexer/logs.ts` | `isRangeError`, adaptive chunked `getLogs` generator |
 | `src/chain/standard.ts` | ERC-165 detection + Enumerable support |
 | `src/chain/deployBlock.ts` | override → explorer → guarded binary search |
@@ -3961,95 +3961,428 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Rate limiter and chain client registry
+### Task 8: Token-bucket rate limiter and chain client registry
 
 **Files:**
 - Create: `src/chain/rateLimit.ts`, `src/chain/client.ts`
-- Test: `test/unit/rateLimit.test.ts`
+- Test: `test/unit/rateLimit.test.ts`, `test/unit/client.test.ts`
 
 **Interfaces:**
-- Consumes: `ChainConfig`, `Config` (Task 1)
+- Consumes: `Clock`, `systemClock`, `manualClock` (Task 3); `Config`, `ChainConfig` (Task 1); `ConfigError` (Task 1)
 - Produces:
-  - `createRateLimiter(requestsPerSecond: number, now?: () => number): <T>(fn: () => Promise<T>) => Promise<T>`
-  - `getClient(chainId: number, config: Config): PublicClient`
-  - `resetClients(): void`
+  - `type RateLimiter = <T>(fn: () => Promise<T>) => Promise<T>`
+  - `createRateLimiter(opts: { capacity: number; refillPerSec: number; clock?: Clock; sleep?: (ms: number) => Promise<void> }): RateLimiter`
+  - `interface ChainClient { chainId: number; client: PublicClient; limit: RateLimiter }`
+  - `getChainClient(chainId: number, config: Config): ChainClient`
+  - `resetChainClients(): void`
 
-- [ ] **Step 1: Write the failing test**
+**Note for Task 14:** the CLI's plan calls `getClient(chainId, config)` and builds a limiter
+separately. It must now call `getChainClient(chainId, config)` and use the `limit` from the
+returned object, so the client and its bucket cannot drift apart.
+
+---
+
+**Five properties, and one of them is measured rather than argued.**
+
+**1. The bucket is driven by an injected clock and an injected sleep — never `setTimeout`
+in tests.** Same discipline as Task 4's lock clock: a limiter tested with real sleeps is
+slow and flaky, and a flaky timing test gets deleted within a month. Both dependencies are
+injected, and the test's `sleep` advances the manual clock instead of waiting, so the whole
+suite runs instantly and deterministically.
+
+**2. Refill is proportional to elapsed time, not a fixed tick.** A tick-based refill
+either over-grants after an idle period or under-grants during a burst. Two behavioural
+assertions pin it: a bucket idle for 10 seconds at 5/s refills to exactly capacity and **not
+beyond** (proved by firing `capacity` requests with no wait, then observing the next one
+wait), and a burst of `capacity + 1` forces exactly the last request to wait.
+
+**3. One bucket per chain, bound to the memoized client.** A slow mainnet backfill must not
+throttle Base. The limiter is returned alongside the client in a single memoized object, so
+the two cannot be paired up wrongly by a caller, and a test drains one chain's bucket and
+proves the other's is untouched.
+
+**4. Memoization returns the identical instance, and a failed construction is not cached.**
+Returning a fresh client per call would silently give each one its own bucket, defeating the
+rate limit entirely. Equally, caching a failure would turn a transient misconfiguration into
+a permanent one for the life of the process.
+
+**5. The bucket and viem's retries do not compound into an unbounded wait — measured.**
+Against a local server that always returns 500:
+
+```
+retryCount 3, retryDelay 250 -> 4 HTTP attempts, total 1935ms, gaps 0/313/515/1007ms
+retryCount 0, retryDelay 250 -> 1 HTTP attempt,  total   12ms
+```
+
+So viem **doubles** the delay each retry (250 → 500 → 1000), giving 1750ms of backoff across
+3 retries. It does not read `retryDelay` as a fixed interval. The limiter wraps the *whole*
+viem call, so retries happen inside one token and are not individually rate-limited — which
+means retries can briefly exceed the configured rate, but by at most a factor of
+`retryCount + 1`, and they cannot consume additional tokens. The worst case is bounded and
+must be stated in a comment; the arithmetic is in the code below.
+
+- [ ] **Step 1: Write the failing rate-limiter test**
 
 `test/unit/rateLimit.test.ts`:
 
 ```ts
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { createRateLimiter } from '../../src/chain/rateLimit.js';
+import { manualClock } from '../../src/clock.js';
 
-beforeEach(() => { vi.useFakeTimers(); });
-afterEach(() => { vi.useRealTimers(); });
+/**
+ * A sleep that advances the manual clock instead of waiting. Every test here is
+ * instant and deterministic; no setTimeout, no real elapsed time. A limiter
+ * tested against the wall clock is flaky, and flaky tests get deleted.
+ */
+function fakeSleep(clock: ReturnType<typeof manualClock>) {
+  const slept: number[] = [];
+  return {
+    slept,
+    sleep: async (ms: number) => {
+      slept.push(ms);
+      clock.advance(ms);
+    },
+  };
+}
 
-describe('createRateLimiter', () => {
-  it('runs calls within the budget immediately', async () => {
-    const limit = createRateLimiter(10);
-    const results = await Promise.all([limit(async () => 1), limit(async () => 2)]);
-    expect(results).toEqual([1, 2]);
+function harness(capacity: number, refillPerSec: number, startMs = 0) {
+  const clock = manualClock(startMs);
+  const { slept, sleep } = fakeSleep(clock);
+  const limit = createRateLimiter({ capacity, refillPerSec, clock, sleep });
+  return { clock, slept, limit };
+}
+
+describe('createRateLimiter — burst up to capacity', () => {
+  it('runs a full burst without sleeping', async () => {
+    const { slept, limit } = harness(5, 5);
+    for (let i = 0; i < 5; i++) await limit(async () => i);
+    expect(slept).toEqual([]);
   });
 
-  it('delays a call that exceeds the per-second budget', async () => {
-    const limit = createRateLimiter(2);
-    const done: number[] = [];
-    const pending = Promise.all([
-      limit(async () => { done.push(1); }),
-      limit(async () => { done.push(2); }),
-      limit(async () => { done.push(3); }),
-    ]);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(done).toEqual([1, 2]);
-    await vi.advanceTimersByTimeAsync(1000);
-    await pending;
-    expect(done).toEqual([1, 2, 3]);
+  it('makes the request past capacity wait', async () => {
+    const { slept, limit } = harness(5, 5);
+    for (let i = 0; i < 5; i++) await limit(async () => i);
+    await limit(async () => 'sixth');
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBe(200);   // one token at 5/s
   });
 
-  it('propagates the rejection of a limited call', async () => {
-    const limit = createRateLimiter(10);
+  it('returns the function result unchanged', async () => {
+    const { limit } = harness(2, 2);
+    await expect(limit(async () => 'value')).resolves.toBe('value');
+  });
+
+  it('propagates a rejection', async () => {
+    const { limit } = harness(2, 2);
     await expect(limit(async () => { throw new Error('boom'); })).rejects.toThrow('boom');
   });
 
-  it('releases its slot after a failure so later calls still run', async () => {
-    const limit = createRateLimiter(1);
-    await expect(limit(async () => { throw new Error('boom'); })).rejects.toThrow();
-    await vi.advanceTimersByTimeAsync(1000);
-    await expect(limit(async () => 'ok')).resolves.toBe('ok');
+  it('consumes a token even when the call fails, so a failing burst is still limited', async () => {
+    const { slept, limit } = harness(2, 2);
+    await expect(limit(async () => { throw new Error('a'); })).rejects.toThrow();
+    await expect(limit(async () => { throw new Error('b'); })).rejects.toThrow();
+    await limit(async () => 'third');
+    expect(slept).toHaveLength(1);
+  });
+});
+
+describe('createRateLimiter — refill is proportional to elapsed time', () => {
+  // A fixed-tick refill would either over-grant here or under-grant during a
+  // burst. These assert the elapsed-time behaviour, not an internal counter.
+  it('refills to exactly capacity after a long idle, and not beyond', async () => {
+    const { clock, slept, limit } = harness(5, 5);
+    for (let i = 0; i < 5; i++) await limit(async () => i);   // drain
+    expect(slept).toEqual([]);
+
+    clock.advance(10_000);   // 10s idle at 5/s would be 50 tokens, uncapped
+
+    // Exactly `capacity` more run free...
+    for (let i = 0; i < 5; i++) await limit(async () => i);
+    expect(slept).toEqual([]);
+
+    // ...and the next one waits, proving the refill capped at capacity rather
+    // than accumulating 50 tokens.
+    await limit(async () => 'over');
+    expect(slept).toEqual([200]);
+  });
+
+  it('grants a partial refill proportional to a short idle', async () => {
+    const { clock, slept, limit } = harness(5, 5);
+    for (let i = 0; i < 5; i++) await limit(async () => i);   // drain
+
+    clock.advance(600);   // 0.6s at 5/s = 3 tokens
+
+    for (let i = 0; i < 3; i++) await limit(async () => i);
+    expect(slept).toEqual([]);
+
+    await limit(async () => 'fourth');
+    expect(slept).toHaveLength(1);
+  });
+
+  it('waits proportionally less when partially refilled', async () => {
+    const { clock, slept, limit } = harness(1, 5);
+    await limit(async () => 'first');       // drains the only token
+    clock.advance(100);                      // 0.5 of a token at 5/s
+    await limit(async () => 'second');
+    expect(slept[0]).toBe(100);              // needs the other 0.5 = 100ms
+  });
+
+  it('does not accumulate tokens beyond capacity across several idles', async () => {
+    const { clock, slept, limit } = harness(3, 10);
+    clock.advance(60_000);                   // a minute idle
+    for (let i = 0; i < 3; i++) await limit(async () => i);
+    expect(slept).toEqual([]);
+    await limit(async () => 'over');
+    expect(slept).toHaveLength(1);
+  });
+
+  it('never grants a negative wait when the clock does not move', async () => {
+    const { slept, limit } = harness(1, 10);
+    await limit(async () => 'a');
+    await limit(async () => 'b');
+    expect(slept[0]).toBeGreaterThan(0);
+  });
+});
+
+describe('createRateLimiter — concurrent callers', () => {
+  // Without serialised acquisition, two concurrent callers can both observe the
+  // same last token and both proceed, silently exceeding the rate.
+  it('does not let two concurrent callers share one token', async () => {
+    const { slept, limit } = harness(1, 5);
+    await Promise.all([limit(async () => 'a'), limit(async () => 'b')]);
+    expect(slept).toHaveLength(1);
+  });
+
+  it('serialises a concurrent burst past capacity', async () => {
+    const { slept, limit } = harness(2, 5);
+    await Promise.all([
+      limit(async () => 'a'), limit(async () => 'b'),
+      limit(async () => 'c'), limit(async () => 'd'),
+    ]);
+    expect(slept).toHaveLength(2);   // two over capacity
+  });
+
+  it('keeps limiting after a concurrent caller rejects', async () => {
+    const { limit } = harness(2, 5);
+    const results = await Promise.allSettled([
+      limit(async () => { throw new Error('x'); }),
+      limit(async () => 'ok'),
+    ]);
+    expect(results[0]?.status).toBe('rejected');
+    expect(results[1]?.status).toBe('fulfilled');
+  });
+});
+
+describe('createRateLimiter — independent buckets', () => {
+  it('gives two limiters separate token pools', async () => {
+    const a = harness(1, 5);
+    const b = harness(1, 5);
+    await a.limit(async () => 'a1');
+    await a.limit(async () => 'a2');    // a must wait
+    await b.limit(async () => 'b1');    // b is untouched
+    expect(a.slept).toHaveLength(1);
+    expect(b.slept).toEqual([]);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `npx vitest run test/unit/rateLimit.test.ts`
-Expected: FAIL — cannot resolve `../../src/chain/rateLimit.js`.
-
-- [ ] **Step 3: Write `src/chain/rateLimit.ts`**
+- [ ] **Step 2: Run to verify failure, then write `src/chain/rateLimit.ts`**
 
 ```ts
+import { systemClock, type Clock } from '../clock.js';
+
+export type RateLimiter = <T>(fn: () => Promise<T>) => Promise<T>;
+
+export interface RateLimiterOptions {
+  /** Maximum burst. Tokens never accumulate beyond this. */
+  capacity: number;
+  /** Tokens added per second, applied proportionally to elapsed time. */
+  refillPerSec: number;
+  clock?: Clock;
+  sleep?: (ms: number) => Promise<void>;
+}
+
 /**
- * Token bucket. Returns a wrapper that delays a call until a token is free,
- * so a long backfill cannot trip provider rate limits.
+ * A token bucket.
+ *
+ * Refill is computed from ELAPSED TIME rather than a fixed tick: a tick-based
+ * refill either over-grants after an idle period or under-grants during a
+ * burst. Tokens are capped at `capacity`, so a bucket idle for a minute does
+ * not then allow a minute's worth of requests at once.
+ *
+ * The clock and sleep are injected so tests can drive time explicitly. A
+ * limiter tested against the wall clock is slow and flaky, and flaky tests get
+ * deleted.
+ *
+ * WORST-CASE DELAY FOR ONE FAILING REQUEST — measured, not estimated.
+ * Against a server that always returns 500, viem's http transport with
+ * `retryCount: 3, retryDelay: 250` made 4 HTTP attempts with gaps of roughly
+ * 250/500/1000ms: it DOUBLES the delay each retry rather than treating
+ * retryDelay as a fixed interval. Backoff therefore totals ~1750ms.
+ *
+ * This limiter wraps the whole viem call, so those retries happen inside a
+ * single token and consume no extra tokens — they cannot compound into an
+ * unbounded wait. Two consequences worth knowing:
+ *
+ *   worst case = bucket wait + (retryCount + 1) x request timeout + backoff
+ *              = (1 / refillPerSec) s + 4 x 30 s + 1.75 s
+ *              ~= 122 s for one request, at 30s timeout
+ *
+ * and a retrying request briefly exceeds the configured rate by at most a
+ * factor of `retryCount + 1`, because its retries are not individually
+ * rate-limited. Both are bounded. The dominant term is the request timeout,
+ * not the backoff, so lowering `timeout` matters far more than lowering
+ * `retryDelay` if a stuck backfill needs to fail faster.
  */
-export function createRateLimiter(
-  requestsPerSecond: number,
-): <T>(fn: () => Promise<T>) => Promise<T> {
-  const intervalMs = 1000 / requestsPerSecond;
-  let nextSlot = 0;
+export function createRateLimiter(opts: RateLimiterOptions): RateLimiter {
+  const clock = opts.clock ?? systemClock;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const { capacity, refillPerSec } = opts;
+
+  if (capacity < 1) throw new Error('rate limiter capacity must be at least 1');
+  if (refillPerSec <= 0) throw new Error('rate limiter refillPerSec must be positive');
+
+  let tokens = capacity;
+  let lastRefillMs = clock.now();
+  // Acquisition is serialised: without this, two concurrent callers can both
+  // observe the same last token and both proceed, silently doubling the rate.
+  let tail: Promise<unknown> = Promise.resolve();
+
+  function refill(): void {
+    const now = clock.now();
+    const elapsedMs = now - lastRefillMs;
+    if (elapsedMs <= 0) return;
+    lastRefillMs = now;
+    tokens = Math.min(capacity, tokens + (elapsedMs / 1000) * refillPerSec);
+  }
+
+  async function acquire(): Promise<void> {
+    refill();
+    if (tokens < 1) {
+      const waitMs = Math.ceil(((1 - tokens) / refillPerSec) * 1000);
+      await sleep(waitMs);
+      refill();
+    }
+    tokens = Math.max(0, tokens - 1);
+  }
 
   return async function limited<T>(fn: () => Promise<T>): Promise<T> {
-    const now = Date.now();
-    const slot = Math.max(now, nextSlot);
-    nextSlot = slot + intervalMs;
-    const wait = slot - now;
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    // The slot is consumed whether or not fn succeeds, so a failure cannot
-    // starve later calls.
+    const mine = tail.then(() => acquire());
+    // Swallow on the chain only, so one caller's failure cannot break the queue
+    // for everyone behind it. The caller still sees its own rejection below.
+    tail = mine.catch(() => undefined);
+    await mine;
     return fn();
   };
 }
+```
+
+- [ ] **Step 3: Write the failing client-registry test**
+
+`test/unit/client.test.ts`:
+
+```ts
+import { afterEach, describe, expect, it } from 'vitest';
+import { getChainClient, resetChainClients } from '../../src/chain/client.js';
+import { ConfigError } from '../../src/errors.js';
+import type { ChainConfig, Config } from '../../src/config.js';
+
+const chain = (chainId: number, name: string): ChainConfig => ({
+  chainId, name, rpcUrl: `https://${name}.example/v2/key`,
+  initialChunk: 2000, maxChunk: 10000, requestsPerSecond: 5,
+  confirmations: 12, blockFetchThreshold: 3,
+  archiveProbe: { address: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', block: 1 },
+});
+
+const configWith = (...ids: Array<[number, string]>): Config => ({
+  chains: new Map(ids.map(([id, name]) => [id, chain(id, name)])),
+  defaultChainId: ids[0]?.[0],
+  dbPath: ':memory:',
+  etherscanApiKey: undefined,
+  secrets: ids.map(([, name]) => `https://${name}.example/v2/key`),
+});
+
+afterEach(() => resetChainClients());
+
+describe('getChainClient — memoization', () => {
+  it('returns the identical object for the same chain id', () => {
+    const config = configWith([1, 'eth']);
+    expect(getChainClient(1, config)).toBe(getChainClient(1, config));
+  });
+
+  it('returns the identical client and limiter, not just an equal wrapper', () => {
+    const config = configWith([1, 'eth']);
+    const a = getChainClient(1, config);
+    const b = getChainClient(1, config);
+    expect(a.client).toBe(b.client);
+    expect(a.limit).toBe(b.limit);
+  });
+
+  it('returns different objects for different chains', () => {
+    const config = configWith([1, 'eth'], [8453, 'base']);
+    expect(getChainClient(1, config)).not.toBe(getChainClient(8453, config));
+  });
+
+  it('forgets everything after resetChainClients', () => {
+    const config = configWith([1, 'eth']);
+    const first = getChainClient(1, config);
+    resetChainClients();
+    expect(getChainClient(1, config)).not.toBe(first);
+  });
+});
+
+describe('getChainClient — failures are not memoized', () => {
+  it('throws ConfigError for an unconfigured chain', () => {
+    expect(() => getChainClient(999, configWith([1, 'eth']))).toThrow(ConfigError);
+  });
+
+  it('names the missing env var so the error is actionable', () => {
+    expect(() => getChainClient(999, configWith([1, 'eth']))).toThrow(/RPC_URL_999/);
+  });
+
+  // Caching the failure would turn a transient misconfiguration into a
+  // permanent one for the life of the process.
+  it('succeeds on a later call once the chain is configured', () => {
+    expect(() => getChainClient(999, configWith([1, 'eth']))).toThrow(ConfigError);
+    const fixed = configWith([1, 'eth'], [999, 'newchain']);
+    expect(() => getChainClient(999, fixed)).not.toThrow();
+    expect(getChainClient(999, fixed).chainId).toBe(999);
+  });
+
+  it('still throws every time while the chain stays unconfigured', () => {
+    const config = configWith([1, 'eth']);
+    expect(() => getChainClient(999, config)).toThrow(ConfigError);
+    expect(() => getChainClient(999, config)).toThrow(ConfigError);
+  });
+});
+
+describe('getChainClient — one bucket per chain', () => {
+  // A slow mainnet backfill must not throttle Base.
+  it('does not let one chain drain another chain\'s bucket', async () => {
+    const config = configWith([1, 'eth'], [8453, 'base']);
+    const eth = getChainClient(1, config);
+    const base = getChainClient(8453, config);
+
+    expect(eth.limit).not.toBe(base.limit);
+
+    // Drain mainnet's bucket entirely (capacity is requestsPerSecond = 5).
+    const started: string[] = [];
+    for (let i = 0; i < 5; i++) await eth.limit(async () => { started.push('eth'); });
+
+    // Base must still run immediately. If the buckets were shared this would
+    // block on mainnet's exhausted tokens.
+    const before = Date.now();
+    await base.limit(async () => { started.push('base'); });
+    expect(Date.now() - before).toBeLessThan(50);
+    expect(started.filter((s) => s === 'base')).toHaveLength(1);
+  });
+
+  it('gives each chain a limiter sized from its own requestsPerSecond', () => {
+    const config = configWith([1, 'eth'], [8453, 'base']);
+    expect(getChainClient(1, config).limit).not.toBe(getChainClient(8453, config).limit);
+  });
+});
 ```
 
 - [ ] **Step 4: Write `src/chain/client.ts`**
@@ -4058,26 +4391,46 @@ export function createRateLimiter(
 import { createPublicClient, http, type PublicClient } from 'viem';
 import type { Config } from '../config.js';
 import { ConfigError } from '../errors.js';
+import { createRateLimiter, type RateLimiter } from './rateLimit.js';
 
-const clients = new Map<number, PublicClient>();
+export interface ChainClient {
+  chainId: number;
+  client: PublicClient;
+  /** This chain's own token bucket. Never shared with another chain. */
+  limit: RateLimiter;
+}
+
+const clients = new Map<number, ChainClient>();
 
 /**
- * Memoized public client per chain. Read-only: this project never signs, so no
- * wallet client exists anywhere in the codebase.
+ * Memoized public client plus its rate limiter, one pair per chain.
+ *
+ * They are returned together so a caller cannot pair a client with the wrong
+ * bucket, and so one chain's slow backfill cannot throttle another's — each
+ * chain has its own token pool sized from its own `requestsPerSecond`.
+ *
+ * Read-only: this project never signs, so no wallet client exists anywhere.
+ *
+ * A failed construction is deliberately NOT cached. Caching it would turn a
+ * transient misconfiguration into a permanent one for the life of the process.
  */
-export function getClient(chainId: number, config: Config): PublicClient {
+export function getChainClient(chainId: number, config: Config): ChainClient {
   const cached = clients.get(chainId);
   if (cached) return cached;
 
   const chain = config.chains.get(chainId);
   if (!chain) {
     throw new ConfigError(
-      `chain ${chainId} is not configured. Set RPC_URL_${chainId} and add it to config/chains.json.`,
+      `chain ${chainId} is not configured. Set RPC_URL_${chainId} and add it to ` +
+      'config/chains.json.',
     );
   }
 
   const client = createPublicClient({
     transport: http(chain.rpcUrl, {
+      // Measured against an always-500 server: viem DOUBLES the delay each
+      // retry (250/500/1000), so 3 retries cost ~1750ms of backoff across 4
+      // HTTP attempts. See the worst-case arithmetic in rateLimit.ts.
       retryCount: 3,
       retryDelay: 250,
       // Coalesces concurrent calls into JSON-RPC batch requests, which is what
@@ -4085,29 +4438,84 @@ export function getClient(chainId: number, config: Config): PublicClient {
       batch: { batchSize: 50, wait: 10 },
     }),
   });
-  clients.set(chainId, client);
-  return client;
+
+  const entry: ChainClient = {
+    chainId,
+    client,
+    limit: createRateLimiter({
+      capacity: chain.requestsPerSecond,
+      refillPerSec: chain.requestsPerSecond,
+    }),
+  };
+
+  // Only reached on success, so a throw above leaves nothing cached.
+  clients.set(chainId, entry);
+  return entry;
 }
 
-export function resetClients(): void {
+export function resetChainClients(): void {
   clients.clear();
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests and typecheck**
 
-Run: `npx vitest run test/unit/rateLimit.test.ts && npm run typecheck`
-Expected: PASS, 4 tests.
+Run: `npx vitest run test/unit/rateLimit.test.ts test/unit/client.test.ts && npm run typecheck`
+Then `npm test` for the whole suite.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Mutation-verify the four load-bearing properties — mandatory**
+
+Per CLAUDE.md. In a scratch file OUTSIDE `src/`, copy each module and produce these mutants,
+reporting which tests fail for each:
+
+- **Mutant A — fixed-tick refill.** Replace the elapsed-time refill with
+  `tokens = Math.min(capacity, tokens + refillPerSec)` on each acquire. Expected: the
+  proportional-refill tests fail. Report whether the 10-second-idle test fails too, and say
+  which direction it errs in (over- or under-granting).
+- **Mutant B — uncapped refill.** Drop the `Math.min(capacity, …)`. Expected: the
+  idle-refill test fails because the sixth request no longer waits. This is the one that
+  proves "not beyond capacity" is pinned rather than incidental.
+- **Mutant C — no serialised acquisition.** Call `acquire()` directly without the `tail`
+  chain. Expected: the two-concurrent-callers test fails, with both proceeding on one token.
+  Report the observed `slept` array.
+- **Mutant D — memoize failures.** Cache the `ConfigError` (or cache before the throw) and
+  rethrow on later calls. Expected: `succeeds on a later call once the chain is configured`
+  fails.
+
+Also confirm the reverse for memoization: **Mutant E — return a fresh client each call**
+(drop the cache read). Expected: the identity tests fail. Note in your report that this
+mutant also silently gives every call its own bucket, which would defeat rate limiting
+entirely while every functional test still passed — that is why the identity assertions use
+`toBe` rather than a structural comparison.
+
+If any mutant passes a test it should break, say so plainly and record it as a gap.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/chain/rateLimit.ts src/chain/client.ts test/unit/rateLimit.test.ts
-git commit -m "feat: token-bucket rate limiter and memoized public client per chain
+git add src/chain/rateLimit.ts src/chain/client.ts test/unit/rateLimit.test.ts test/unit/client.test.ts
+git commit -m "feat: elapsed-time token bucket and per-chain client registry
 
-Public clients only; no wallet client exists in this codebase. The HTTP
-transport batches concurrent calls, which is what makes per-tx enrichment
-affordable.
+Refill is proportional to elapsed time and capped at capacity: a
+tick-based refill over-grants after an idle period and under-grants
+during a burst. Tested against an injected clock and an injected sleep
+that advances it, so the suite is instant and deterministic — a limiter
+tested against the wall clock is flaky, and flaky tests get deleted.
+
+Acquisition is serialised. Without it two concurrent callers observe the
+same last token and both proceed, silently doubling the rate.
+
+The client and its bucket are memoized together as one object so they
+cannot be paired up wrongly, and each chain gets its own pool sized from
+its own requestsPerSecond — a slow mainnet backfill must not throttle
+Base. A failed construction is not cached, so a transient
+misconfiguration does not become permanent.
+
+Measured against an always-500 server: viem DOUBLES retryDelay each
+retry (250/500/1000), so 3 retries cost ~1750ms across 4 HTTP attempts.
+Retries happen inside one token and consume no extra tokens, so they
+cannot compound into an unbounded wait; the worst case is bucket wait +
+4 x timeout + 1.75s, dominated by the timeout rather than the backoff.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -5769,8 +6177,7 @@ export function parseArgs(argv: string[], defaultChainId?: number): ParsedArgs {
 - [ ] **Step 4: Write `src/cli/index.ts`**
 
 ```ts
-import { createRateLimiter } from '../chain/rateLimit.js';
-import { getClient } from '../chain/client.js';
+import { getChainClient } from '../chain/client.js';
 import { makeSupportsInterface } from '../chain/standard.js';
 import { makeTxSource } from '../chain/tx.js';
 import { loadConfig } from '../config.js';
@@ -5798,8 +6205,9 @@ async function main(): Promise<void> {
   const db = openDb(config.dbPath);
   runMigrations(db);
 
-  const client = getClient(args.chainId, config);
-  const limit = createRateLimiter(chain.requestsPerSecond);
+  // One memoized object per chain: the client and its own token bucket,
+  // returned together so they cannot be paired up wrongly.
+  const { client, limit } = getChainClient(args.chainId, config);
   const address = args.contract as Address;
   const standard = args.standard;
 
@@ -5904,7 +6312,7 @@ This task needs RPC keys in `.env`. Do not hardcode any collection value until i
  * Usage: npx tsx scripts/capture-fixtures.ts --chain 8453 --contract 0x… --blocks 5
  */
 import { writeFileSync } from 'node:fs';
-import { getClient } from '../src/chain/client.js';
+import { getChainClient } from '../src/chain/client.js';
 import { loadConfig } from '../src/config.js';
 import { parseArgs } from '../src/cli/args.js';
 import { TRANSFER_TOPICS } from '../src/indexer/decode.js';
@@ -5916,7 +6324,7 @@ const args = parseArgs(process.argv.slice(2).filter((_, i, a) => {
   return prev !== '--blocks' && a[i] !== '--blocks';
 }), config.defaultChainId);
 
-const client = getClient(args.chainId, config);
+const { client } = getChainClient(args.chainId, config);
 const address = args.contract as Address;
 
 const deployBlock = BigInt(args.deployBlock ?? 0);
@@ -5957,7 +6365,7 @@ Then print, for the candidate: deploy block, deploy-block source, first mint tx 
 ```ts
 import { describe, expect, it } from 'vitest';
 import { parseAbi } from 'viem';
-import { getClient } from '../../src/chain/client.js';
+import { getChainClient } from '../../src/chain/client.js';
 import { loadConfig } from '../../src/config.js';
 import { openDb } from '../../src/db/connection.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -5980,7 +6388,7 @@ describe.skipIf(!configured)('backfill against a real collection', () => {
     const config = loadConfig();
     const db = openDb(':memory:');
     runMigrations(db);
-    const client = getClient(CHAIN_ID, config);
+    const { client } = getChainClient(CHAIN_ID, config);
     const address = CONTRACT as Address;
     const chain = config.chains.get(CHAIN_ID);
     if (!chain) throw new Error(`chain ${CHAIN_ID} not configured`);
