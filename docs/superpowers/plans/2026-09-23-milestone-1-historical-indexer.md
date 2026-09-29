@@ -5141,28 +5141,107 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `Standard`, `Address` (Task 1); `UnsupportedStandardError` (Task 1)
 - Produces:
-  - `INTERFACE_IDS = { erc721: '0x80ac58cd', erc1155: '0xd9b67a26', erc721Enumerable: '0x780e9d63' }`
-  - `interface SupportsInterface { (interfaceId: `0x${string}`): Promise<boolean> }`
+  - `INTERFACE_IDS = { erc721, erc1155, erc721Enumerable, invalid }`
+  - `interface SupportsInterface { (interfaceId: \`0x${string}\`): Promise<boolean> }`
   - `detectStandard(supports: SupportsInterface, address: Address): Promise<Standard>`
   - `supportsEnumerable(supports: SupportsInterface): Promise<boolean>`
   - `makeSupportsInterface(client: PublicClient, address: Address): SupportsInterface`
+  - `isExecutionFailure(err: unknown): boolean`
 
-Detection takes a `supports` function rather than a client so the branch logic is testable without a chain.
+Detection takes a `supports` function rather than a client, so the branch logic is testable
+without a chain.
+
+---
+
+**Measured against real mainnet contracts before planning. Three findings.**
+
+```
+BAYC (ERC-721)            erc721=true  erc1155=false  enumerable=true  0xffffffff=false
+OpenSea Storefront (1155) erc721=false erc1155=true   enumerable=false 0xffffffff=false
+CryptoPunks (pre-165)     all THREW
+WETH (ERC-20)             all THREW
+EOA / no code             all THREW
+```
+
+**1. The `0xffffffff` conformance check is missing from the original design, and it is the
+only thing standing between us and a lying contract.** ERC-165 *requires*
+`supportsInterface(0xffffffff)` to return `false`. Both real contracts above comply. A
+contract that returns `true` for everything would otherwise be detected as ERC-721 — its
+positive answer means nothing. Checking `0xffffffff` first costs one call and invalidates
+every positive answer from a non-conforming contract.
+
+Note this is not the same as the "claims both standards" check: a contract answering `true`
+to everything trips both, but one answering `true` to `0xffffffff` and to ERC-721 only would
+pass the both-check and still be untrustworthy.
+
+**2. A transport failure must not be reported as "unsupported standard".** The original
+design's `safeSupports` caught *every* error and returned `false`, so an RPC outage during
+detection would tell the user their contract supports neither ERC-721 nor ERC-1155 —
+confidently, and wrongly. Measured, the two cases are distinguishable by the error chain:
+
+```
+CryptoPunks (no such function) -> TransactionRejectedRpcError < RpcRequestError
+RPC returning HTTP 500         -> HttpRequestError
+```
+
+So only *execution* failures are swallowed as "does not implement ERC-165". Transport
+failures rethrow, and the caller's retry and rate limiting deal with them.
+
+**3. Enumerable detection works and BAYC has it.** That matters for Task 15, whose supply
+assertion depends on `totalSupply()` being present — it is ERC-721 Enumerable
+(`0x780e9d63`), not base ERC-721.
 
 - [ ] **Step 1: Write the failing test**
 
 `test/unit/standard.test.ts`:
 
 ```ts
-import { describe, expect, it } from 'vitest';
-import { INTERFACE_IDS, detectStandard, supportsEnumerable } from '../../src/chain/standard.js';
+import { describe, expect, it, vi } from 'vitest';
+import { BaseError, HttpRequestError } from 'viem';
+import {
+  INTERFACE_IDS, detectStandard, isExecutionFailure, supportsEnumerable,
+} from '../../src/chain/standard.js';
 import { UnsupportedStandardError } from '../../src/errors.js';
 import type { Address } from '../../src/types.js';
 
 const ADDRESS = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d' as Address;
+
+/** A contract that answers true only for the listed ids, false otherwise. */
 const answering = (ids: string[]) => async (id: `0x${string}`) => ids.includes(id);
 
-describe('detectStandard', () => {
+/** A contract with no supportsInterface at all — measured shape for CryptoPunks. */
+function executionFailure(): Error {
+  const inner = new Error('execution reverted');
+  inner.name = 'TransactionRejectedRpcError';
+  const outer = new BaseError('The contract function reverted.', { cause: inner });
+  outer.name = 'ContractFunctionExecutionError';
+  return outer;
+}
+
+/** A transport failure — measured shape when the RPC returns HTTP 500. */
+function transportFailure(): Error {
+  const inner = new HttpRequestError({ url: 'http://example.test', status: 500 });
+  const outer = new BaseError('The contract function call failed.', { cause: inner });
+  outer.name = 'ContractFunctionExecutionError';
+  return outer;
+}
+
+describe('isExecutionFailure', () => {
+  it('treats a contract-level rejection as an execution failure', () => {
+    expect(isExecutionFailure(executionFailure())).toBe(true);
+  });
+
+  it('does NOT treat a transport failure as an execution failure', () => {
+    expect(isExecutionFailure(transportFailure())).toBe(false);
+  });
+
+  it('does not treat a plain error or junk as an execution failure', () => {
+    expect(isExecutionFailure(new Error('boom'))).toBe(false);
+    expect(isExecutionFailure(null)).toBe(false);
+  });
+});
+
+describe('detectStandard — happy paths', () => {
   it('detects ERC-721', async () => {
     expect(await detectStandard(answering([INTERFACE_IDS.erc721]), ADDRESS)).toBe('721');
   });
@@ -5170,54 +5249,132 @@ describe('detectStandard', () => {
   it('detects ERC-1155', async () => {
     expect(await detectStandard(answering([INTERFACE_IDS.erc1155]), ADDRESS)).toBe('1155');
   });
+});
 
-  it('rejects a contract supporting neither', async () => {
+// ERC-165 REQUIRES supportsInterface(0xffffffff) === false. A contract that
+// returns true for it is not answering questions, it is saying yes to
+// everything, so no positive answer from it can be trusted. Measured: both
+// real contracts tested return false here.
+describe('detectStandard — the 0xffffffff conformance check', () => {
+  it('rejects a contract that claims to support the invalid interface id', async () => {
+    const liar = answering([INTERFACE_IDS.invalid, INTERFACE_IDS.erc721]);
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
+  });
+
+  it('says why, naming the conformance failure rather than "unsupported"', async () => {
+    const liar = answering([INTERFACE_IDS.invalid, INTERFACE_IDS.erc721]);
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(/0xffffffff|conformance/i);
+  });
+
+  it('rejects a contract that says true to absolutely everything', async () => {
+    await expect(detectStandard(async () => true, ADDRESS))
+      .rejects.toThrow(UnsupportedStandardError);
+  });
+
+  it('checks conformance before trusting a positive ERC-721 answer', async () => {
+    const calls: string[] = [];
+    const liar = async (id: `0x${string}`) => { calls.push(id); return true; };
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow();
+    expect(calls).toContain(INTERFACE_IDS.invalid);
+  });
+});
+
+describe('detectStandard — rejections', () => {
+  it('rejects a contract supporting neither standard', async () => {
     await expect(detectStandard(answering([]), ADDRESS)).rejects.toThrow(UnsupportedStandardError);
   });
 
-  // Claiming both is a broken or hostile contract; guessing would silently
-  // decode the wrong events.
-  it('rejects a contract claiming both', async () => {
+  // Claiming both is broken or hostile; guessing would silently decode the
+  // wrong events for the whole collection.
+  it('rejects a contract claiming both standards', async () => {
     const both = answering([INTERFACE_IDS.erc721, INTERFACE_IDS.erc1155]);
     await expect(detectStandard(both, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
   });
 
-  it('treats a reverting supportsInterface as unsupported, not a crash', async () => {
-    const reverting = async () => { throw new Error('execution reverted'); };
-    await expect(detectStandard(reverting, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
+  it('distinguishes the both-standards message from the neither message', async () => {
+    const both = answering([INTERFACE_IDS.erc721, INTERFACE_IDS.erc1155]);
+    await expect(detectStandard(both, ADDRESS)).rejects.toThrow(/both/i);
+    await expect(detectStandard(answering([]), ADDRESS)).rejects.toThrow(/neither/i);
   });
 
-  it('names the address in the error so the message is actionable', async () => {
+  it('treats a pre-ERC-165 contract as unsupported, not a crash', async () => {
+    const preErc165 = async () => { throw executionFailure(); };
+    await expect(detectStandard(preErc165, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
+  });
+
+  it('names the address so the error is actionable', async () => {
     await expect(detectStandard(answering([]), ADDRESS)).rejects.toThrow(ADDRESS);
+  });
+
+  it('mentions --standard as the escape hatch for pre-ERC-165 collections', async () => {
+    const preErc165 = async () => { throw executionFailure(); };
+    await expect(detectStandard(preErc165, ADDRESS)).rejects.toThrow(/--standard/);
+  });
+});
+
+// A transport failure reported as "supports neither standard" is a confident,
+// wrong answer that sends the user looking at their contract instead of their
+// connection.
+describe('detectStandard — transport failures must not look like unsupported', () => {
+  it('rethrows a transport failure instead of reporting unsupported', async () => {
+    const flaky = async () => { throw transportFailure(); };
+    await expect(detectStandard(flaky, ADDRESS)).rejects.not.toThrow(UnsupportedStandardError);
+  });
+
+  it('propagates the original transport error', async () => {
+    const err = transportFailure();
+    const flaky = async () => { throw err; };
+    await expect(detectStandard(flaky, ADDRESS)).rejects.toBe(err);
+  });
+
+  it('rethrows a transport failure raised on the conformance probe itself', async () => {
+    const err = transportFailure();
+    const flaky = async (id: `0x${string}`) => {
+      if (id === INTERFACE_IDS.invalid) throw err;
+      return true;
+    };
+    await expect(detectStandard(flaky, ADDRESS)).rejects.toBe(err);
   });
 });
 
 describe('supportsEnumerable', () => {
-  it('is true when the Enumerable interface id is supported', async () => {
+  it('is true when the Enumerable id is supported', async () => {
     expect(await supportsEnumerable(answering([INTERFACE_IDS.erc721Enumerable]))).toBe(true);
   });
 
   // totalSupply() is Enumerable, not base ERC-721 — asserting against it
-  // unconditionally would fail on most collections.
+  // unconditionally would fail on collections that lack it.
   it('is false for a base ERC-721', async () => {
     expect(await supportsEnumerable(answering([INTERFACE_IDS.erc721]))).toBe(false);
   });
 
-  it('is false when the call reverts', async () => {
-    expect(await supportsEnumerable(async () => { throw new Error('reverted'); })).toBe(false);
+  it('is false when the contract has no supportsInterface at all', async () => {
+    expect(await supportsEnumerable(async () => { throw executionFailure(); })).toBe(false);
+  });
+
+  // Unlike detection, a transport failure here is not fatal: the caller falls
+  // back to a hardcoded expected count. But it must not silently read as
+  // "no Enumerable" either, so it rethrows and the caller decides.
+  it('rethrows a transport failure rather than reporting false', async () => {
+    const err = transportFailure();
+    await expect(supportsEnumerable(async () => { throw err; })).rejects.toBe(err);
+  });
+});
+
+describe('INTERFACE_IDS', () => {
+  it('uses the canonical ERC-165 interface ids', () => {
+    expect(INTERFACE_IDS.erc721).toBe('0x80ac58cd');
+    expect(INTERFACE_IDS.erc1155).toBe('0xd9b67a26');
+    expect(INTERFACE_IDS.erc721Enumerable).toBe('0x780e9d63');
+    expect(INTERFACE_IDS.invalid).toBe('0xffffffff');
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `npx vitest run test/unit/standard.test.ts`
-Expected: FAIL — cannot resolve `../../src/chain/standard.js`.
-
-- [ ] **Step 3: Write `src/chain/standard.ts`**
+- [ ] **Step 2: Run to verify failure, then write `src/chain/standard.ts`**
 
 ```ts
-import { parseAbi, type PublicClient } from 'viem';
+import { BaseError, HttpRequestError, parseAbi, TimeoutError, type PublicClient } from 'viem';
 import { UnsupportedStandardError } from '../errors.js';
 import type { Address, Standard } from '../types.js';
 
@@ -5226,6 +5383,8 @@ export const INTERFACE_IDS = {
   erc1155: '0xd9b67a26',
   /** totalSupply() lives here, not in base ERC-721. */
   erc721Enumerable: '0x780e9d63',
+  /** ERC-165 requires this to be answered `false`. */
+  invalid: '0xffffffff',
 } as const;
 
 const ERC165_ABI = parseAbi([
@@ -5240,21 +5399,62 @@ export function makeSupportsInterface(
   client: PublicClient,
   address: Address,
 ): SupportsInterface {
-  return async (interfaceId) => {
-    const result = await client.readContract({
-      address,
-      abi: ERC165_ABI,
-      functionName: 'supportsInterface',
-      args: [interfaceId],
-    });
-    return Boolean(result);
-  };
+  return async (interfaceId) =>
+    Boolean(await client.readContract({
+      address, abi: ERC165_ABI, functionName: 'supportsInterface', args: [interfaceId],
+    }));
+}
+
+/**
+ * True when the call failed because the CONTRACT could not answer — it has no
+ * such function, or it reverted — rather than because we could not reach the
+ * chain.
+ *
+ * The distinction matters: swallowing everything means an RPC outage reports
+ * "this contract supports neither ERC-721 nor ERC-1155", which is confident,
+ * wrong, and sends the user to inspect their contract instead of their
+ * connection. Measured shapes:
+ *
+ *   contract has no supportsInterface -> TransactionRejectedRpcError < RpcRequestError
+ *   RPC returns HTTP 500              -> HttpRequestError
+ */
+export function isExecutionFailure(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return false;
+  const transport = err.walk(
+    (e) => e instanceof HttpRequestError || e instanceof TimeoutError,
+  );
+  return transport === null;
+}
+
+/** Swallows a contract-level failure as "no", rethrows anything else. */
+async function safeSupports(
+  supports: SupportsInterface,
+  interfaceId: `0x${string}`,
+): Promise<boolean> {
+  try {
+    return await supports(interfaceId);
+  } catch (err) {
+    if (isExecutionFailure(err)) return false;
+    throw err;
+  }
 }
 
 export async function detectStandard(
   supports: SupportsInterface,
   address: Address,
 ): Promise<Standard> {
+  // ERC-165 conformance first. A contract that answers `true` to 0xffffffff is
+  // not answering questions, it is saying yes to everything — so no positive
+  // answer it gives can be trusted, including a positive ERC-721 answer. This
+  // is checked BEFORE the standard ids for exactly that reason.
+  if (await safeSupports(supports, INTERFACE_IDS.invalid)) {
+    throw new UnsupportedStandardError(
+      `${address} claims to support the invalid interface id 0xffffffff, which ERC-165 ` +
+      'requires to be false. Its answers cannot be trusted; refusing to guess a standard. ' +
+      'Pass --standard to override.',
+    );
+  }
+
   const [is721, is1155] = await Promise.all([
     safeSupports(supports, INTERFACE_IDS.erc721),
     safeSupports(supports, INTERFACE_IDS.erc1155),
@@ -5262,7 +5462,8 @@ export async function detectStandard(
 
   if (is721 && is1155) {
     throw new UnsupportedStandardError(
-      `${address} claims both ERC-721 and ERC-1155; refusing to guess. ` +
+      `${address} claims both ERC-721 and ERC-1155; refusing to guess, because decoding ` +
+      'with the wrong standard would silently mis-index the whole collection. ' +
       'Pass --standard to override.',
     );
   }
@@ -5271,41 +5472,81 @@ export async function detectStandard(
 
   throw new UnsupportedStandardError(
     `${address} supports neither ERC-721 (0x80ac58cd) nor ERC-1155 (0xd9b67a26). ` +
-    'Pre-ERC-165 collections need --standard.',
+    'Pre-ERC-165 collections such as CryptoPunks need --standard.',
   );
 }
 
+/**
+ * Whether the collection implements ERC-721 Enumerable, and therefore
+ * `totalSupply()`. A transport failure rethrows rather than reading as "no", so
+ * a caller cannot silently fall back to a weaker assertion because the network
+ * blipped.
+ */
 export async function supportsEnumerable(supports: SupportsInterface): Promise<boolean> {
   return safeSupports(supports, INTERFACE_IDS.erc721Enumerable);
 }
-
-/** A contract without ERC-165 reverts rather than returning false. */
-async function safeSupports(
-  supports: SupportsInterface,
-  interfaceId: `0x${string}`,
-): Promise<boolean> {
-  try {
-    return await supports(interfaceId);
-  } catch {
-    return false;
-  }
-}
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 3: Run the tests and typecheck**
 
-Run: `npx vitest run test/unit/standard.test.ts && npm run typecheck`
-Expected: PASS, 9 tests.
+Run: `npx vitest run test/unit/standard.test.ts && npm run typecheck`, then `npm test`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Mutation-verify the three guards — mandatory**
+
+In a scratch file OUTSIDE `src/`:
+
+- **Mutant A — drop the `0xffffffff` conformance check.** Expected: a contract answering
+  `true` to everything is detected as… report which standard it returns, and note that a
+  real collection indexed under a wrongly-detected standard produces zero rows with no error.
+- **Mutant B — `isExecutionFailure` returns `true` unconditionally** (the original
+  catch-everything behaviour). Expected: the transport tests fail, and a transport failure is
+  reported as `UnsupportedStandardError`. Report the message it produces, since that message
+  is what a user would act on.
+- **Mutant C — check the standards before conformance.** Expected: the ordering test fails.
+  Report whether a lying contract is still caught (it should be, but later and with a
+  different message) — I want to know whether the ordering is load-bearing for correctness
+  or only for the message.
+
+- [ ] **Step 5: Verify against real contracts — do not skip**
+
+The unit tests use synthesised error shapes. Confirm they still match reality with a
+throwaway script (delete it after; scrub any error text through
+`deriveSecretTokens`/`scrubSecrets`):
+
+- BAYC `0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d` detects as `721`, and
+  `supportsEnumerable` is `true`
+- OpenSea Shared Storefront `0x495f947276749ce646f68ac8c248420045cb7b5e` detects as `1155`
+- CryptoPunks `0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb` throws `UnsupportedStandardError`
+- WETH `0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2` throws `UnsupportedStandardError`
+- All four return `false` for `0xffffffff`
+
+Report each. If any differs from the measurements above, say so — the synthesised fixtures
+are what need updating, not the predicate.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/chain/standard.ts test/unit/standard.test.ts
-git commit -m "feat: ERC-165 standard detection plus Enumerable support check
+git commit -m "feat: ERC-165 standard detection with conformance and transport guards
 
-A contract claiming both standards is rejected rather than guessed at.
-supportsEnumerable exists because totalSupply() is ERC-721 Enumerable,
-not base ERC-721, so the integration assertion must detect it first.
+Measured against real mainnet contracts before designing. Two guards the
+original design lacked:
+
+ERC-165 requires supportsInterface(0xffffffff) to be false. A contract
+answering true to it is saying yes to everything, so its positive ERC-721
+answer means nothing. Checked FIRST, before the standard ids, because it
+invalidates them. Both real contracts tested comply.
+
+A transport failure is no longer swallowed as 'supports neither
+standard'. The original safeSupports caught every error and returned
+false, so an RPC outage during detection would confidently tell the user
+their contract is unsupported. Measured, the cases differ: a contract
+with no supportsInterface yields TransactionRejectedRpcError, an HTTP 500
+yields HttpRequestError. Only the former is swallowed.
+
+Enumerable detection confirmed working on a real collection, which Task
+15's supply assertion depends on — totalSupply() is Enumerable, not base
+ERC-721.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
