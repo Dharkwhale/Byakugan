@@ -4532,42 +4532,144 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `RawLog` (Task 6); `RangeExhaustedError` (Task 1)
 - Produces:
   - `isRangeError(err: unknown): boolean`
+  - `suggestedRange(err: unknown): { fromBlock: bigint; toBlock: bigint } | undefined`
+  - `errorText(err: unknown): string` (exported for testing)
   - `interface LogFetcher { (a: { fromBlock: bigint; toBlock: bigint }): Promise<RawLog[]> }`
   - `iterateLogs(a: { fetch: LogFetcher; fromBlock: bigint; toBlock: bigint; initialChunk: number; maxChunk: number; maxHalvings?: number }): AsyncGenerator<{ fromBlock: bigint; toBlock: bigint; logs: RawLog[] }>`
 
-The generator takes a `fetch` function rather than a viem client, so the adaptive-range behaviour is testable without mocking a whole client.
+---
+
+**This task was redesigned after measuring the real provider. Four findings, all
+reproducible against the configured Alchemy endpoints.**
+
+**1. The top-level error message is useless. The range information is in `details`.**
+
+```
+name    = InvalidRequestRpcError
+code    = -32600
+message = "JSON is not a valid request object."
+details = "Under the Free tier plan, you can make eth_getLogs requests with up to a
+           10 block range. Based on your parameters, this block range should work:
+           [0x17ec57d, 0x17ec586]. Upgrade to PAYG for expanded block range..."
+```
+
+The originally-planned `isRangeError` matched only `err.message` against phrases like
+`"more than 10000 results"`. Against this provider it would return **false**, the chunker
+would rethrow instead of halving, and the backfill would die on its first call. So the
+predicate must gather text from `details`, `shortMessage`, `message` **and the whole `cause`
+chain** before matching.
+
+**2. `-32600` must not be treated as a range error on its own.** It is JSON-RPC's generic
+"Invalid Request". Matching the code alone would classify a genuinely malformed request as a
+range problem and halve forever against a bug that halving cannot fix. The predicate is
+**text-driven**; only `-32005` ("limit exceeded"), which is range-specific, counts as
+evidence by itself.
+
+**3. The provider tells us the range that would work, and adopting it succeeds first try.**
+Measured: parsing `[0x18df43c, 0x18df445]` out of `details` and re-requesting exactly that
+span returned 402 logs immediately. Blind halving from 2000 would have taken **eight**
+failed round trips to reach a working size; adopting the suggestion takes **one**.
+
+**4. A remembered ceiling is required, or the chunker oscillates forever.** Growing by 1.25
+after each success walks the range straight back above the provider's cap, failing again,
+halving again, indefinitely — one wasted call every few chunks for the entire backfill. So a
+failed range is remembered and growth is capped by it.
+
+**Measured cap on the configured account: 10 blocks inclusive.** `fromBlock..toBlock`
+spanning 10 blocks succeeds; 11 fails. Verified on all three chains — same limit, same
+message. This is a plan-tier limit, not a chain property, which is why it is discovered at
+runtime rather than configured in `chains.json`.
+
+**Consequence worth stating plainly in the code:** at 10 blocks per request, a full mainnet
+backfill from a 2021 deploy block to head is roughly 1.1 million requests. `initialChunk` in
+`chains.json` stays at its optimistic value because the cost of being wrong is now exactly
+one failed call per chain per run — the suggestion parser corrects it immediately, and the
+ceiling stops it recurring.
 
 - [ ] **Step 1: Write the failing test**
 
 `test/unit/logs.test.ts`:
 
 ```ts
-import { describe, expect, it } from 'vitest';
-import { isRangeError, iterateLogs } from '../../src/indexer/logs.js';
+import { describe, expect, it, vi } from 'vitest';
+import { errorText, isRangeError, iterateLogs, suggestedRange } from '../../src/indexer/logs.js';
 import { RangeExhaustedError } from '../../src/errors.js';
 import type { RawLog } from '../../src/indexer/decode.js';
 
-const rangeMessages = [
-  'query returned more than 10000 results',
-  'Log response size exceeded. You can make eth_getLogs requests with up to a 2K block range',
-  'block range is too wide',
-  'exceed maximum block range: 5000',
-  'query exceeds max results 10000',
-];
+/** The real Alchemy free-tier shape, captured from a live request. */
+const ALCHEMY_DETAILS =
+  'Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block ' +
+  'range. Based on your parameters, this block range should work: [0x17ec57d, 0x17ec586]. ' +
+  'Upgrade to PAYG for expanded block range limits.';
 
-describe('isRangeError', () => {
-  it.each(rangeMessages)('recognises %s', (message) => {
+function alchemyRangeError(): Error {
+  const err = new Error('JSON is not a valid request object.') as Error & {
+    code: number; details: string; shortMessage: string;
+  };
+  err.name = 'InvalidRequestRpcError';
+  err.code = -32600;
+  err.details = ALCHEMY_DETAILS;
+  err.shortMessage = 'JSON is not a valid request object.';
+  return err;
+}
+
+describe('errorText', () => {
+  it('gathers details, shortMessage and message', () => {
+    const text = errorText(alchemyRangeError());
+    expect(text).toContain('10 block range');
+    expect(text).toContain('JSON is not a valid request object');
+  });
+
+  it('walks the cause chain', () => {
+    const outer = new Error('request failed');
+    (outer as Error & { cause?: unknown }).cause = alchemyRangeError();
+    expect(errorText(outer)).toContain('10 block range');
+  });
+
+  it('is total for null, undefined, a string and a cyclic cause', () => {
+    expect(() => errorText(null)).not.toThrow();
+    expect(() => errorText(undefined)).not.toThrow();
+    expect(() => errorText('plain')).not.toThrow();
+    const a = new Error('a') as Error & { cause?: unknown };
+    a.cause = a;
+    expect(() => errorText(a)).not.toThrow();
+  });
+});
+
+describe('isRangeError — the real provider shape', () => {
+  // This is the case the original predicate got wrong: the top-level message
+  // says nothing about ranges, so matching only `message` returns false and the
+  // backfill dies on its first call.
+  it('recognises the Alchemy free-tier error whose message is unhelpful', () => {
+    expect(isRangeError(alchemyRangeError())).toBe(true);
+  });
+
+  it('recognises it when wrapped in a cause chain', () => {
+    const outer = new Error('RPC Request failed.');
+    (outer as Error & { cause?: unknown }).cause = alchemyRangeError();
+    expect(isRangeError(outer)).toBe(true);
+  });
+
+  it.each([
+    'query returned more than 10000 results',
+    'Log response size exceeded. You can make eth_getLogs requests with up to a 2K block range',
+    'block range is too wide',
+    'exceed maximum block range: 5000',
+    'query exceeds max results 10000',
+  ])('recognises other providers: %s', (message) => {
     expect(isRangeError(new Error(message))).toBe(true);
   });
 
-  it('recognises the -32005 limit-exceeded code', () => {
+  it('recognises the -32005 limit-exceeded code without matching text', () => {
     expect(isRangeError(Object.assign(new Error('limit exceeded'), { code: -32005 }))).toBe(true);
   });
 
-  it('recognises a nested cause', () => {
-    const outer = new Error('request failed');
-    (outer as Error & { cause?: unknown }).cause = new Error('block range is too wide');
-    expect(isRangeError(outer)).toBe(true);
+  // -32600 is JSON-RPC's generic "Invalid Request". Treating the code alone as a
+  // range error would make the chunker halve forever against a malformed request
+  // that halving cannot fix.
+  it('does NOT treat a bare -32600 as a range error', () => {
+    const err = Object.assign(new Error('JSON is not a valid request object.'), { code: -32600 });
+    expect(isRangeError(err)).toBe(false);
   });
 
   it('does not treat an unrelated error as a range error', () => {
@@ -4576,12 +4678,45 @@ describe('isRangeError', () => {
 
   it('does not treat a non-error as a range error', () => {
     expect(isRangeError(null)).toBe(false);
+    expect(isRangeError('block range is too wide')).toBe(false);
   });
 });
 
-describe('iterateLogs', () => {
-  const emptyFetch = async () => [];
+describe('suggestedRange', () => {
+  it('parses the range the provider says would work', () => {
+    expect(suggestedRange(alchemyRangeError())).toEqual({
+      fromBlock: 0x17ec57dn,
+      toBlock: 0x17ec586n,
+    });
+  });
 
+  it('yields a span matching the stated limit', () => {
+    const r = suggestedRange(alchemyRangeError())!;
+    expect(r.toBlock - r.fromBlock + 1n).toBe(10n);
+  });
+
+  it('finds it through a cause chain', () => {
+    const outer = new Error('wrapped');
+    (outer as Error & { cause?: unknown }).cause = alchemyRangeError();
+    expect(suggestedRange(outer)).toBeDefined();
+  });
+
+  it('returns undefined when no suggestion is present', () => {
+    expect(suggestedRange(new Error('block range is too wide'))).toBeUndefined();
+  });
+
+  it('returns undefined for a reversed or malformed pair', () => {
+    const err = Object.assign(new Error('x'), { details: 'try [0x20, 0x10]' });
+    expect(suggestedRange(err)).toBeUndefined();
+  });
+
+  it('is total for junk input', () => {
+    expect(() => suggestedRange(null)).not.toThrow();
+    expect(suggestedRange(null)).toBeUndefined();
+  });
+});
+
+describe('iterateLogs — walking the span', () => {
   it('covers the whole span with inclusive, non-overlapping chunks', async () => {
     const seen: Array<[bigint, bigint]> = [];
     for await (const chunk of iterateLogs({
@@ -4593,45 +4728,129 @@ describe('iterateLogs', () => {
     expect(seen).toEqual([[0n, 99n], [100n, 199n], [200n, 250n]]);
   });
 
-  it('grows the range by 1.25x on success, capped at maxChunk', async () => {
+  it('yields nothing when the span is empty', async () => {
+    const chunks = [];
+    for await (const c of iterateLogs({
+      fetch: async () => [], fromBlock: 100n, toBlock: 99n, initialChunk: 10, maxChunk: 10,
+    })) chunks.push(c);
+    expect(chunks).toEqual([]);
+  });
+
+  it('passes logs through', async () => {
+    const log = { logIndex: 0 } as RawLog;
+    const chunks = [];
+    for await (const c of iterateLogs({
+      fetch: async () => [log], fromBlock: 0n, toBlock: 5n, initialChunk: 10, maxChunk: 10,
+    })) chunks.push(c);
+    expect(chunks[0]?.logs).toEqual([log]);
+  });
+
+  it('grows by 1.25x on success, capped at maxChunk', async () => {
     const sizes: number[] = [];
     for await (const _ of iterateLogs({
-      fetch: async ({ fromBlock, toBlock }) => {
-        sizes.push(Number(toBlock - fromBlock) + 1);
-        return [];
-      },
+      fetch: async ({ fromBlock, toBlock }) => { sizes.push(Number(toBlock - fromBlock) + 1); return []; },
       fromBlock: 0n, toBlock: 10_000n, initialChunk: 100, maxChunk: 160,
     })) { /* drain */ }
     expect(sizes[0]).toBe(100);
     expect(sizes[1]).toBe(125);
     expect(sizes[2]).toBe(156);
-    expect(sizes[3]).toBe(160); // capped
-    expect(Math.max(...sizes)).toBe(160);
+    expect(Math.max(...sizes)).toBe(160);   // capped
+  });
+});
+
+describe('iterateLogs — adopting the provider suggestion', () => {
+  // Measured: blind halving from 2000 needs EIGHT failed round trips to reach a
+  // 10-block range. Adopting the suggestion needs one.
+  it('drops straight to the suggested size after one failure', async () => {
+    const attempts: number[] = [];
+    const fetch = vi.fn(async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+      const span = Number(toBlock - fromBlock) + 1;
+      attempts.push(span);
+      if (span > 10) {
+        const err = alchemyRangeError();
+        (err as Error & { details: string }).details =
+          `up to a 10 block range. this block range should work: ` +
+          `[0x${fromBlock.toString(16)}, 0x${(fromBlock + 9n).toString(16)}]`;
+        throw err;
+      }
+      return [];
+    });
+
+    for await (const _ of iterateLogs({
+      fetch, fromBlock: 0n, toBlock: 29n, initialChunk: 2000, maxChunk: 2000,
+    })) { /* drain */ }
+
+    expect(attempts[0]).toBe(30);    // first try, whole span
+    expect(attempts[1]).toBe(10);    // straight to the suggestion, not 1000
+    expect(attempts.filter((a) => a > 10)).toHaveLength(1);   // exactly one failure
   });
 
-  it('halves the range on a provider range error and retries the same start', async () => {
-    const attempts: Array<[bigint, bigint]> = [];
+  // Without a remembered ceiling, growth walks the range back above the cap and
+  // it fails again, forever — one wasted call every few chunks for the whole
+  // backfill.
+  it('never grows back above a range that failed', async () => {
+    const attempts: number[] = [];
+    const fetch = async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+      const span = Number(toBlock - fromBlock) + 1;
+      attempts.push(span);
+      if (span > 10) {
+        const err = alchemyRangeError();
+        (err as Error & { details: string }).details =
+          `up to a 10 block range. should work: [0x${fromBlock.toString(16)}, ` +
+          `0x${(fromBlock + 9n).toString(16)}]`;
+        throw err;
+      }
+      return [];
+    };
+
+    for await (const _ of iterateLogs({
+      fetch, fromBlock: 0n, toBlock: 199n, initialChunk: 2000, maxChunk: 2000,
+    })) { /* drain */ }
+
+    expect(attempts.filter((a) => a > 10)).toHaveLength(1);
+    expect(Math.max(...attempts.slice(1))).toBeLessThanOrEqual(10);
+  });
+
+  it('falls back to halving when the provider suggests nothing', async () => {
+    const attempts: number[] = [];
     let failures = 2;
     for await (const _ of iterateLogs({
       fetch: async ({ fromBlock, toBlock }) => {
-        attempts.push([fromBlock, toBlock]);
+        attempts.push(Number(toBlock - fromBlock) + 1);
         if (failures-- > 0) throw new Error('query returned more than 10000 results');
         return [];
       },
       fromBlock: 0n, toBlock: 99n, initialChunk: 100, maxChunk: 100,
     })) { /* drain */ }
-    expect(attempts[0]).toEqual([0n, 99n]);
-    expect(attempts[1]).toEqual([0n, 49n]);
-    expect(attempts[2]).toEqual([0n, 24n]);
+    expect(attempts.slice(0, 3)).toEqual([100, 50, 25]);
   });
 
+  it('ignores a suggestion larger than the range that just failed', async () => {
+    const attempts: number[] = [];
+    let first = true;
+    for await (const _ of iterateLogs({
+      fetch: async ({ fromBlock, toBlock }) => {
+        attempts.push(Number(toBlock - fromBlock) + 1);
+        if (first) {
+          first = false;
+          const err = alchemyRangeError();
+          // A nonsensical suggestion WIDER than what just failed.
+          (err as Error & { details: string }).details = 'should work: [0x0, 0xffff]';
+          throw err;
+        }
+        return [];
+      },
+      fromBlock: 0n, toBlock: 99n, initialChunk: 100, maxChunk: 100,
+    })) { /* drain */ }
+    expect(attempts[1]).toBeLessThan(attempts[0]!);
+  });
+});
+
+describe('iterateLogs — bounded failure', () => {
   it('never halves below a single block', async () => {
     let calls = 0;
     const gen = iterateLogs({
-      fetch: async () => {
-        calls += 1;
-        throw new Error('query returned more than 10000 results');
-      },
+      fetch: async () => { calls += 1; throw new Error('query returned more than 10000 results'); },
       fromBlock: 0n, toBlock: 10n, initialChunk: 4, maxChunk: 4, maxHalvings: 10,
     });
     await expect(gen.next()).rejects.toThrow(RangeExhaustedError);
@@ -4654,41 +4873,32 @@ describe('iterateLogs', () => {
     await expect(gen.next()).rejects.toThrow('ECONNRESET');
   });
 
-  it('yields nothing when the span is empty', async () => {
-    const chunks = [];
-    for await (const c of iterateLogs({
-      fetch: emptyFetch, fromBlock: 100n, toBlock: 99n, initialChunk: 10, maxChunk: 10,
-    })) chunks.push(c);
-    expect(chunks).toEqual([]);
-  });
-
-  it('passes logs through', async () => {
-    const log = { logIndex: 0 } as RawLog;
-    const chunks = [];
-    for await (const c of iterateLogs({
-      fetch: async () => [log], fromBlock: 0n, toBlock: 5n, initialChunk: 10, maxChunk: 10,
-    })) chunks.push(c);
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0]?.logs).toEqual([log]);
+  it('rethrows a malformed-request error instead of halving against it', async () => {
+    const gen = iterateLogs({
+      fetch: async () => {
+        throw Object.assign(new Error('JSON is not a valid request object.'), { code: -32600 });
+      },
+      fromBlock: 0n, toBlock: 10n, initialChunk: 10, maxChunk: 10,
+    });
+    await expect(gen.next()).rejects.toThrow(/JSON is not a valid request object/);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `npx vitest run test/unit/logs.test.ts`
-Expected: FAIL — cannot resolve `../../src/indexer/logs.js`.
-
-- [ ] **Step 3: Write `src/indexer/logs.ts`**
+- [ ] **Step 2: Run to verify failure, then write `src/indexer/logs.ts`**
 
 ```ts
 import { RangeExhaustedError } from '../errors.js';
 import type { RawLog } from './decode.js';
 
+/**
+ * Phrases providers use when a getLogs range or result set is too large.
+ * Matched against the FULL error text, not just `message` — see `errorText`.
+ */
 const RANGE_PATTERNS = [
+  'block range',
   'more than 10000 results',
   'max results',
-  'block range is too wide',
   'block range too large',
   'exceed maximum block range',
   'response size exceeded',
@@ -4696,36 +4906,96 @@ const RANGE_PATTERNS = [
   'log response size exceeded',
 ];
 
-const RANGE_CODES = new Set([-32005, -32602]);
+/**
+ * Codes that mean "too much" on their own. `-32600` is deliberately absent: it
+ * is JSON-RPC's generic "Invalid Request", and treating it as a range error
+ * would make the chunker halve forever against a malformed request that halving
+ * cannot fix.
+ */
+const RANGE_CODES = new Set([-32005]);
+
+/** `[0x…, 0x…]` — the range a provider says would have worked. */
+const SUGGESTED_RANGE = /\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/;
 
 /**
- * True when a provider refused a getLogs call because the range or result set
- * was too large. Every provider phrases this differently, so all matching
- * lives here: adding a provider means editing one function.
+ * Every string a provider error carries, including down the cause chain.
+ *
+ * Measured against Alchemy: the top-level `message` is
+ * "JSON is not a valid request object." and says nothing about ranges, while
+ * `details` carries "…up to a 10 block range…". Matching only `message` would
+ * miss it entirely and the backfill would die on its first call.
  */
+export function errorText(err: unknown, seen = new Set<unknown>(), depth = 0): string {
+  if (!err || typeof err !== 'object' || seen.has(err) || depth > 5) return '';
+  seen.add(err);
+  const e = err as {
+    message?: unknown; details?: unknown; shortMessage?: unknown; cause?: unknown;
+  };
+  const parts = [e.details, e.shortMessage, e.message]
+    .filter((p): p is string => typeof p === 'string');
+  return `${parts.join(' | ')} ${errorText(e.cause, seen, depth + 1)}`;
+}
+
 export function isRangeError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
 
   const code = (err as { code?: unknown }).code;
   if (typeof code === 'number' && RANGE_CODES.has(code)) return true;
 
-  const message = String((err as { message?: unknown }).message ?? '').toLowerCase();
-  if (RANGE_PATTERNS.some((p) => message.includes(p))) return true;
+  const text = errorText(err).toLowerCase();
+  return RANGE_PATTERNS.some((p) => text.includes(p));
+}
 
-  const cause = (err as { cause?: unknown }).cause;
-  return cause ? isRangeError(cause) : false;
+/**
+ * The range a provider suggested, when it offers one.
+ *
+ * Measured: Alchemy returns "this block range should work: [0x17ec57d,
+ * 0x17ec586]", and re-requesting exactly that span succeeds on the first retry.
+ * Blind halving from an optimistic 2000 takes eight failed round trips to reach
+ * the same place.
+ */
+export function suggestedRange(
+  err: unknown,
+): { fromBlock: bigint; toBlock: bigint } | undefined {
+  const match = SUGGESTED_RANGE.exec(errorText(err));
+  if (!match?.[1] || !match[2]) return undefined;
+  try {
+    const fromBlock = BigInt(match[1]);
+    const toBlock = BigInt(match[2]);
+    if (toBlock < fromBlock) return undefined;
+    return { fromBlock, toBlock };
+  } catch {
+    return undefined;
+  }
 }
 
 export interface LogFetcher {
   (a: { fromBlock: bigint; toBlock: bigint }): Promise<RawLog[]>;
 }
 
+const min = (a: bigint, b: bigint): bigint => (a < b ? a : b);
+const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
+
 /**
- * Walks [fromBlock, toBlock] in inclusive, non-overlapping chunks, shrinking
- * the range when the provider complains and growing it when it does not.
+ * Walks [fromBlock, toBlock] in inclusive, non-overlapping chunks, shrinking the
+ * range when the provider complains and growing it when it does not.
  *
- * Two caps prevent an unbounded loop: the range never falls below one block,
- * and a chunk that still fails after `maxHalvings` attempts throws.
+ * Three behaviours matter, all driven by measurements against the real provider:
+ *
+ * - When the provider names a range that would work, adopt it rather than
+ *   halving. Measured: one retry instead of eight.
+ * - Remember the largest range known to fail and never grow back to it.
+ *   Without that ceiling, growing 1.25x after each success walks straight back
+ *   over the cap and fails again, forever — one wasted call every few chunks
+ *   for the whole backfill.
+ * - Never fall below one block, and give up after `maxHalvings`, so a provider
+ *   that refuses everything cannot spin.
+ *
+ * The configured account's measured cap is 10 blocks, which is a plan-tier
+ * limit rather than a chain property — hence discovered at runtime instead of
+ * configured. At that size a full mainnet backfill from a 2021 deploy block is
+ * on the order of a million requests; `initialChunk` stays optimistic because
+ * being wrong now costs exactly one failed call per chain per run.
  */
 export async function* iterateLogs(a: {
   fetch: LogFetcher;
@@ -4736,8 +5006,10 @@ export async function* iterateLogs(a: {
   maxHalvings?: number;
 }): AsyncGenerator<{ fromBlock: bigint; toBlock: bigint; logs: RawLog[] }> {
   const maxHalvings = a.maxHalvings ?? 12;
-  let range = BigInt(Math.max(1, a.initialChunk));
-  const maxChunk = BigInt(Math.max(1, a.maxChunk));
+  const hardMax = BigInt(Math.max(1, a.maxChunk));
+  let range = min(BigInt(Math.max(1, a.initialChunk)), hardMax);
+  /** Largest range not yet known to fail. Only ever shrinks within a run. */
+  let ceiling = hardMax;
   let cursor = a.fromBlock;
 
   while (cursor <= a.toBlock) {
@@ -4749,43 +5021,111 @@ export async function* iterateLogs(a: {
         const logs = await a.fetch({ fromBlock: cursor, toBlock: end });
         yield { fromBlock: cursor, toBlock: end, logs };
         cursor = end + 1n;
-        range = min((range * 5n) / 4n, maxChunk);
+        range = min(min((range * 5n) / 4n, ceiling), hardMax);
         break;
       } catch (err) {
         if (!isRangeError(err)) throw err;
+
+        // This width is now known bad; never grow back to it.
+        ceiling = max(range - 1n, 1n);
+
+        const suggestion = suggestedRange(err);
+        const suggestedWidth = suggestion
+          ? suggestion.toBlock - suggestion.fromBlock + 1n
+          : undefined;
+
+        // Only trust a suggestion that is actually smaller than what failed —
+        // a wider one cannot be a fix and would loop.
+        const next =
+          suggestedWidth !== undefined && suggestedWidth < range
+            ? suggestedWidth
+            : max(range / 2n, 1n);
+
         if (range === 1n || halvings >= maxHalvings) {
           throw new RangeExhaustedError(
             `getLogs still failing at range ${range} block(s) from ${cursor} after ` +
-            `${halvings} halving(s): ${String((err as Error).message)}`,
+            `${halvings} reduction(s): ${String((err as Error).message)}`,
           );
         }
-        range = max(range / 2n, 1n);
+
+        range = max(min(next, ceiling), 1n);
         halvings += 1;
       }
     }
   }
 }
-
-const min = (a: bigint, b: bigint): bigint => (a < b ? a : b);
-const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 3: Run the tests and typecheck**
 
-Run: `npx vitest run test/unit/logs.test.ts && npm run typecheck`
-Expected: PASS, 14 tests.
+Run: `npx vitest run test/unit/logs.test.ts && npm run typecheck`, then `npm test`.
 
-Note on the growth assertion: `100 → 125 → 156 → 195` capped to `160`. If the observed sequence differs, fix the *test* to match integer `(range * 5n) / 4n` truncation rather than changing the implementation to chase the numbers.
+Note on the growth assertion: `100 → 125 → 156 → 195` capped to `160`. If the observed
+sequence differs, fix the **test** to match integer `(range * 5n) / 4n` truncation rather
+than changing the implementation to chase the numbers.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Mutation-verify the four guards — mandatory**
+
+In a scratch file OUTSIDE `src/`:
+
+- **Mutant A — `isRangeError` reads only `err.message`** (the original design). Expected:
+  every Alchemy-shape test fails. This is the mutant that represents the bug actually found
+  by measurement, so report it first.
+- **Mutant B — add `-32600` to `RANGE_CODES`.** Expected: `does NOT treat a bare -32600 as a
+  range error` fails, and `rethrows a malformed-request error instead of halving against it`
+  fails. Report what the second one does instead — my expectation is that it halves to 1 and
+  then throws `RangeExhaustedError`, turning a clear "your request is malformed" into a
+  misleading "range exhausted" after a dozen wasted calls. Confirm or correct that.
+- **Mutant C — ignore the suggestion** (always halve). Expected: the `drops straight to the
+  suggested size` test fails; report how many attempts it took instead of 2.
+- **Mutant D — drop the ceiling** (`range = min(range * 1.25, hardMax)` on success).
+  Expected: `never grows back above a range that failed` fails; report how many failed calls
+  occurred across the 200-block span, since that number is the per-backfill waste.
+
+If any mutant passes a test it should break, say so plainly and record it as a gap.
+
+- [ ] **Step 5: Verify against the real provider — do not skip**
+
+The unit tests use a captured error shape. Confirm the shape is still what the provider
+sends, with a throwaway script (delete it afterwards, and never print an RPC URL — scrub
+with `deriveSecretTokens`/`scrubSecrets` from `src/secrets.ts`):
+
+- request `eth_getLogs` over a 5000-block span on chain 1 for a busy contract
+- assert `isRangeError(err)` is `true` and `suggestedRange(err)` is defined
+- re-request the suggested span and confirm it succeeds
+
+Report the outcome. If the provider's wording has changed, the captured fixture in the test
+file is what needs updating — say so rather than loosening the predicate.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/indexer/logs.ts test/unit/logs.test.ts
-git commit -m "feat: adaptive chunked getLogs with provider range-error detection
+git commit -m "feat: adaptive chunked getLogs driven by real provider behaviour
 
-Halves on a range error, grows 1.25x on success, capped at maxChunk.
-Never halves below one block and gives up after maxHalvings, so a
-provider that always refuses cannot spin forever.
+Redesigned after measuring the configured endpoints. Four findings:
+
+The top-level error message is useless. Alchemy sends code -32600 with
+message 'JSON is not a valid request object.' and puts the real
+information in `details`: 'up to a 10 block range... this block range
+should work: [0x.., 0x..]'. The originally-planned predicate matched only
+`message` and would have returned false, so the chunker would have
+rethrown and the backfill died on its first call.
+
+-32600 is NOT treated as a range error on its own: it is JSON-RPC's
+generic Invalid Request, and halving cannot fix a malformed request.
+Only -32005 counts as evidence by itself; everything else is text-driven.
+
+The provider names a range that works, and adopting it succeeds first
+try — one retry instead of the eight blind halvings needed to get from
+2000 down to 10.
+
+A failed width is remembered as a ceiling. Without it, growing 1.25x
+after each success walks back over the cap and fails again forever.
+
+Measured cap on this account: 10 blocks inclusive, identical on all three
+chains — a plan-tier limit, not a chain property, so it is learned at
+runtime rather than configured.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
