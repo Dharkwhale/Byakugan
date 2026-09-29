@@ -118,9 +118,20 @@ describe('createRateLimiter — refill is proportional to elapsed time', () => {
 });
 
 describe('createRateLimiter — concurrent callers', () => {
-  // Without serialised acquisition, two concurrent callers can both observe the
-  // same last token and both proceed, silently exceeding the rate.
-  it('does not let two concurrent callers share one token', async () => {
+  // NOTE (mutation-verified): this test does NOT prove serialised
+  // acquisition. With only one token, the fast path of `acquire()` (refill,
+  // check, decrement) has no `await` in it, so JS run-to-completion already
+  // guarantees the first caller finishes before the second one starts, with
+  // or without the `tail` chain — there is no race to lose over a single
+  // available token. Removing serialisation entirely still produces
+  // `slept = [200]` here, identical to the correct implementation. What this
+  // test actually pins is that one caller runs free and the other waits for
+  // exactly one token — a real property, just not the concurrency one its
+  // old name claimed. The test below, `serialises a concurrent burst past
+  // capacity`, is the one that fails under a no-serialisation mutant, because
+  // it forces two callers to simultaneously be on the SLOW (waiting) path,
+  // which is where the race actually lives.
+  it('serves one waiter per token when only one token is short', async () => {
     const { slept, limit } = harness(1, 5);
     await Promise.all([limit(async () => 'a'), limit(async () => 'b')]);
     expect(slept).toHaveLength(1);
@@ -133,6 +144,19 @@ describe('createRateLimiter — concurrent callers', () => {
       limit(async () => 'c'), limit(async () => 'd'),
     ]);
     expect(slept).toHaveLength(2);   // two over capacity
+  });
+
+  // A second, larger case: more simultaneous waiters makes the mutant's
+  // over-grant harder to hide behind a small sample. Capacity 2, 6 callers:
+  // 2 run free, 4 must each wait for a token.
+  it('serialises a larger concurrent burst past capacity', async () => {
+    const { slept, limit } = harness(2, 5);
+    await Promise.all([
+      limit(async () => 'a'), limit(async () => 'b'),
+      limit(async () => 'c'), limit(async () => 'd'),
+      limit(async () => 'e'), limit(async () => 'f'),
+    ]);
+    expect(slept).toHaveLength(4);   // four over capacity
   });
 
   it('keeps limiting after a concurrent caller rejects', async () => {

@@ -53,8 +53,17 @@ export function createRateLimiter(opts: RateLimiterOptions): RateLimiter {
 
   let tokens = capacity;
   let lastRefillMs = clock.now();
-  // Acquisition is serialised: without this, two concurrent callers can both
-  // observe the same last token and both proceed, silently doubling the rate.
+  // Acquisition is serialised. The fast path below (refill, check, decrement)
+  // has no `await` in it, so JS run-to-completion already prevents two
+  // callers from interleaving there — with only one token short, there is no
+  // race to lose. The real race is on the SLOW path: when several callers
+  // are all short of a token, they all `await sleep(...)`, and without this
+  // `tail` chain they would all wake, all `refill()`, and all fall through to
+  // `Math.max(0, tokens - 1)` below — which *clamps* rather than going
+  // negative, so an over-grant of N simultaneous waiters is silent instead of
+  // throwing or producing a visibly wrong token count. Serialising acquire()
+  // through `tail` makes that clamp unreachable: each waiter's refill and
+  // decrement happens only after the previous one has fully completed.
   let tail: Promise<unknown> = Promise.resolve();
 
   function refill(): void {

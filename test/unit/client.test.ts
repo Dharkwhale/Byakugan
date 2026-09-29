@@ -74,7 +74,19 @@ describe('getChainClient — failures are not memoized', () => {
 
 describe('getChainClient — one bucket per chain', () => {
   // A slow mainnet backfill must not throttle Base.
-  it('does not let one chain drain another chain\'s bucket', async () => {
+  //
+  // Behavioural independence of two buckets (one draining, one untouched) is
+  // already pinned with an injected clock in rateLimit.test.ts ("gives two
+  // limiters separate token pools" — no wall clock involved there). This test
+  // does not need to re-prove that property; it only needs to prove the
+  // WIRING — that getChainClient hands each chain its own limiter instance
+  // rather than a shared one. So it asserts identity and that Base actually
+  // ran, and deliberately does not read Date.now(): getChainClient always
+  // builds its limiter with the real systemClock (its signature has no clock
+  // parameter to inject, and adding one would be freelancing past the
+  // brief's interface), so a timing assertion here would be a wall-clock read
+  // in a suite that otherwise injects time everywhere else.
+  it('gives eth and base independently wired limiters', async () => {
     const config = configWith([1, 'eth'], [8453, 'base']);
     const eth = getChainClient(1, config);
     const base = getChainClient(8453, config);
@@ -85,11 +97,10 @@ describe('getChainClient — one bucket per chain', () => {
     const started: string[] = [];
     for (let i = 0; i < 5; i++) await eth.limit(async () => { started.push('eth'); });
 
-    // Base must still run immediately. If the buckets were shared this would
-    // block on mainnet's exhausted tokens.
-    const before = Date.now();
+    // Base must still run. If the buckets were shared this would block on
+    // mainnet's exhausted tokens (proven with injected time in
+    // rateLimit.test.ts); here we just confirm it actually ran.
     await base.limit(async () => { started.push('base'); });
-    expect(Date.now() - before).toBeLessThan(50);
     expect(started.filter((s) => s === 'base')).toHaveLength(1);
   });
 
