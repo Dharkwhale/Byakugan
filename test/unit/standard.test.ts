@@ -20,6 +20,22 @@ function executionFailure(): Error {
   return outer;
 }
 
+/**
+ * WETH's measured shape (mainnet WETH has no supportsInterface and a fallback that
+ * returns no data): ContractFunctionExecutionError < ContractFunctionZeroDataError
+ * < AbiDecodingZeroDataError. Synthesised with those `name` values as a stand-in
+ * for the real chain; there is no TransactionRejectedRpcError anywhere in it.
+ */
+function wethZeroDataFailure(): Error {
+  const inner = new BaseError('Cannot decode zero data ("0x") with ABI parameters.');
+  inner.name = 'AbiDecodingZeroDataError';
+  const mid = new BaseError('The contract function returned no data.', { cause: inner });
+  mid.name = 'ContractFunctionZeroDataError';
+  const outer = new BaseError('The contract function execution failed.', { cause: mid });
+  outer.name = 'ContractFunctionExecutionError';
+  return outer;
+}
+
 /** A transport failure — measured shape when the RPC returns HTTP 500. */
 function transportFailure(): Error {
   const inner = new HttpRequestError({ url: 'http://example.test', status: 500 });
@@ -31,6 +47,10 @@ function transportFailure(): Error {
 describe('isExecutionFailure', () => {
   it('treats a contract-level rejection as an execution failure', () => {
     expect(isExecutionFailure(executionFailure())).toBe(true);
+  });
+
+  it('treats the measured WETH zero-data chain as an execution failure', () => {
+    expect(isExecutionFailure(wethZeroDataFailure())).toBe(true);
   });
 
   it('does NOT treat a transport failure as an execution failure', () => {
@@ -68,16 +88,35 @@ describe('detectStandard — the 0xffffffff conformance check', () => {
     await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(/0xffffffff|conformance/i);
   });
 
-  it('rejects a contract that says true to absolutely everything', async () => {
+  // The 0xffffffff + ERC-721-ONLY liar: the claims-both check cannot catch it,
+  // so only the conformance check stands between it and being detected as '721'.
+  it('rejects a liar answering true to 0xffffffff and ERC-721 only, naming conformance', async () => {
+    const liar = answering([INTERFACE_IDS.invalid, INTERFACE_IDS.erc721]);
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(/0xffffffff/);
+  });
+
+  it('rejects a liar answering true to 0xffffffff and ERC-1155 only, naming conformance', async () => {
+    const liar = answering([INTERFACE_IDS.invalid, INTERFACE_IDS.erc1155]);
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
+    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow(/0xffffffff/);
+  });
+
+  // Does NOT pin conformance: the claims-both check also rejects this contract.
+  it('rejects a contract claiming true to everything (caught as claiming both standards)', async () => {
     await expect(detectStandard(async () => true, ADDRESS))
       .rejects.toThrow(UnsupportedStandardError);
   });
 
-  it('checks conformance before trusting a positive ERC-721 answer', async () => {
+  // Order, not presence: on a CONFORMING ERC-721 (the path that returns), the
+  // first id queried must be 0xffffffff, so it has been asked before any
+  // standard id is and before detectStandard can return.
+  it('queries 0xffffffff first, before any standard id, on a successful detection', async () => {
     const calls: string[] = [];
-    const liar = async (id: `0x${string}`) => { calls.push(id); return true; };
-    await expect(detectStandard(liar, ADDRESS)).rejects.toThrow();
-    expect(calls).toContain(INTERFACE_IDS.invalid);
+    const good = async (id: `0x${string}`) => { calls.push(id); return id === INTERFACE_IDS.erc721; };
+    expect(await detectStandard(good, ADDRESS)).toBe('721');
+    expect(calls[0]).toBe(INTERFACE_IDS.invalid);
+    expect(calls).toContain(INTERFACE_IDS.erc721);
   });
 });
 
@@ -106,6 +145,11 @@ describe('detectStandard — rejections', () => {
 
   it('names the address so the error is actionable', async () => {
     await expect(detectStandard(answering([]), ADDRESS)).rejects.toThrow(ADDRESS);
+  });
+
+  it('treats a WETH-shaped zero-data failure as unsupported, not a crash', async () => {
+    const weth = async () => { throw wethZeroDataFailure(); };
+    await expect(detectStandard(weth, ADDRESS)).rejects.toThrow(UnsupportedStandardError);
   });
 
   it('mentions --standard as the escape hatch for pre-ERC-165 collections', async () => {
