@@ -3620,85 +3620,277 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `test/unit/classify.test.ts`
 
 **Interfaces:**
-- Consumes: `DecodedTransfer`, `TxInfo`, `Kind`, `ZERO_ADDRESS` (Task 1)
+- Consumes: `DecodedTransfer`, `TxInfo`, `Kind`, `Address`, `ZERO_ADDRESS` (Task 1); `ClassifyError` (added here)
+- Modify: `src/errors.ts` — add `ClassifyError`
 - Produces: `classify(transfer: Pick<DecodedTransfer, 'from' | 'to'>, tx: TxInfo): Kind`
 
-- [ ] **Step 1: Write the failing test**
+---
+
+**Four properties, each pinned by a test that can fail.**
+
+**1. Rule order is load-bearing, so it gets a discriminating test — not just correct code.**
+The rules apply in order: `mint`, then `burn`, then `buy`, then `transfer`. A paid mint
+(`from == 0x0`, `tx.value > 0`, `tx.from == to`) satisfies *both* the mint rule and the buy
+rule, so it is the case that distinguishes the orderings. A mutant checking `buy` first
+returns `buy` and must fail. A mutant checking `burn` before `mint` must fail on the
+degenerate case below.
+
+**The degenerate `from == 0x0 && to == 0x0` case, decided explicitly:** it returns `mint`,
+purely by rule order. Neither answer is meaningful — a token minted to nobody is not a real
+event, and no compliant contract emits it — so the value of deciding is that the behaviour
+is pinned rather than accidental, and that it discriminates mint-vs-burn ordering. It is
+not a claim that `mint` is semantically correct for such a log.
+
+**2. `tx.value` is compared as a `bigint`, and a non-bigint is a hard error.**
+`TxInfo.value` is typed `bigint`, but the repository stores `tx_value_wei` as TEXT and
+`findKnownTxs` converts it back with `BigInt(...)`. A future caller handing `classify` a raw
+database row would pass a string, and string-vs-bigint comparison misclassifies silently
+rather than failing. A `typeof` guard turns that into a loud error at the boundary. Tested
+with a value above 2^53, where any accidental `Number` round-trip loses precision.
+
+**3. The `tx.from == to` comparison lowercases BOTH sides, and the test uses checksummed
+input.** This is the highest-value test in the task. `classify` runs *pre-insert*, on viem's
+output — and viem returns **checksummed** addresses (measured in Task 6: it returned
+`0xaAaAaAaa…` for a lowercase input). The Task 3 `CHECK (col = lower(col))` constraints
+guarantee only what is *stored*, which is downstream of here. So a comparison that lowercases
+one side and not the other never matches, and **every buy silently becomes a transfer** —
+no error, no missing rows, just a systematically wrong `kind` column that looks plausible.
+The test therefore feeds genuinely checksummed addresses, not lowercase ones.
+
+**4. `burn` detects `0x0` only — pinned, not implicit.** A transfer to
+`0x…dEaD` is a burn in every practical sense and this classifier calls it `transfer`. That
+limitation is documented, so it gets a fixture asserting the current behaviour. When a sale
+decoder lands and burn detection widens, this test is the thing that must be deliberately
+changed — which is the point of writing it down as a test rather than a comment.
+
+- [ ] **Step 1: Add `ClassifyError` to `src/errors.ts`**
+
+Append, leaving every other class untouched:
+
+```ts
+export class ClassifyError extends ByakuganError {}
+```
+
+- [ ] **Step 2: Write the failing test**
 
 `test/unit/classify.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
 import { classify } from '../../src/indexer/classify.js';
-import { ZERO_ADDRESS, type Address } from '../../src/types.js';
+import { ClassifyError } from '../../src/errors.js';
+import { ZERO_ADDRESS, type Address, type TxInfo } from '../../src/types.js';
 
 const BUYER = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
 const SELLER = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
 const ROUTER = '0xcccccccccccccccccccccccccccccccccccccccc' as Address;
+/** The conventional burn sink. Note the mixed case — that is how it is written. */
+const DEAD = '0x000000000000000000000000000000000000dEaD' as Address;
 
-describe('classify', () => {
+/** A genuinely checksummed address: viem returns this shape, not lowercase. */
+const BUYER_CHECKSUMMED = '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' as Address;
+
+const tx = (over: Partial<TxInfo> = {}): TxInfo => ({ from: BUYER, value: 0n, ...over });
+
+describe('classify — rule order', () => {
   it('calls a transfer from the zero address a mint', () => {
-    expect(classify({ from: ZERO_ADDRESS, to: BUYER }, { from: BUYER, value: 0n })).toBe('mint');
+    expect(classify({ from: ZERO_ADDRESS, to: BUYER }, tx())).toBe('mint');
   });
 
+  // The discriminating case: this log satisfies BOTH the mint rule and the buy
+  // rule, so it is the only input that tells the two orderings apart. A mutant
+  // checking buy first returns 'buy' here.
   it('still calls a paid mint a mint, not a buy', () => {
-    expect(classify({ from: ZERO_ADDRESS, to: BUYER }, { from: BUYER, value: 10n })).toBe('mint');
+    expect(classify({ from: ZERO_ADDRESS, to: BUYER }, tx({ from: BUYER, value: 10n })))
+      .toBe('mint');
   });
 
   it('calls a transfer to the zero address a burn', () => {
-    expect(classify({ from: SELLER, to: ZERO_ADDRESS }, { from: SELLER, value: 0n })).toBe('burn');
+    expect(classify({ from: SELLER, to: ZERO_ADDRESS }, tx({ from: SELLER }))).toBe('burn');
   });
 
+  // Decided explicitly rather than left to fall out: rule order gives 'mint'.
+  // Neither answer is meaningful — no compliant contract emits this — so the
+  // point is that the behaviour is pinned, and that it discriminates
+  // mint-before-burn from burn-before-mint.
+  it('calls a zero-to-zero transfer a mint, by rule order', () => {
+    expect(classify({ from: ZERO_ADDRESS, to: ZERO_ADDRESS }, tx())).toBe('mint');
+  });
+
+  it('calls a paid burn a burn, not a buy', () => {
+    expect(classify({ from: SELLER, to: ZERO_ADDRESS }, tx({ from: ZERO_ADDRESS, value: 5n })))
+      .toBe('burn');
+  });
+});
+
+describe('classify — buy and transfer', () => {
   it('calls a paid transfer to the tx sender a buy', () => {
-    expect(classify({ from: SELLER, to: BUYER }, { from: BUYER, value: 10n })).toBe('buy');
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: 10n }))).toBe('buy');
   });
 
   it('calls an unpaid transfer a transfer', () => {
-    expect(classify({ from: SELLER, to: BUYER }, { from: BUYER, value: 0n })).toBe('transfer');
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: 0n })))
+      .toBe('transfer');
   });
 
-  // Known limitation, asserted so it is a decision rather than an accident.
+  // Documented limitation, asserted so it is a decision rather than an accident.
   it('calls a paid transfer to someone other than the tx sender a transfer', () => {
-    expect(classify({ from: SELLER, to: BUYER }, { from: ROUTER, value: 10n })).toBe('transfer');
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: ROUTER, value: 10n })))
+      .toBe('transfer');
   });
+});
 
-  it('compares addresses case-insensitively', () => {
+// THE HIGHEST-VALUE BLOCK HERE. classify runs PRE-INSERT on viem's output, and
+// viem returns CHECKSUMMED addresses. The database's lower() CHECK constraints
+// are downstream and guarantee nothing at this point. A comparison that
+// lowercases one side only never matches, so every buy silently becomes a
+// transfer — no error, no missing rows, just a wrong `kind` that looks fine.
+describe('classify — checksummed input must still match', () => {
+  it('matches a checksummed tx.from against a checksummed recipient', () => {
     expect(classify(
-      { from: SELLER, to: BUYER.toUpperCase() as Address },
-      { from: BUYER, value: 10n },
+      { from: SELLER, to: BUYER_CHECKSUMMED },
+      tx({ from: BUYER_CHECKSUMMED, value: 10n }),
     )).toBe('buy');
   });
 
-  it('treats a zero-to-zero transfer as a mint, matching rule order', () => {
-    expect(classify(
-      { from: ZERO_ADDRESS, to: ZERO_ADDRESS },
-      { from: BUYER, value: 0n },
-    )).toBe('mint');
+  it('matches a checksummed tx.from against a lowercase recipient', () => {
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER_CHECKSUMMED, value: 10n })))
+      .toBe('buy');
+  });
+
+  it('matches a lowercase tx.from against a checksummed recipient', () => {
+    expect(classify({ from: SELLER, to: BUYER_CHECKSUMMED }, tx({ from: BUYER, value: 10n })))
+      .toBe('buy');
+  });
+
+  it('recognises a checksummed zero address as a mint', () => {
+    const checksummedZero = ZERO_ADDRESS.toUpperCase().replace('0X', '0x') as Address;
+    expect(classify({ from: checksummedZero, to: BUYER }, tx())).toBe('mint');
+  });
+
+  it('does not match two different addresses that differ only beyond case', () => {
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: SELLER, value: 10n })))
+      .toBe('transfer');
+  });
+});
+
+describe('classify — tx.value is a bigint, never a string or number', () => {
+  it('treats a value above 2^53 as paid', () => {
+    const huge = 2n ** 60n;   // 1152921504606846976 — beyond Number.MAX_SAFE_INTEGER
+    expect(huge > BigInt(Number.MAX_SAFE_INTEGER)).toBe(true);
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: huge }))).toBe('buy');
+  });
+
+  it('treats max-uint256 as paid', () => {
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: 2n ** 256n - 1n })))
+      .toBe('buy');
+  });
+
+  it('treats exactly zero as unpaid', () => {
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: 0n })))
+      .toBe('transfer');
+  });
+
+  it('treats 1 wei as paid', () => {
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: 1n }))).toBe('buy');
+  });
+
+  // A raw database row carries tx_value_wei as TEXT. Handing one straight to
+  // classify must fail loudly rather than misclassify: '0' is a non-empty
+  // string and any coercing comparison would read it as paid.
+  it('throws on a string value rather than misclassifying it', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: '1000000000000000000' as unknown as bigint },
+    )).toThrow(ClassifyError);
+  });
+
+  it('throws on a string "0" rather than treating it as unpaid by luck', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: '0' as unknown as bigint },
+    )).toThrow(ClassifyError);
+  });
+
+  it('throws on a number value', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: 10 as unknown as bigint },
+    )).toThrow(ClassifyError);
+  });
+
+  it('names the offending type in the error', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      { from: BUYER, value: '10' as unknown as bigint },
+    )).toThrow(/string/i);
+  });
+});
+
+// Documented limitation, pinned as a test so widening burn detection is a
+// deliberate edit rather than a silent behaviour change.
+describe('classify — burn detects the zero address only', () => {
+  it('calls a transfer to 0x…dEaD a transfer, not a burn', () => {
+    expect(classify({ from: SELLER, to: DEAD }, tx({ from: SELLER }))).toBe('transfer');
+  });
+
+  it('calls a PAID transfer to 0x…dEaD a transfer too', () => {
+    expect(classify({ from: SELLER, to: DEAD }, tx({ from: ROUTER, value: 10n })))
+      .toBe('transfer');
+  });
+
+  it('is unaffected by the case of the dead address', () => {
+    const lower = DEAD.toLowerCase() as Address;
+    expect(classify({ from: SELLER, to: lower }, tx({ from: SELLER }))).toBe('transfer');
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 3: Run to verify failure, then write `src/indexer/classify.ts`**
 
-Run: `npx vitest run test/unit/classify.test.ts`
-Expected: FAIL — cannot resolve `../../src/indexer/classify.js`.
-
-- [ ] **Step 3: Write `src/indexer/classify.ts`**
+Run: `npx vitest run test/unit/classify.test.ts` — FAIL, module missing.
 
 ```ts
+import { ClassifyError } from '../errors.js';
 import { ZERO_ADDRESS, type DecodedTransfer, type Kind, type TxInfo } from '../types.js';
 
 /**
- * Rules are applied in order, so a paid mint stays a mint.
+ * Classifies one transfer.
  *
- * Known limitation: a sale paid in WETH or another ERC-20 carries tx.value 0
- * and classifies as `transfer`. So does a purchase routed through a contract,
- * where tx.from is the router rather than the recipient.
+ * RULE ORDER IS LOAD-BEARING. A paid mint satisfies both the mint rule and the
+ * buy rule, so checking buy first would relabel every paid mint as a buy —
+ * which is most of them. mint, then burn, then buy, then transfer.
+ *
+ * CASE IS LOAD-BEARING TOO. This runs PRE-INSERT, on viem's output, and viem
+ * returns CHECKSUMMED addresses. The database's `CHECK (col = lower(col))`
+ * constraints are downstream and guarantee nothing here. Comparing a
+ * checksummed `tx.from` against a lowercased recipient never matches, so every
+ * buy would silently become a transfer — no error, no missing row, just a
+ * systematically wrong `kind`. Both sides are lowercased.
+ *
+ * Known limitations, each pinned by a test:
+ * - A sale paid in WETH or another ERC-20 carries `tx.value === 0n` and
+ *   classifies as `transfer`.
+ * - A purchase routed through a contract, where `tx.from` is the router rather
+ *   than the recipient, classifies as `transfer`.
+ * - `burn` detects the zero address only. A transfer to `0x…dEaD` is a burn in
+ *   practice and is classified `transfer`.
  */
 export function classify(
   transfer: Pick<DecodedTransfer, 'from' | 'to'>,
   tx: TxInfo,
 ): Kind {
+  // TxInfo.value is typed bigint, but the repository stores tx_value_wei as
+  // TEXT. A caller handing over a raw database row would pass a string, and a
+  // coercing comparison would misclassify silently instead of failing — '0' is
+  // a non-empty string. Fail loudly at the boundary instead.
+  if (typeof tx.value !== 'bigint') {
+    throw new ClassifyError(
+      `tx.value must be a bigint, received ${typeof tx.value}. ` +
+      'Convert with BigInt() before classifying; a string comparison misclassifies silently.',
+    );
+  }
+
   const from = transfer.from.toLowerCase();
   const to = transfer.to.toLowerCase();
 
@@ -3709,20 +3901,60 @@ export function classify(
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 4: Run the tests and typecheck**
 
 Run: `npx vitest run test/unit/classify.test.ts && npm run typecheck`
-Expected: PASS, 8 tests.
+Then `npm test` for the whole suite.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Mutation-verify the three load-bearing properties — mandatory**
+
+Per CLAUDE.md, a test claiming to pin a property is not done until it has been run against
+the plausible wrong implementation. All three of these mutants are things a reasonable
+person might actually write. In a scratch file OUTSIDE `src/`, copy `classify.ts` and
+produce each, reporting which tests fail:
+
+- **Mutant A — check `buy` before `mint`.** Expected: `still calls a paid mint a mint, not
+  a buy` fails, returning `'buy'`. This is the one that matters most: paid mints are the
+  common case, so this mutant mislabels most of the dataset.
+- **Mutant B — drop `.toLowerCase()` from the `tx.from` side only** (`tx.from === to`).
+  Expected: every test in the checksummed-input block that expects `'buy'` fails, returning
+  `'transfer'`. Report how many. If any of them still passes, the block is not actually
+  feeding checksummed input and needs fixing.
+- **Mutant C — check `burn` before `mint`.** Expected: `calls a zero-to-zero transfer a
+  mint, by rule order` fails, returning `'burn'`. This is the only test that distinguishes
+  those two orderings, so if it does not fail, the degenerate case is not pinning anything.
+
+Also report what happens with **Mutant D — remove the `typeof` guard** and pass the string
+cases: say for each whether it returns `'buy'` or `'transfer'`, so the silent
+misclassification is on the record rather than asserted in the abstract.
+
+If any mutant passes a test it should break, say so plainly and record it as a gap rather
+than shipping. Delete the scratch file afterwards.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/indexer/classify.ts test/unit/classify.test.ts
+git add src/indexer/classify.ts src/errors.ts test/unit/classify.test.ts
 git commit -m "feat: classify transfers as mint, burn, buy, or transfer
 
-Rules apply in order so a paid mint stays a mint. ERC-20-paid sales and
-router-mediated purchases classify as transfer; both are asserted as
-known limitations rather than left to chance.
+Rule order is load-bearing: a paid mint satisfies both the mint rule and
+the buy rule, so checking buy first would relabel most mints. Pinned by a
+test that fails against exactly that mutant, and the degenerate
+zero-to-zero case is decided explicitly (mint, by rule order) because it
+is the only input distinguishing mint-before-burn from burn-before-mint.
+
+Case is load-bearing too. classify runs pre-insert on viem's output, and
+viem returns checksummed addresses; the database's lower() CHECKs are
+downstream and guarantee nothing here. Lowercasing one side only would
+make every buy silently become a transfer, so the tests feed genuinely
+checksummed addresses.
+
+tx.value is compared as a bigint and a non-bigint now throws. The
+repository stores tx_value_wei as TEXT, so a caller passing a raw row
+would hand over a string, and '0' is truthy under a coercing comparison.
+
+Burn detects the zero address only; 0x…dEaD classifying as transfer is
+pinned by a fixture so widening it later is a deliberate edit.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
