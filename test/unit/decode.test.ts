@@ -11,18 +11,23 @@ function load(name: string): RawLog[] {
   return raw.map((l) => ({ ...l, blockNumber: BigInt(l.blockNumber as string) })) as RawLog[];
 }
 
+const TOPIC_1155_SINGLE =
+  '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62' as Hex;
 const TOPIC_1155_BATCH =
   '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb' as Hex;
 const OPERATOR = '0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Hex;
 const ZERO_TOPIC = `0x${'0'.repeat(64)}` as Hex;
 const TO = '0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Hex;
+// Shared with the "diagnosable" error-message test below, so the fixture's
+// hash and the assertion on it cannot drift apart.
+const BATCH_TX_HASH = `0x${'7'.repeat(64)}` as Hex;
 
 /** A TransferBatch log with arbitrary ids/values — including invalid pairings. */
 function batchLog(ids: bigint[], values: bigint[]): RawLog {
   return {
     topics: [TOPIC_1155_BATCH, OPERATOR, ZERO_TOPIC, TO],
     data: encodeAbiParameters([{ type: 'uint256[]' }, { type: 'uint256[]' }], [ids, values]),
-    transactionHash: `0x${'7'.repeat(64)}` as Hex,
+    transactionHash: BATCH_TX_HASH,
     blockNumber: 700n,
     logIndex: 11,
   };
@@ -70,6 +75,50 @@ describe('decodeLogs — ERC-20 Transfer must be skipped, not decoded or thrown 
     const out = decodeLogs(mixed, '721');
     expect(out).toHaveLength(1);
     expect(out[0]?.tokenId).toBe(1n);
+  });
+});
+
+// The topic-count guard is hoisted above the standard branch, so it must
+// reject a malformed ERC-1155 log too, not just the ERC-20/ERC-721 collision.
+// Measured (coordinator review): before this guard was hoisted, a
+// TransferSingle- or TransferBatch-shaped log with too few topics THREW
+// DecodeLogTopicsMismatch instead of skipping — the exact failure mode the
+// ERC-721 guard already existed to prevent, just not extended to ERC-1155.
+describe('decodeLogs — ERC-1155 topic-count guard (structural, not just the ERC-20 collision)', () => {
+  it('a TransferSingle-shaped log with 2 topics decodes to zero rows and does not throw', () => {
+    const log: RawLog = {
+      topics: [TOPIC_1155_SINGLE, OPERATOR],
+      data: load('logs-1155-single')[0]!.data,
+      transactionHash: `0x${'9'.repeat(64)}` as Hex,
+      blockNumber: 900n,
+      logIndex: 0,
+    };
+    expect(() => decodeTransferLog(log, '1155')).not.toThrow();
+    expect(decodeTransferLog(log, '1155')).toEqual([]);
+  });
+
+  it('a TransferBatch-shaped log with 2 topics decodes to zero rows and does not throw', () => {
+    const log: RawLog = {
+      topics: [TOPIC_1155_BATCH, OPERATOR],
+      data: load('logs-1155-batch')[0]!.data,
+      transactionHash: `0x${'9'.repeat(64)}` as Hex,
+      blockNumber: 900n,
+      logIndex: 1,
+    };
+    expect(() => decodeTransferLog(log, '1155')).not.toThrow();
+    expect(decodeTransferLog(log, '1155')).toEqual([]);
+  });
+
+  it('a TransferSingle-shaped log with 5 topics (too many) decodes to zero rows and does not throw', () => {
+    const log: RawLog = {
+      topics: [TOPIC_1155_SINGLE, OPERATOR, ZERO_TOPIC, TO, ZERO_TOPIC],
+      data: load('logs-1155-single')[0]!.data,
+      transactionHash: `0x${'9'.repeat(64)}` as Hex,
+      blockNumber: 900n,
+      logIndex: 2,
+    };
+    expect(() => decodeTransferLog(log, '1155')).not.toThrow();
+    expect(decodeTransferLog(log, '1155')).toEqual([]);
   });
 });
 
@@ -174,9 +223,11 @@ describe('decodeLogs — ERC-1155 TransferBatch', () => {
 });
 
 // Malformed-but-decodable is the silent-corruption shape. Measured: viem decodes a
-// mismatched TransferBatch WITHOUT complaint, so this guard is ours alone. Zipping
-// to the shorter array drops a transfer; padding with 0n invents one.
-describe('decodeLogs — malformed TransferBatch throws rather than zipping', () => {
+// mismatched TransferBatch WITHOUT complaint, so this guard is ours alone. In THIS
+// implementation removing it would fabricate a zero-amount transfer for every id
+// past the shorter values[] (mutation-verified), not drop the extra id — a
+// differently-shaped loop could drop instead. Both are silent corruption.
+describe('decodeLogs — malformed TransferBatch throws rather than fabricating rows', () => {
   it('throws when there are more ids than values', () => {
     expect(() => decodeTransferLog(batchLog([1n, 2n, 3n], [1n, 2n]), '1155'))
       .toThrow(DecodeError);
@@ -190,11 +241,13 @@ describe('decodeLogs — malformed TransferBatch throws rather than zipping', ()
   it('names both lengths and the log in the error, so it is diagnosable', () => {
     expect(() => decodeTransferLog(batchLog([1n, 2n, 3n], [1n]), '1155'))
       .toThrow(/3 ids.*1 value|1 value.*3 ids/i);
+    // Exact hash, not a coincidental digit run: BATCH_TX_HASH is the same
+    // constant batchLog() uses, so this and the fixture cannot drift apart.
     expect(() => decodeTransferLog(batchLog([1n, 2n, 3n], [1n]), '1155'))
-      .toThrow(/7{8}/);   // the fixture tx hash appears in the message
+      .toThrow(BATCH_TX_HASH);
   });
 
-  it('throws rather than silently returning the shorter zip', () => {
+  it('throws rather than silently fabricating a zero-amount row for the shorter array', () => {
     let out: unknown = 'not-called';
     try { out = decodeTransferLog(batchLog([1n, 2n, 3n], [1n, 2n]), '1155'); } catch { /* expected */ }
     expect(out).toBe('not-called');

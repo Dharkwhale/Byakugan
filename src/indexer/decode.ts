@@ -26,10 +26,29 @@ const TOPIC_1155_BATCH =
   '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb' as const;
 
 /**
- * ERC-721 `Transfer` has three indexed arguments, so a compliant log carries
- * topic0 plus three — four in total.
+ * Every event this decoder handles — ERC-721 `Transfer`, ERC-1155
+ * `TransferSingle` and `TransferBatch` — declares exactly three indexed
+ * parameters, so a compliant log carries topic0 plus three: four in total.
+ *
+ * Two distinct bugs are stopped by one check, and they fail differently —
+ * measured, not assumed. For ERC-721 it is the ERC-20 collision:
+ * `Transfer(address,address,uint256)` hashes identically, but ERC-20 indexes
+ * only two arguments, so its logs carry three topics and viem THROWS
+ * `DecodeLogTopicsMismatch`; unguarded, that kills a backfill on the first
+ * ERC-20 log it meets. For ERC-1155 it is plain malformedness, and a
+ * too-few-topics log throws the same way — but a too-many-topics log does
+ * NOT throw: viem silently decodes using only the leading topics it expects
+ * and discards the rest, so an unguarded log with extra topics would be
+ * accepted as a normal-looking transfer rather than rejected. This guard is
+ * therefore doing two different jobs: it turns a crash into a skip (too few
+ * topics) AND it turns a silent misdecode into a skip (too many topics).
+ *
+ * KNOWN LIMITATION: a non-compliant early ERC-721 that emits a NON-indexed
+ * `tokenId` also has three topics and is therefore skipped. Accepting it
+ * would require an ABI indistinguishable from ERC-20, so those collections
+ * index as zero transfers. Recorded in the README.
  */
-const ERC721_TOPIC_COUNT = 4;
+const TOPIC_COUNT_WITH_THREE_INDEXED = 4;
 
 /** topic0 filters to pass to getLogs, per standard. */
 export const TRANSFER_TOPICS: Record<Standard, Hash[]> = {
@@ -39,10 +58,30 @@ export const TRANSFER_TOPICS: Record<Standard, Hash[]> = {
 
 const lower = (a: string): Address => a.toLowerCase() as Address;
 
+/**
+ * Narrows `topics` to a non-empty tuple so `decodeEventLog` — which types its
+ * `topics` parameter as `[signature: Hex, ...args: Hex[]] | []` — can be
+ * called without a cast. A proven narrowing rather than an assertion: if a
+ * future edit moves a decode call above this guard, typecheck fails instead
+ * of silently trusting an assertion.
+ */
+function hasTopic0(topics: Hash[]): topics is [Hash, ...Hash[]] {
+  return topics.length > 0;
+}
+
 export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTransfer[] {
-  const topic0 = log.topics[0];
+  const { topics } = log;
+  // A log with no topics at all cannot match topic0; narrows `topics` to a
+  // non-empty tuple for every decodeEventLog call below.
+  if (!hasTopic0(topics)) return [];
+  const topic0 = topics[0];
+
   // An unrelated event from the same address is normal, not exceptional.
-  if (!topic0 || !TRANSFER_TOPICS[standard].includes(topic0)) return [];
+  if (!TRANSFER_TOPICS[standard].includes(topic0)) return [];
+
+  // See TOPIC_COUNT_WITH_THREE_INDEXED: one check for all three supported
+  // events, since all three declare exactly three indexed parameters.
+  if (topics.length !== TOPIC_COUNT_WITH_THREE_INDEXED) return [];
 
   const common = {
     txHash: log.transactionHash,
@@ -51,19 +90,7 @@ export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTrans
   };
 
   if (standard === '721') {
-    // ERC-20's Transfer(address,address,uint256) hashes to the SAME topic0, but
-    // indexes only two arguments, so its logs carry three topics. Skipping on
-    // topic count is what keeps an ERC-20 log out of the index — and, with a
-    // three-indexed ABI, what stops viem throwing DecodeLogTopicsMismatch and
-    // killing the backfill on the first one it meets.
-    //
-    // KNOWN LIMITATION: a non-compliant early ERC-721 that emits a NON-indexed
-    // tokenId also has three topics and is therefore skipped. Accepting it would
-    // require an ABI indistinguishable from ERC-20, so those collections index
-    // as zero transfers. Recorded in the README.
-    if (log.topics.length !== ERC721_TOPIC_COUNT) return [];
-
-    const { args } = decodeEventLog({ abi: ERC721_ABI, topics: log.topics as [Hash, ...Hash[]], data: log.data });
+    const { args } = decodeEventLog({ abi: ERC721_ABI, topics, data: log.data });
     return [{
       ...common,
       tokenId: args.tokenId,
@@ -75,7 +102,7 @@ export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTrans
   }
 
   if (topic0 === TOPIC_1155_SINGLE) {
-    const { args } = decodeEventLog({ abi: ERC1155_ABI, topics: log.topics as [Hash, ...Hash[]], data: log.data });
+    const { args } = decodeEventLog({ abi: ERC1155_ABI, topics, data: log.data });
     if (!('id' in args)) return [];
     return [{
       ...common,
@@ -87,18 +114,24 @@ export function decodeTransferLog(log: RawLog, standard: Standard): DecodedTrans
     }];
   }
 
-  const { args } = decodeEventLog({ abi: ERC1155_ABI, topics: log.topics as [Hash, ...Hash[]], data: log.data });
+  const { args } = decodeEventLog({ abi: ERC1155_ABI, topics, data: log.data });
   if (!('ids' in args)) return [];
 
   // viem decodes the two arrays independently and does NOT object when their
-  // lengths differ (measured). Zipping to the shorter one silently drops a
-  // transfer; padding with 0n silently invents one. Neither is acceptable for an
-  // index, so a malformed batch is a hard error.
+  // lengths differ (measured). In THIS implementation, removing this check
+  // would not zip to the shorter array: the loop below iterates ids.length,
+  // so a short values[] would invent a fabricated 0n-amount transfer for
+  // every missing entry rather than dropping the extra id (mutation-verified
+  // — see decode.test.ts). A differently-shaped loop could instead drop a
+  // transfer by stopping at the shorter length. Both are silent corruption,
+  // so a malformed batch is a hard error regardless of which failure mode a
+  // future refactor would produce.
   if (args.ids.length !== args.values.length) {
     throw new DecodeError(
       `ERC-1155 TransferBatch in ${log.transactionHash} log ${log.logIndex} carries ` +
       `${args.ids.length} ids and ${args.values.length} values. Refusing to decode: ` +
-      'zipping to the shorter array would drop transfers and padding would invent them.',
+      'this would fabricate a zero-amount transfer for every id past the shorter ' +
+      'array (or drop one, in a differently-shaped implementation) — neither is safe.',
     );
   }
 
