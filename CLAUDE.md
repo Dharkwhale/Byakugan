@@ -58,6 +58,22 @@ partial.
 When a test cannot be made to fail against the mutant, say so and record the
 gap. An honest "argued, not tested" comment beats a contrived pass.
 
+### Derive expectations from the spec, never from the fixture
+
+When a fixture is hand-authored — ABI-encoded log data, a hex blob, a
+pre-computed hash — write the assertions from what the code *should* produce,
+not from what the fixture *does* produce. A hand-written `TransferBatch`
+fixture in this project had two extra hex characters that shifted its values
+array to `[0n, <huge>]` instead of `[1n, 2n]`. The test failed loudly and the
+fixture got fixed. Had the expectations been read off the fixture instead,
+every batch amount in the index would have been silently wrong with a green
+suite.
+
+Prefer generating adversarial or malformed fixtures programmatically
+(`encodeAbiParameters`) over hand-computing offsets: the encoder is correct by
+construction, and a malformed shape usually cannot be captured from a
+compliant chain anyway.
+
 ### Assert behaviour, not configuration
 
 Assert what a caller would notice. `PRAGMA foreign_keys` returning `1` proves
