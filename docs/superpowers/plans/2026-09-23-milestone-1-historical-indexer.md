@@ -6694,7 +6694,25 @@ npx tsx scripts/capture-fixtures.ts --chain 8453 --contract <candidate> --standa
 npm run index -- --chain 8453 --contract <candidate>
 ```
 
-Then print, for the candidate: deploy block, deploy-block source, first mint tx hash, mint count, burn count, and whether ERC-721 Enumerable is supported. Pick a small, non-burnable, fully minted ERC-721 on Base or Arbitrum so the backfill is fast.
+Then print, for the candidate: deploy block, deploy-block source, first mint tx hash, mint count, burn count, and whether ERC-721 Enumerable is supported. **Choosing the collection — constrained by a measured provider limit.**
+
+The configured account caps `eth_getLogs` at **10 blocks**, flat. Measured: a query against
+an address that has never emitted anything still caps at 10 on all three chains, and the
+provider suggests 10 regardless of the span requested; dense mint window and quiet recent
+window behave identically. So it is a plan-tier cap, not a result-density limit.
+
+Runtime is therefore governed by the `deployBlock -> head` SPAN, not by supply. Pick for a
+short span, not merely a small collection:
+
+- supply in the low thousands, minted over a short block span
+- **deployed recently**, so the span is tens of thousands of blocks rather than millions. At
+  10 blocks per request and 25 rps: 50k blocks is ~5k requests (~3 minutes); a year-old
+  mainnet collection is ~263k requests (~3 hours); a year-old Arbitrum collection is ~11M
+  requests (~5 days)
+- non-burnable and fully minted, so the supply assertion is stable
+
+A larger or older collection buys nothing here — this test proves pipeline correctness, not
+throughput.
 
 **Stop here and give the user the explorer links** for the deploy block and the first mint tx hash. Only after they confirm, hardcode the values into the integration test constants below. Do not proceed on your own verification alone — the milestone's acceptance criteria say the user verifies this.
 
