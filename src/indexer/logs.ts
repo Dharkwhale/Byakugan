@@ -4,28 +4,53 @@ import type { RawLog } from './decode.js';
 /**
  * Phrases providers use when a getLogs range or result set is too large.
  * Matched against the FULL error text, not just `message` — see `errorText`.
+ * An entry is listed only if no other entry is a substring of it (a
+ * 'block range too large' entry would be dead weight next to 'block range').
  */
 const RANGE_PATTERNS = [
   'block range',
   'more than 10000 results',
   'max results',
-  'block range too large',
-  'exceed maximum block range',
   'response size exceeded',
   'query timeout exceeded',
-  'log response size exceeded',
 ];
 
 /**
- * Codes that mean "too much" on their own. `-32600` is deliberately absent: it
- * is JSON-RPC's generic "Invalid Request", and treating it as a range error
- * would make the chunker halve forever against a malformed request that halving
+ * Codes that mean "too much" on their own, unless the text says the provider is
+ * rate limiting (see `RATE_LIMIT`). `-32600` is deliberately absent: it is
+ * JSON-RPC's generic "Invalid Request", and treating it as a range error would
+ * make the chunker halve forever against a malformed request that halving
  * cannot fix.
  */
 const RANGE_CODES = new Set([-32005]);
 
+/**
+ * Some providers reuse -32005 for rate limiting. Halving cannot fix that and
+ * would end in a misleading RangeExhaustedError; the rate limiter and retry
+ * layer own it instead.
+ */
+const RATE_LIMIT = /rate[\s-]?limit|too many requests|\b429\b/;
+
 /** `[0x…, 0x…]` — the range a provider says would have worked. */
 const SUGGESTED_RANGE = /\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/;
+
+interface ErrorNode {
+  message?: unknown; details?: unknown; shortMessage?: unknown; data?: unknown;
+  metaMessages?: unknown; code?: unknown; cause?: unknown; error?: unknown;
+}
+
+/**
+ * The error and everything reachable through `cause` and a nested `error`
+ * object, each node once. `seen` stops a cycle from repeating text; `depth`
+ * bounds pathological chains. They are not redundant: the depth limit alone
+ * terminates a cycle but would emit its text once per lap.
+ */
+function errorNodes(err: unknown, seen = new Set<unknown>(), depth = 0): ErrorNode[] {
+  if (!err || typeof err !== 'object' || seen.has(err) || depth > 5) return [];
+  seen.add(err);
+  const e = err as ErrorNode;
+  return [e, ...errorNodes(e.cause, seen, depth + 1), ...errorNodes(e.error, seen, depth + 1)];
+}
 
 /**
  * Every string a provider error carries, including down the cause chain.
@@ -33,26 +58,33 @@ const SUGGESTED_RANGE = /\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/;
  * Measured against Alchemy: the top-level `message` is
  * "JSON is not a valid request object." and says nothing about ranges, while
  * `details` carries "…up to a 10 block range…". Matching only `message` would
- * miss it entirely and the backfill would die on its first call.
+ * miss it entirely and the backfill would die on its first call. `data`, a
+ * nested `error.message` and viem's `metaMessages` are read for the same reason.
+ * Total for any input.
  */
-export function errorText(err: unknown, seen = new Set<unknown>(), depth = 0): string {
-  if (!err || typeof err !== 'object' || seen.has(err) || depth > 5) return '';
-  seen.add(err);
-  const e = err as {
-    message?: unknown; details?: unknown; shortMessage?: unknown; cause?: unknown;
-  };
-  const parts = [e.details, e.shortMessage, e.message]
-    .filter((p): p is string => typeof p === 'string');
-  return `${parts.join(' | ')} ${errorText(e.cause, seen, depth + 1)}`;
+export function errorText(err: unknown): string {
+  return errorNodes(err)
+    .map((e) => {
+      const meta = Array.isArray(e.metaMessages)
+        ? e.metaMessages.filter((m): m is string => typeof m === 'string')
+        : [];
+      return [e.details, e.shortMessage, e.message, e.data, ...meta]
+        .filter((p): p is string => typeof p === 'string')
+        .join(' | ');
+    })
+    .join(' ');
 }
 
 export function isRangeError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
 
-  const code = (err as { code?: unknown }).code;
-  if (typeof code === 'number' && RANGE_CODES.has(code)) return true;
-
   const text = errorText(err).toLowerCase();
+
+  const hasRangeCode = errorNodes(err).some(
+    (e) => typeof e.code === 'number' && RANGE_CODES.has(e.code),
+  );
+  if (hasRangeCode && !RATE_LIMIT.test(text)) return true;
+
   return RANGE_PATTERNS.some((p) => text.includes(p));
 }
 
@@ -63,6 +95,12 @@ export function isRangeError(err: unknown): boolean {
  * 0x17ec586]", and re-requesting exactly that span succeeds on the first retry.
  * Blind halving from an optimistic 2000 takes eight failed round trips to reach
  * the same place.
+ *
+ * Accepted limitation: this takes the FIRST `[0x…, 0x…]` pair in the text, which
+ * could in principle be an echoed parameter array rather than a suggestion. It
+ * only runs after `isRangeError` is true, and `iterateLogs` rejects an
+ * implausible width (one not smaller than the span that failed). Only the WIDTH
+ * is used — the suggested start is never compared against the cursor.
  */
 export function suggestedRange(
   err: unknown,
@@ -98,6 +136,12 @@ const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
  *   Without that ceiling, growing 1.25x after each success walks straight back
  *   over the cap and fails again, forever — one wasted call every few chunks
  *   for the whole backfill.
+ *   Accepted limitation: the ceiling is PERMANENT for the run. If a suggestion
+ *   is driven by result count in a dense block region rather than a plan-tier
+ *   cap, the ceiling ratchets down and stays down, costing speed for the rest of
+ *   the run; a restart re-learns. The measured provider returns a plan-tier cap
+ *   ("Under the Free tier plan ... up to a 10 block range"), so this is a speed
+ *   risk, not a correctness one.
  * - Never fall below one block, and give up after `maxHalvings`, so a provider
  *   that refuses everything cannot spin.
  *
@@ -127,11 +171,16 @@ export async function* iterateLogs(a: {
 
     for (;;) {
       const end = min(cursor + range - 1n, a.toBlock);
+      // The span actually requested. When `toBlock` clamps the request this is
+      // smaller than `range`; every reduction must be derived from IT, or the
+      // same request is re-sent while `range` shrinks to no effect.
+      const span = end - cursor + 1n;
       try {
         const logs = await a.fetch({ fromBlock: cursor, toBlock: end });
         yield { fromBlock: cursor, toBlock: end, logs };
         cursor = end + 1n;
-        range = min(min((range * 5n) / 4n, ceiling), hardMax);
+        // Integer 1.25x is a no-op at 1..3, so always advance by at least one.
+        range = min(min(max(range + 1n, (range * 5n) / 4n), ceiling), hardMax);
         break;
       } catch (err) {
         if (!isRangeError(err)) throw err;
@@ -141,23 +190,23 @@ export async function* iterateLogs(a: {
           ? suggestion.toBlock - suggestion.fromBlock + 1n
           : undefined;
 
-        // Only trust a suggestion that is actually smaller than what failed —
+        // Only trust a suggestion that is smaller than the span that failed —
         // a wider one cannot be a fix and would loop.
         const usable =
-          suggestedWidth !== undefined && suggestedWidth < range ? suggestedWidth : undefined;
+          suggestedWidth !== undefined && suggestedWidth < span ? suggestedWidth : undefined;
 
         // The ceiling must be the provider's STATED cap when it gives one, not
-        // merely `range - 1`. Using `range - 1` leaves the ceiling far above the
+        // merely `span - 1`. Using `span - 1` leaves the ceiling far above the
         // real limit, so the next 1.25x growth sails straight back over it and
         // fails again — the exact oscillation the ceiling exists to prevent.
         // Without a suggestion, all we know is that this width is too big.
-        ceiling = max(usable ?? range - 1n, 1n);
+        ceiling = min(ceiling, max(usable ?? span - 1n, 1n));
 
-        const next = usable ?? max(range / 2n, 1n);
+        const next = usable ?? max(span / 2n, 1n);
 
-        if (range === 1n || halvings >= maxHalvings) {
+        if (span === 1n || halvings >= maxHalvings) {
           throw new RangeExhaustedError(
-            `getLogs still failing at range ${range} block(s) from ${cursor} after ` +
+            `getLogs still failing at span ${span} block(s) from ${cursor} after ` +
             `${halvings} reduction(s): ${String((err as Error).message)}`,
           );
         }

@@ -33,13 +33,29 @@ describe('errorText', () => {
     expect(errorText(outer)).toContain('10 block range');
   });
 
-  it('is total for null, undefined, a string and a cyclic cause', () => {
-    expect(() => errorText(null)).not.toThrow();
-    expect(() => errorText(undefined)).not.toThrow();
-    expect(() => errorText('plain')).not.toThrow();
-    const a = new Error('a') as Error & { cause?: unknown };
+  it('is total for null, undefined, a string and other junk', () => {
+    expect(errorText(null)).toBe('');
+    expect(errorText(undefined)).toBe('');
+    expect(errorText('plain')).toBe('');
+    expect(errorText(42)).toBe('');
+    expect(errorText({ message: 7, details: {}, data: null, metaMessages: 'nope' }).trim()).toBe('');
+  });
+
+  // The depth limit alone would terminate a cycle, but it would emit the text
+  // once per lap. `seen` is what makes each error contribute exactly once, so
+  // the assertion is on the returned text, not on "did not throw".
+  it('visits a cyclic cause exactly once', () => {
+    const a = new Error('cyc') as Error & { cause?: unknown };
     a.cause = a;
-    expect(() => errorText(a)).not.toThrow();
+    expect(errorText(a).trim()).toBe('cyc');
+  });
+
+  it('reads `data`, a nested error.message and viem metaMessages', () => {
+    expect(errorText({ data: 'in-data' })).toContain('in-data');
+    expect(errorText({ error: { message: 'in-nested-error' } })).toContain('in-nested-error');
+    const text = errorText({ metaMessages: ['meta one', 'meta two', 5] });
+    expect(text).toContain('meta one');
+    expect(text).toContain('meta two');
   });
 });
 
@@ -69,6 +85,35 @@ describe('isRangeError — the real provider shape', () => {
 
   it('recognises the -32005 limit-exceeded code without matching text', () => {
     expect(isRangeError(Object.assign(new Error('limit exceeded'), { code: -32005 }))).toBe(true);
+  });
+
+  it('treats -32005 with range wording as a range error', () => {
+    const err = Object.assign(new Error('query returned too many blocks'), { code: -32005 });
+    expect(isRangeError(err)).toBe(true);
+  });
+
+  // Some providers reuse -32005 for rate limiting. Halving cannot fix that; it
+  // would end in a misleading RangeExhaustedError instead of the retry layer.
+  it.each([
+    'rate limit exceeded',
+    'Too Many Requests',
+    'HTTP 429: slow down',
+  ])('does NOT treat -32005 as a range error when it looks like rate limiting: %s', (msg) => {
+    expect(isRangeError(Object.assign(new Error(msg), { code: -32005 }))).toBe(false);
+  });
+
+  it('finds a -32005 code down the cause chain', () => {
+    const outer = new Error('RPC Request failed.');
+    (outer as Error & { cause?: unknown }).cause =
+      Object.assign(new Error('limit exceeded'), { code: -32005 });
+    expect(isRangeError(outer)).toBe(true);
+  });
+
+  it('does NOT treat a chained -32005 as a range error when the text is rate limiting', () => {
+    const outer = new Error('RPC Request failed.');
+    (outer as Error & { cause?: unknown }).cause =
+      Object.assign(new Error('rate limit exceeded'), { code: -32005 });
+    expect(isRangeError(outer)).toBe(false);
   });
 
   // -32600 is JSON-RPC's generic "Invalid Request". Treating the code alone as a
@@ -165,6 +210,33 @@ describe('iterateLogs — walking the span', () => {
   });
 });
 
+describe('iterateLogs — recovering after a reduction', () => {
+  /** Records every requested span; fails any span >= `failAt` with a range error. */
+  async function run(o: { failAt: bigint; to: bigint; initialChunk: number }): Promise<number[]> {
+    const spans: number[] = [];
+    for await (const _ of iterateLogs({
+      fetch: async ({ fromBlock, toBlock }) => {
+        spans.push(Number(toBlock - fromBlock) + 1);
+        if (toBlock - fromBlock + 1n >= o.failAt) throw new Error('block range is too wide');
+        return [];
+      },
+      fromBlock: 0n, toBlock: o.to, initialChunk: o.initialChunk, maxChunk: 100,
+    })) { /* drain */ }
+    return spans;
+  }
+
+  // 3 fails -> ceiling 2, range 1. Integer 1.25x leaves 1 at 1 forever; growth
+  // must advance by at least one block to reach the ceiling.
+  it('a range reduced to 1 recovers on subsequent successes', async () => {
+    expect(await run({ failAt: 3n, to: 8n, initialChunk: 3 })).toEqual([3, 1, 2, 2, 2, 2]);
+  });
+
+  // 4 fails -> ceiling 3, range 2. 2 * 5 / 4 is still 2 in integers.
+  it('a range of 2 grows on to the ceiling rather than stalling', async () => {
+    expect(await run({ failAt: 4n, to: 13n, initialChunk: 4 })).toEqual([4, 2, 3, 3, 3, 3]);
+  });
+});
+
 describe('iterateLogs — adopting the provider suggestion', () => {
   // Measured: blind halving from 2000 needs EIGHT failed round trips to reach a
   // 10-block range. Adopting the suggestion needs one.
@@ -254,27 +326,78 @@ describe('iterateLogs — adopting the provider suggestion', () => {
       },
       fromBlock: 0n, toBlock: 99n, initialChunk: 100, maxChunk: 100,
     })) { /* drain */ }
-    expect(attempts[1]).toBeLessThan(attempts[0]!);
+    // 100 fails; the wider suggestion is rejected, so halve: 50. Then one 1.25x
+    // growth step is clamped by the ceiling (99) and by the 50 blocks left.
+    // A `range - 1` fallback would give [100, 99, ...] instead.
+    expect(attempts).toEqual([100, 50, 50]);
+  });
+
+  // The usability check compares against the span that ACTUALLY failed (30), not
+  // `range` (2000): a suggestion of 35 is wider than what failed, so it cannot
+  // be a fix and must not become the ceiling.
+  it('ignores a suggestion wider than the clamped span that failed', async () => {
+    const spans: number[] = [];
+    for await (const _ of iterateLogs({
+      fetch: async ({ fromBlock, toBlock }) => {
+        const span = toBlock - fromBlock + 1n;
+        spans.push(Number(span));
+        if (span > 20n) {
+          throw Object.assign(new Error('x'), {
+            details: 'block range too wide, should work: [0x0, 0x22]',   // width 35
+          });
+        }
+        return [];
+      },
+      fromBlock: 0n, toBlock: 29n, initialChunk: 2000, maxChunk: 2000,
+    })) { /* drain */ }
+    expect(spans).toEqual([30, 15, 15]);
   });
 });
 
 describe('iterateLogs — bounded failure', () => {
-  it('never halves below a single block', async () => {
-    let calls = 0;
+  async function failAlways(o: {
+    to: bigint; initialChunk: number; maxHalvings?: number; message?: string;
+  }): Promise<{ spans: number[]; error: unknown }> {
+    const spans: number[] = [];
     const gen = iterateLogs({
-      fetch: async () => { calls += 1; throw new Error('query returned more than 10000 results'); },
-      fromBlock: 0n, toBlock: 10n, initialChunk: 4, maxChunk: 4, maxHalvings: 10,
+      fetch: async ({ fromBlock, toBlock }) => {
+        spans.push(Number(toBlock - fromBlock) + 1);
+        throw new Error(o.message ?? 'query returned more than 10000 results');
+      },
+      fromBlock: 0n, toBlock: o.to, initialChunk: o.initialChunk, maxChunk: 1000,
+      ...(o.maxHalvings !== undefined ? { maxHalvings: o.maxHalvings } : {}),
     });
-    await expect(gen.next()).rejects.toThrow(RangeExhaustedError);
-    expect(calls).toBeLessThanOrEqual(11);
+    let error: unknown;
+    try { await gen.next(); } catch (e) { error = e; }
+    return { spans, error };
+  }
+
+  // Generous maxHalvings, so only the one-block floor can stop it. Without the
+  // floor guard it would keep re-sending 1-block requests until maxHalvings.
+  it('never halves below a single block', async () => {
+    const { spans, error } = await failAlways({ to: 10n, initialChunk: 4, maxHalvings: 10 });
+    expect(error).toBeInstanceOf(RangeExhaustedError);
+    expect(spans).toEqual([4, 2, 1]);
   });
 
+  // The range would reach one block after nine reductions; maxHalvings: 2 must
+  // stop it after two. Without the cap it gives up only at the one-block floor.
   it('gives up after maxHalvings rather than looping unbounded', async () => {
-    const gen = iterateLogs({
-      fetch: async () => { throw new Error('block range is too wide'); },
-      fromBlock: 0n, toBlock: 10_000n, initialChunk: 1000, maxChunk: 1000, maxHalvings: 2,
+    const { spans, error } = await failAlways({
+      to: 10_000n, initialChunk: 1000, maxHalvings: 2, message: 'block range is too wide',
     });
-    await expect(gen.next()).rejects.toThrow(RangeExhaustedError);
+    expect(error).toBeInstanceOf(RangeExhaustedError);
+    expect(spans).toEqual([1000, 500, 250]);
+  });
+
+  // A span shorter than initialChunk (clamped by toBlock) must not re-send the
+  // identical request while `range` shrinks to no effect.
+  it('never re-sends the same span when toBlock clamps the request', async () => {
+    const { spans, error } = await failAlways({
+      to: 29n, initialChunk: 2000, message: 'block range is too wide',
+    });
+    expect(error).toBeInstanceOf(RangeExhaustedError);
+    expect(spans).toEqual([30, 15, 7, 3, 1]);
   });
 
   it('rethrows an error that is not a range error', async () => {
