@@ -140,8 +140,12 @@ const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
  *   chunks it doubles (clamped to `maxChunk`) so the run can find out whether the
  *   limit has lifted. If that probe fails, the ceiling drops again through the
  *   normal path and `successesBeforeProbe` DOUBLES (capped at 1024x its start),
- *   so probing backs off and wastes O(log n) calls over a long run rather than
- *   one every N chunks forever. Why it exists: on paid tiers the limit is
+ *   so probing backs off instead of wasting one call every N chunks forever.
+ *   Cost: O(log n) while the interval is still doubling, then O(n / cap) once
+ *   it reaches its ceiling — about 60 wasted calls per million chunks, against
+ *   50,000 for a fixed interval. It is NOT strictly O(log n) over an unbounded
+ *   run; an earlier version of this comment claimed that and was wrong.
+ *   Why it exists: on paid tiers the limit is
  *   result-size driven, and density varies enormously — a ceiling learned in a
  *   mint window holding thousands of logs per block would otherwise throttle the
  *   quiet years that follow, for the whole run. The MEASURED free-tier cap is
