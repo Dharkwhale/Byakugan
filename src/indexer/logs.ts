@@ -136,12 +136,17 @@ const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
  *   Without that ceiling, growing 1.25x after each success walks straight back
  *   over the cap and fails again, forever — one wasted call every few chunks
  *   for the whole backfill.
- *   Accepted limitation: the ceiling is PERMANENT for the run. If a suggestion
- *   is driven by result count in a dense block region rather than a plan-tier
- *   cap, the ceiling ratchets down and stays down, costing speed for the rest of
- *   the run; a restart re-learns. The measured provider returns a plan-tier cap
- *   ("Under the Free tier plan ... up to a 10 block range"), so this is a speed
- *   risk, not a correctness one.
+ *   The ceiling DECAYS: after `successesBeforeProbe` consecutive successful
+ *   chunks it doubles (clamped to `maxChunk`) so the run can find out whether the
+ *   limit has lifted. If that probe fails, the ceiling drops again through the
+ *   normal path and `successesBeforeProbe` DOUBLES (capped at 1024x its start),
+ *   so probing backs off and wastes O(log n) calls over a long run rather than
+ *   one every N chunks forever. Why it exists: on paid tiers the limit is
+ *   result-size driven, and density varies enormously — a ceiling learned in a
+ *   mint window holding thousands of logs per block would otherwise throttle the
+ *   quiet years that follow, for the whole run. The MEASURED free-tier cap is
+ *   FLAT (10 blocks even for an address that never emitted), so there the probe
+ *   simply keeps failing and backing off: a handful of calls per run.
  * - Never fall below one block, and give up after `maxHalvings`, so a provider
  *   that refuses everything cannot spin.
  *
@@ -158,12 +163,20 @@ export async function* iterateLogs(a: {
   initialChunk: number;
   maxChunk: number;
   maxHalvings?: number;
+  /** Consecutive successes before the ceiling is probed upward. Default 20. */
+  successesBeforeProbe?: number;
 }): AsyncGenerator<{ fromBlock: bigint; toBlock: bigint; logs: RawLog[] }> {
   const maxHalvings = a.maxHalvings ?? 12;
   const hardMax = BigInt(Math.max(1, a.maxChunk));
   let range = min(BigInt(Math.max(1, a.initialChunk)), hardMax);
-  /** Largest range not yet known to fail. Only ever shrinks within a run. */
+  /** Largest range not yet known to fail. Shrinks on failure, decays back up on sustained success. */
   let ceiling = hardMax;
+  const baseProbeAfter = Math.max(1, Math.floor(a.successesBeforeProbe ?? 20));
+  const maxProbeAfter = baseProbeAfter * 1024;
+  let probeAfter = baseProbeAfter;
+  let streak = 0;
+  /** The ceiling in force before the latest raise; set while that probe is unresolved. */
+  let probeFloor: bigint | undefined;
   let cursor = a.fromBlock;
 
   while (cursor <= a.toBlock) {
@@ -179,11 +192,26 @@ export async function* iterateLogs(a: {
         const logs = await a.fetch({ fromBlock: cursor, toBlock: end });
         yield { fromBlock: cursor, toBlock: end, logs };
         cursor = end + 1n;
+        streak += 1;
+        if (probeFloor !== undefined && span > probeFloor) probeFloor = undefined;
+        if (streak >= probeAfter && ceiling < hardMax) {
+          probeFloor = ceiling;
+          ceiling = min(ceiling * 2n, hardMax);
+          streak = 0;
+        }
         // Integer 1.25x is a no-op at 1..3, so always advance by at least one.
         range = min(min(max(range + 1n, (range * 5n) / 4n), ceiling), hardMax);
         break;
       } catch (err) {
         if (!isRangeError(err)) throw err;
+
+        streak = 0;
+        // A failure wider than the pre-raise ceiling means the probe failed:
+        // back off the next one.
+        if (probeFloor !== undefined && span > probeFloor) {
+          probeAfter = Math.min(probeAfter * 2, maxProbeAfter);
+        }
+        probeFloor = undefined;
 
         const suggestion = suggestedRange(err);
         const suggestedWidth = suggestion

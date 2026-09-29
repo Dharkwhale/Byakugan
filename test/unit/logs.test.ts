@@ -354,6 +354,86 @@ describe('iterateLogs — adopting the provider suggestion', () => {
   });
 });
 
+describe('iterateLogs — the ceiling decays on sustained success', () => {
+  type Call = { span: number; ok: boolean; from: bigint };
+
+  /** Fails any span above `capAt(fromBlock)` with the Alchemy shape, suggesting exactly the cap. */
+  async function drive(o: {
+    to: bigint; capAt: (from: bigint) => bigint; probe: number; maxChunk?: number;
+  }): Promise<Call[]> {
+    const calls: Call[] = [];
+    for await (const _ of iterateLogs({
+      fetch: async ({ fromBlock, toBlock }) => {
+        const span = toBlock - fromBlock + 1n;
+        const cap = o.capAt(fromBlock);
+        const ok = span <= cap;
+        calls.push({ span: Number(span), ok, from: fromBlock });
+        if (!ok) {
+          const err = alchemyRangeError();
+          (err as Error & { details: string }).details =
+            `up to a ${cap} block range. should work: [0x${fromBlock.toString(16)}, ` +
+            `0x${(fromBlock + cap - 1n).toString(16)}]`;
+          throw err;
+        }
+        return [];
+      },
+      fromBlock: 0n, toBlock: o.to, initialChunk: 100, maxChunk: o.maxChunk ?? 100,
+      successesBeforeProbe: o.probe,
+    })) { /* drain */ }
+    return calls;
+  }
+
+  // Headline property: a limit learned in a dense region must not throttle the
+  // quiet region after it.
+  it('climbs back to maxChunk after a temporary cap lifts', async () => {
+    const calls = await drive({ to: 200_000n, capAt: (f) => (f < 300n ? 10n : 1_000_000n), probe: 4 });
+    const ok = calls.filter((c) => c.ok);
+    expect(Math.max(...ok.filter((c) => c.from < 300n).map((c) => c.span))).toBeLessThanOrEqual(10);
+    expect(Math.max(...ok.filter((c) => c.from > 100_000n).map((c) => c.span))).toBe(100);
+  });
+
+  // The measured free-tier shape: a flat cap. Probing must back off, not fire
+  // every few chunks for the whole run.
+  it('wastes only a handful of calls against a permanent flat cap', async () => {
+    const calls = await drive({ to: 4_000n, capAt: () => 10n, probe: 4, maxChunk: 2000 });
+    const failures = calls.filter((c) => !c.ok).length;
+    const successes = calls.length - failures;
+    expect(successes).toBeGreaterThanOrEqual(390);
+    expect(failures).toBeLessThan(10);
+    expect(failures).toBeGreaterThan(1);   // it does probe
+  });
+
+  it('grows sub-linearly: 8x the chunks adds only a few failures', async () => {
+    const short = (await drive({ to: 4_000n, capAt: () => 10n, probe: 4, maxChunk: 2000 })).filter((c) => !c.ok).length;
+    const long = (await drive({ to: 32_000n, capAt: () => 10n, probe: 4, maxChunk: 2000 })).filter((c) => !c.ok).length;
+    expect(long - short).toBeLessThanOrEqual(4);
+  });
+
+  it('never sends a known-bad width immediately after a failure', async () => {
+    const calls = await drive({ to: 4_000n, capAt: () => 10n, probe: 4, maxChunk: 2000 });
+    calls.forEach((c, i) => {
+      if (c.ok) return;
+      const next = calls[i + 1];
+      if (next) expect(next.span).toBeLessThanOrEqual(10);
+    });
+  });
+
+  it('doubles the probe interval after each failed probe', async () => {
+    const calls = await drive({ to: 4_000n, capAt: () => 10n, probe: 4, maxChunk: 2000 });
+    const gaps: number[] = [];
+    let run = 0;
+    let seenFirstFailure = false;
+    for (const c of calls) {
+      if (c.ok) { run += 1; continue; }
+      if (seenFirstFailure) gaps.push(run);
+      seenFirstFailure = true;
+      run = 0;
+    }
+    expect(gaps.length).toBeGreaterThanOrEqual(4);
+    expect(gaps.slice(0, 4)).toEqual([4, 8, 16, 32]);
+  });
+});
+
 describe('iterateLogs — bounded failure', () => {
   async function failAlways(o: {
     to: bigint; initialChunk: number; maxHalvings?: number; message?: string;
