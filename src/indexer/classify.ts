@@ -2,18 +2,45 @@ import { ClassifyError } from '../errors.js';
 import { ZERO_ADDRESS, type DecodedTransfer, type Kind, type TxInfo } from '../types.js';
 
 /**
+ * Throws if `value` is not already lowercase.
+ *
+ * `classify` ASSERTS its address inputs are normalised rather than
+ * normalising them itself. Addresses are supposed to arrive lowercase already
+ * — `decode.ts` lowercases `transfer.from`/`transfer.to` before this function
+ * ever sees them, and `chain/tx.ts` (Task 12) is specified to lowercase
+ * `tx.from` the same way. Defensively re-lowercasing here would let an
+ * omission in either of those places pass through unnoticed: classify would
+ * just quietly compensate and nobody would learn the upstream contract was
+ * broken. Asserting instead makes that dependency unskippable — the first
+ * real value that violates it throws here, by name, instead of being masked.
+ */
+function assertLowercase(label: string, value: string): void {
+  if (value !== value.toLowerCase()) {
+    throw new ClassifyError(
+      `${label} must already be lowercase, received "${value}". Addresses are ` +
+      'normalised at the boundary — decode.ts for transfer.from/to, chain/tx.ts for ' +
+      'tx.from. classify asserts rather than normalises, so an upstream omission fails ' +
+      'here loudly instead of being silently masked.',
+    );
+  }
+}
+
+/**
  * Classifies one transfer.
  *
  * RULE ORDER IS LOAD-BEARING. A paid mint satisfies both the mint rule and the
  * buy rule, so checking buy first would relabel every paid mint as a buy —
  * which is most of them. mint, then burn, then buy, then transfer.
  *
- * CASE IS LOAD-BEARING TOO. This runs PRE-INSERT, on viem's output, and viem
- * returns CHECKSUMMED addresses. The database's `CHECK (col = lower(col))`
- * constraints are downstream and guarantee nothing here. Comparing a
- * checksummed `tx.from` against a lowercased recipient never matches, so every
- * buy would silently become a transfer — no error, no missing row, just a
- * systematically wrong `kind`. Both sides are lowercased.
+ * CASE IS ASSERTED, NOT NORMALISED. Addresses are expected to arrive already
+ * lowercase: `decode.ts` lowercases `transfer.from`/`transfer.to`, and
+ * `chain/tx.ts` is specified to lowercase `tx.from` the same way before this
+ * function runs. `classify` checks that invariant with `assertLowercase`
+ * rather than defensively re-lowercasing, because normalising here would mask
+ * a broken upstream contract instead of surfacing it — a checksummed value
+ * reaching this function is itself the bug, and the loudest, most specific
+ * place to catch it is right here, by field name, rather than downstream as
+ * an opaque SQLite CHECK failure (or, worse, not at all).
  *
  * Known limitations, each pinned by a test:
  * - A sale paid in WETH or another ERC-20 carries `tx.value === 0n` and
@@ -46,18 +73,15 @@ export function classify(
     );
   }
 
-  // Both sides are normalised as a habit — lowercasing costs nothing — but
-  // only `to` is load-bearing. `from` is compared only against ZERO_ADDRESS,
-  // which has no letters, so no case variation of `from` changes the result;
-  // there is no test behind that half, and none is possible (see the deleted
-  // "checksummed zero address" test). `to` is compared against `tx.from` in
-  // the buy rule below, where case genuinely matters — that pairing is the
-  // one Mutant B (dropping toLowerCase on tx.from) demonstrates breaks.
-  const from = transfer.from.toLowerCase();
-  const to = transfer.to.toLowerCase();
+  assertLowercase('transfer.from', transfer.from);
+  assertLowercase('transfer.to', transfer.to);
+  assertLowercase('tx.from', tx.from);
+
+  const from = transfer.from;
+  const to = transfer.to;
 
   if (from === ZERO_ADDRESS) return 'mint';
   if (to === ZERO_ADDRESS) return 'burn';
-  if (tx.value > 0n && tx.from.toLowerCase() === to) return 'buy';
+  if (tx.value > 0n && tx.from === to) return 'buy';
   return 'transfer';
 }

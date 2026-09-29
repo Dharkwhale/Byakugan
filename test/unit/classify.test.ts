@@ -62,33 +62,51 @@ describe('classify — buy and transfer', () => {
   });
 });
 
-// THE HIGHEST-VALUE BLOCK HERE. classify runs PRE-INSERT on viem's output, and
-// viem returns CHECKSUMMED addresses. The database's lower() CHECK constraints
-// are downstream and guarantee nothing at this point. A comparison that
-// lowercases one side only never matches, so every buy silently becomes a
-// transfer — no error, no missing rows, just a wrong `kind` that looks fine.
-describe('classify — checksummed input must still match', () => {
-  it('matches a checksummed tx.from against a checksummed recipient', () => {
-    expect(classify(
-      { from: SELLER, to: BUYER_CHECKSUMMED },
+// REVERSED FROM THE ORIGINAL DESIGN, DELIBERATELY. classify used to
+// defensively lowercase its address inputs so a checksummed value would still
+// classify correctly. That masked a broken upstream contract: decode.ts and
+// chain/tx.ts are responsible for normalising addresses before classify ever
+// sees them, and if either omits it, defensive lowercasing here would quietly
+// compensate and nobody would learn. classify now ASSERTS its inputs are
+// already lowercase and throws, naming the field, instead of normalising.
+describe('classify — asserts addresses are already lowercase', () => {
+  it('throws on a checksummed tx.from', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
       tx({ from: BUYER_CHECKSUMMED, value: 10n }),
-    )).toBe('buy');
+    )).toThrow(ClassifyError);
+    expect(() => classify(
+      { from: SELLER, to: BUYER },
+      tx({ from: BUYER_CHECKSUMMED, value: 10n }),
+    )).toThrow(/tx\.from/);
   });
 
-  it('matches a checksummed tx.from against a lowercase recipient', () => {
-    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER_CHECKSUMMED, value: 10n })))
+  it('throws on a checksummed transfer.to', () => {
+    expect(() => classify(
+      { from: SELLER, to: BUYER_CHECKSUMMED },
+      tx({ from: BUYER, value: 10n }),
+    )).toThrow(ClassifyError);
+    expect(() => classify(
+      { from: SELLER, to: BUYER_CHECKSUMMED },
+      tx({ from: BUYER, value: 10n }),
+    )).toThrow(/transfer\.to/);
+  });
+
+  it('throws on a checksummed transfer.from', () => {
+    expect(() => classify(
+      { from: BUYER_CHECKSUMMED, to: BUYER },
+      tx({ from: BUYER, value: 10n }),
+    )).toThrow(ClassifyError);
+    expect(() => classify(
+      { from: BUYER_CHECKSUMMED, to: BUYER },
+      tx({ from: BUYER, value: 10n }),
+    )).toThrow(/transfer\.from/);
+  });
+
+  it('still classifies a buy when every address is already lowercase', () => {
+    expect(classify({ from: SELLER, to: BUYER }, tx({ from: BUYER, value: 10n })))
       .toBe('buy');
   });
-
-  it('matches a lowercase tx.from against a checksummed recipient', () => {
-    expect(classify({ from: SELLER, to: BUYER_CHECKSUMMED }, tx({ from: BUYER, value: 10n })))
-      .toBe('buy');
-  });
-
-  // No "checksummed zero address" test: the zero address has no letters, so
-  // ZERO_ADDRESS.toUpperCase() is a no-op and there is no case variation of
-  // it to exercise. The plain-mint test above already covers this input;
-  // the property is not merely untested here, it is untestable.
 
   it('does not match two different addresses that differ only beyond case', () => {
     expect(classify({ from: SELLER, to: BUYER }, tx({ from: SELLER, value: 10n })))
@@ -186,18 +204,33 @@ describe('classify — tx.value is a bigint, never a string or number', () => {
 
 // Documented limitation, pinned as a test so widening burn detection is a
 // deliberate edit rather than a silent behaviour change.
+//
+// FLAGGED FINDING (see task-7-report.md addendum): DEAD is deliberately
+// mixed-case ("that is how it is written"), and the first two tests below
+// used to feed it straight into `transfer.to`, relying on classify's own
+// .toLowerCase() to tolerate it. That reliance is exactly what the new
+// assert-based contract forbids, so those two now use the lowercase form —
+// the shape decode.ts actually produces before classify ever sees it — and a
+// third test asserts that the original mixed-case fixture now throws instead
+// of being silently tolerated. This was not fixed silently: flagged to the
+// coordinator before landing, per their request.
 describe('classify — burn detects the zero address only', () => {
-  it('calls a transfer to 0x…dEaD a transfer, not a burn', () => {
-    expect(classify({ from: SELLER, to: DEAD }, tx({ from: SELLER }))).toBe('transfer');
+  const deadLower = DEAD.toLowerCase() as Address;
+
+  it('calls a transfer to 0x…dead a transfer, not a burn', () => {
+    expect(classify({ from: SELLER, to: deadLower }, tx({ from: SELLER }))).toBe('transfer');
   });
 
-  it('calls a PAID transfer to 0x…dEaD a transfer too', () => {
-    expect(classify({ from: SELLER, to: DEAD }, tx({ from: ROUTER, value: 10n })))
+  it('calls a PAID transfer to 0x…dead a transfer too', () => {
+    expect(classify({ from: SELLER, to: deadLower }, tx({ from: ROUTER, value: 10n })))
       .toBe('transfer');
   });
 
-  it('is unaffected by the case of the dead address', () => {
-    const lower = DEAD.toLowerCase() as Address;
-    expect(classify({ from: SELLER, to: lower }, tx({ from: SELLER }))).toBe('transfer');
+  // The case-insensitivity this used to demonstrate is gone by design: a
+  // mixed-case dead address is now itself a bug signal (decode.ts should
+  // have normalised it), so classify throws rather than tolerating it.
+  it('throws on the conventionally-written mixed-case dead address', () => {
+    expect(() => classify({ from: SELLER, to: DEAD }, tx({ from: SELLER })))
+      .toThrow(ClassifyError);
   });
 });
