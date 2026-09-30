@@ -75,8 +75,16 @@ export interface AnvilChain {
   rpc(method: string, params?: unknown[]): Promise<unknown>;
   /** Mines exactly one block, sweeping in every pending transaction. */
   mine(): Promise<void>;
-  /** Sends a transaction WITHOUT mining it, so several can share one block. */
-  send(tx: { from: Address; to?: Address; data?: string; value?: bigint }): Promise<Hash>;
+  /**
+   * Sends a transaction WITHOUT mining it, so several can share one block.
+   *
+   * `gasPrice` is worth setting when block ORDER matters: anvil's mempool sorts by
+   * fees (its default `--order`), so equal-priced transactions keep submission
+   * order and varying the price makes the mined order deliberately differ from it.
+   */
+  send(tx: {
+    from: Address; to?: Address; data?: string; value?: bigint; gasPrice?: bigint;
+  }): Promise<Hash>;
   stop(): void;
 }
 
@@ -148,6 +156,7 @@ export async function startAnvil(a: { accounts: number }): Promise<AnvilChain> {
       if (tx.to !== undefined) params.to = tx.to;
       if (tx.data !== undefined) params.data = tx.data;
       if (tx.value !== undefined) params.value = `0x${tx.value.toString(16)}`;
+      if (tx.gasPrice !== undefined) params.gasPrice = `0x${tx.gasPrice.toString(16)}`;
       return (await rpc('eth_sendTransaction', [params])) as Hash;
     },
     stop,

@@ -92,6 +92,28 @@ collection happened to be minting the week it was measured. The break-even itsel
 (`perBlock / perTx`) is provider pricing and still needs the dashboard CU deltas; the
 fixture settles the densities the rule must sit between, not the price.
 
+## Same-block ordering
+
+The clustered block doubles as the only deterministic fixture for ordering *within*
+one block — the ambiguity flagged against `alchemy_getAssetTransfers`. Twenty mints
+share a `block_number`, so `log_index` is the only thing that can resolve them, which
+is exactly the dense mint window where ties are densest.
+
+Two details that the test would be worthless without:
+
+- **The expected order is read from the mined block, never from submission order.**
+- **Gas price rises across the twenty sends.** anvil's mempool sorts by fees (its
+  default `--order`), so equal-priced transactions keep submission order and the two
+  coincide exactly — measured on 1.5.1. While they coincide, a query that wrongly
+  assumed submission order passes, and the ordering test pins nothing. Varying the
+  price forces them apart, and the test asserts they diverge so that a future anvil
+  making them coincide again fails loudly instead of quietly weakening.
+
+Rows are also inserted in *reverse* `log_index` order, because with every row sharing
+a `block_number` an `ORDER BY` that dropped `log_index` would fall back to SQLite's
+rowid — i.e. insertion order — and coincide with the right answer if they had been
+inserted in order.
+
 ## Toolchain, pinned
 
 | tool | version | why pinned |

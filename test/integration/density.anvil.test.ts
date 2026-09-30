@@ -33,7 +33,11 @@ import {
 } from '../../src/chain/fetchStrategy.js';
 import { decodeLogs } from '../../src/indexer/decode.js';
 import { classify } from '../../src/indexer/classify.js';
-import { ZERO_ADDRESS } from '../../src/types.js';
+import { ZERO_ADDRESS, type TransferRow } from '../../src/types.js';
+import { openDb } from '../../src/db/connection.js';
+import { runMigrations } from '../../src/db/migrate.js';
+import { insertTransfers } from '../../src/db/repositories/transfers.js';
+import { firstMinters } from '../../src/db/repositories/analytics.js';
 
 const availability = anvilAvailability();
 if (!availability.ok) {
@@ -102,22 +106,34 @@ describe.skipIf(!availability.ok)('density fixture on anvil', () => {
 
   describe('the CLUSTERED extreme: N wallets, one block', () => {
     let rows: Array<{ txHash: string; blockNumber: number }>;
+    let decodedCluster: Awaited<ReturnType<typeof decodedLogsIn>>;
+    const submittedHashes: string[] = [];
     // Captured, not re-read from the head: later suites mine further blocks, and a
     // test that asked for "the current head" would drift onto one of theirs.
     let clusterBlock: bigint;
 
     beforeAll(async () => {
       // Each wallet sends its OWN mint. None is mined yet, so they all queue.
+      //
+      // GAS PRICE RISES WITH i, on purpose. anvil's mempool sorts by fees (its
+      // default --order), so equal-priced transactions would keep submission order
+      // and mined order would coincide with it — measured, on 1.5.1. Then a query
+      // that wrongly assumed submission order would pass, and the ordering test
+      // below would be pinning nothing. Varying the price forces the two apart, so
+      // reading the MINED order is the only way to get the expectation right.
       for (let i = 0; i < WALLETS; i++) {
         const wallet = chain.accounts[i + 1]!;
-        await chain.send({
+        submittedHashes.push((await chain.send({
           from: wallet, to: erc721, data: call(abi721, 'mint', [wallet]),
-        });
+          gasPrice: 1_000_000_000n + BigInt(i) * 1_000_000n,
+        })).toLowerCase());
       }
       await chain.mine();
       clusterBlock = await headNumber();
-      const decoded = await decodedLogsIn(clusterBlock);
-      rows = decoded.map((d) => ({ txHash: d.txHash, blockNumber: Number(d.blockNumber) }));
+      decodedCluster = await decodedLogsIn(clusterBlock);
+      rows = decodedCluster.map((d) => ({
+        txHash: d.txHash, blockNumber: Number(d.blockNumber),
+      }));
     }, 120_000);
 
     it('lands all N transactions in exactly one block', () => {
@@ -165,6 +181,90 @@ describe.skipIf(!availability.ok)('density fixture on anvil', () => {
     it('decodes every mint, so the density is measured over real rows', () => {
       expect(rows).toHaveLength(WALLETS);
     });
+
+    /**
+     * ORDERING INSIDE ONE BLOCK — the ambiguity flagged against
+     * `alchemy_getAssetTransfers`, and the only deterministic case available for it.
+     *
+     * `firstMinters` orders by (block_number, log_index, batch_index). With 20 mints
+     * sharing a single block, `block_number` ties on every row and `log_index` is the
+     * ONLY thing that can resolve them — which is exactly the dense mint window where
+     * ties matter most and where a missing tiebreak would go unnoticed.
+     *
+     * THE EXPECTED ORDER IS READ FROM THE MINED BLOCK, never from submission order.
+     * anvil orders transactions within a block by its own rules, so asserting the
+     * order they were sent in would pass by luck and break on an anvil upgrade — and
+     * would be pinning the test's own loop rather than the query's ORDER BY. The
+     * expectation is derived from the logs as mined, sorted by log_index.
+     *
+     * ROWS ARE INSERTED IN REVERSE log_index ORDER, deliberately. This is what makes
+     * the test able to fail: with all 20 rows sharing a block_number, an ORDER BY that
+     * dropped log_index would fall back to SQLite's rowid, i.e. insertion order. Had
+     * they been inserted in log_index order, insertion order and the correct answer
+     * would coincide and a broken ORDER BY would pass. Verified by mutation.
+     */
+    it('resolves same-block ties by log_index as MINED, not as submitted', async () => {
+      const block = (await chain.rpc('eth_getBlockByNumber', [
+        `0x${clusterBlock.toString(16)}`, true,
+      ])) as { transactions: Array<{ from: Address; hash: string; value: string }> };
+      const txByHash = new Map(block.transactions.map((t) => [t.hash.toLowerCase(), t]));
+
+      // Sanity: the block must actually contain ties to resolve, or this proves
+      // nothing about tiebreaking.
+      expect(new Set(decodedCluster.map((d) => d.blockNumber)).size).toBe(1);
+      expect(new Set(decodedCluster.map((d) => d.logIndex)).size).toBe(WALLETS);
+
+      // And mined order must actually DIFFER from submission order, or the
+      // distinction this test is named for is untested and an implementation that
+      // assumed submission order would pass. Measured on anvil 1.5.1: with equal gas
+      // prices the two coincide exactly, which is why the sends above vary the price.
+      // If a future anvil makes them coincide anyway, this fails and says so rather
+      // than quietly weakening.
+      const minedOrder = block.transactions.map((t) => t.hash.toLowerCase());
+      expect(submittedHashes).toHaveLength(WALLETS);
+      expect(minedOrder).not.toEqual(submittedHashes);
+      expect([...minedOrder].sort()).toEqual([...submittedHashes].sort());
+
+      const byLogIndex = [...decodedCluster].sort((x, y) => x.logIndex - y.logIndex);
+
+      const db = openDb(':memory:');
+      runMigrations(db);
+      const contract = erc721.toLowerCase();
+      db.prepare('INSERT INTO collections (chain_id, contract, standard) VALUES (?, ?, ?)')
+        .run(31337, contract, '721');
+
+      // Reverse order on purpose — see the note above.
+      const toInsert: TransferRow[] = [...byLogIndex].reverse().map((d) => {
+        const tx = txByHash.get(d.txHash.toLowerCase());
+        if (!tx) throw new Error(`no transaction ${d.txHash} in the mined block`);
+        const txInfo = { from: tx.from.toLowerCase() as Address, value: BigInt(tx.value) };
+        return {
+          chainId: 31337, contract, tokenId: d.tokenId.toString(),
+          amount: d.amount.toString(), fromAddr: d.from, toAddr: d.to,
+          txHash: d.txHash, blockNumber: Number(d.blockNumber), logIndex: d.logIndex,
+          batchIndex: d.batchIndex, txFrom: txInfo.from,
+          txValueWei: txInfo.value.toString(),
+          kind: classify({ from: d.from, to: d.to }, txInfo),
+        };
+      });
+      expect(insertTransfers(db, toInsert)).toBe(WALLETS);
+
+      const expectedMinters = byLogIndex.map(
+        (d) => txByHash.get(d.txHash.toLowerCase())!.from.toLowerCase(),
+      );
+      const actual = firstMinters(db, { chainId: 31337, contract, limit: WALLETS });
+
+      expect(actual.map((r) => r.minter)).toEqual(expectedMinters);
+      // And the log indices it walked really are ascending, so the assertion above
+      // is about ordering rather than about the set of minters.
+      expect(actual.map((r) => r.logIndex))
+        .toEqual([...actual.map((r) => r.logIndex)].sort((x, y) => x - y));
+      // Insertion order was the reverse, so a passing result cannot be rowid order.
+      expect(actual.map((r) => r.minter)).not.toEqual(
+        toInsert.map((r) => r.txFrom),
+      );
+      db.close();
+    }, 120_000);
   });
 
   describe('the AIRDROP extreme: one transaction, N mints', () => {
