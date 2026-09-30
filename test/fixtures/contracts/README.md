@@ -76,15 +76,41 @@ one extreme and cannot cover the other:
   what they call. Submitting many transactions quickly from one wallet gets close by
   luck and is not reproducible.
 
-So the clustered extreme is produced locally with `anvil --no-mining`: send N
-transactions, then mine one block, and the density is exact by construction. That
-needs no funded key (anvil's accounts are unlocked, so `eth_sendTransaction` works
-with no key stored here) and costs no compute units. `CLAUDE.md` schedules anvil from
-Milestone 3, but a deterministic density measurement is precisely what it is for and
-it is free to bring forward.
+So the clustered extreme is produced locally, in
+[`test/integration/density.anvil.test.ts`](../../integration/density.anvil.test.ts),
+with `anvil --no-mining`: send N transactions, mine one block, and the density is
+exact by construction. No funded key is needed — anvil's accounts are unlocked, so
+the local node signs and nothing is stored here — and it costs no compute units.
+
+`CLAUDE.md` scheduled anvil from Milestone 3, but that note is about fork tests for
+live tracking. This is a different use, it is test infrastructure rather than a
+milestone feature, and 200 wallets in one block is exactly what it is for.
 
 The resulting default is therefore derived from a **synthetic upper bound**, not from
 an observed drop — a deliberate choice, so the constant does not encode whatever
 collection happened to be minting the week it was measured. The break-even itself
 (`perBlock / perTx`) is provider pricing and still needs the dashboard CU deltas; the
 fixture settles the densities the rule must sit between, not the price.
+
+## Toolchain, pinned
+
+| tool | version | why pinned |
+|---|---|---|
+| Foundry (`anvil`, `forge`) | **1.5.1-stable** | `anvil --no-mining` semantics and the account set are what the density fixture's exactness rests on |
+| `solc` | **0.8.24** | set in `foundry.toml`, so the fixture bytecode is reproducible across machines rather than drifting with whatever compiler is installed |
+
+```
+curl -L https://foundry.paradigm.xyz | bash && foundryup --version 1.5.1
+npm run build:fixtures     # forge build, into the gitignored test/fixtures/artifacts/
+npm test
+```
+
+Artifacts are gitignored on purpose: with `solc` pinned they are reproducible, and
+committed bytecode is opaque to review in a way source is not.
+
+**Without Foundry installed the anvil suite skips and says why** — it does not fail,
+because nothing else in the suite needs a chain. Worth knowing how that message
+survives: vitest *discards* `console.*` output from a file whose every test is
+skipped, so the first version of it printed nothing at all and the skip was silent.
+It writes to `process.stderr` directly instead, which does survive. A silent skip is
+close to a deleted test.

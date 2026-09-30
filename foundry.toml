@@ -1,0 +1,17 @@
+# Foundry is TEST INFRASTRUCTURE ONLY in this repo.
+#
+# It compiles the fixture contracts in test/fixtures/contracts and runs `anvil`
+# for the deterministic density fixture. No production code path touches it, and
+# no key lives here: anvil's accounts are unlocked, so the local node signs and
+# nothing in this repo needs to.
+#
+# solc is PINNED so the fixture bytecode is reproducible. An unpinned compiler
+# would let the deployed bytecode drift between machines, which is the opposite
+# of what a deterministic fixture is for.
+[profile.default]
+src = "test/fixtures/contracts"
+out = "test/fixtures/artifacts"
+libs = []
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 200

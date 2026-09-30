@@ -19,8 +19,23 @@ asserts the config schema contains no private-key field.
 ## Stack
 
 TypeScript (`strict: true`, ESM, NodeNext), Node 20+. viem (public client
-only), grammY, better-sqlite3, zod, pino, vitest. Foundry `anvil` for fork
-tests from Milestone 3.
+only), grammY, better-sqlite3, zod, pino, vitest.
+
+Foundry is test infrastructure, pinned to **1.5.1-stable** with `solc` **0.8.24**
+in `foundry.toml`. Two distinct uses, and only the second waits for Milestone 3:
+
+- **Now:** `anvil --no-mining` for the deterministic density fixture. The
+  fetch-strategy break-even turns on transactions per block, and the expensive
+  half of that — N separate wallets landing in ONE block — cannot be produced by
+  any contract or by any public testnet; it is a property of transaction
+  bundling. Queue N transactions, mine one block, and the density is exact.
+  No key is involved: anvil's accounts are unlocked, so the local node signs.
+- **From Milestone 3:** fork tests for live tracking.
+
+The anvil suite skips with a printed reason when Foundry is absent, since nothing
+else needs a chain. Note that vitest DISCARDS `console.*` from a file whose every
+test is skipped — write skip notices to `process.stderr` directly, or the skip is
+silent, which is close to a deleted test.
 
 ## Testing rules
 

@@ -13,7 +13,8 @@
     "index": "node --env-file-if-exists=.env --import tsx src/cli/index.ts",
     "migrate": "node --env-file-if-exists=.env --import tsx src/db/migrate.ts",
     "verify:probes": "node --env-file-if-exists=.env --import tsx scripts/verify-archive-probes.ts",
-    "measure-cu": "node --env-file-if-exists=.env --import tsx scripts/measure-cu-cost.ts"
+    "measure-cu": "node --env-file-if-exists=.env --import tsx scripts/measure-cu-cost.ts",
+    "build:fixtures": "forge build"
   },
   "keywords": [],
   "author": "",
