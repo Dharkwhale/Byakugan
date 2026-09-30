@@ -64,11 +64,25 @@ comment instead of asking whether the test could fail:
   implementation, because a single-process synchronous driver cannot produce
   the interleaving that breaks it.
 
-**Still at risk:** Task 13's interrupt-and-resume test. If every log fixture
-lands inside the first chunk, the injected fault fires after everything is
-already committed and the test asserts resumption while proving none. Spread
-the fixtures across chunk boundaries and verify the partial state is genuinely
-partial.
+**Resolved, and kept here as the worked example.** Task 13's interrupt-and-resume
+test was flagged at risk: with every log fixture inside the first chunk, the
+injected fault fires after everything is already committed, and the test asserts
+resumption while proving none. What fixed it:
+
+- Eight fixtures across FOUR chunks, with the fault landing in chunk 2.
+- The row count asserted STRICTLY between zero and the total. Both bounds carry
+  weight: zero means the fault preceded all work, the total means it followed all
+  of it, and under either the test proves nothing about resuming.
+- The watermark asserted on a chunk boundary below the target.
+- A separate test guarding the FIXTURE LAYOUT, so a later edit collapsing the
+  blocks into one chunk fails loudly instead of quietly hollowing out the rest.
+- Mutation-verified: making the insert and the watermark non-atomic fails three
+  tests.
+
+The transferable part is the third and fourth points. Asserting the final state
+after a resume proves nothing — the assertion has to be that the intermediate
+state was genuinely intermediate, and something has to defend the fixture shape
+that makes it so.
 
 **Recorded gap (argued, not tested):** the `AND tx_from IS NULL` on
 `applyEnrichment`'s UPDATE. Mutation-tested; the mutant survived with 88 passed,
