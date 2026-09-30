@@ -5557,25 +5557,145 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `src/chain/deployBlock.ts`
+- Modify: `db/migrations/001_init.sql` — add `deploy_block_validated`
+- Modify: `src/db/repositories/collections.ts` — `finishBootstrap` records validation state
+- Modify: `test/unit/migrate.test.ts`, `test/unit/collections.repo.test.ts` — schema and repo assertions
 - Test: `test/unit/deployBlock.test.ts`
 
 **Interfaces:**
-- Consumes: `DeployBlockUnavailableError` (Task 1); `ChainConfig` (Task 1); `Address` (Task 1); `classifyProbeError`, `ProbeOutcome` from `src/chain/probeErrors.ts` (built in Task 1's fix round, already tested there — do not rewrite it)
+- Consumes: `DeployBlockUnavailableError` (Task 1); `ChainConfig`, `Address`, `DeployBlockSource` (Task 1); `classifyProbeError` from `src/chain/probeErrors.ts` (Task 1 — already tested, do not rewrite); `createRateLimiter` from `src/chain/rateLimit.ts` (Task 8)
 - Produces:
   - `interface CodeReader { (a: { address: Address; blockNumber: bigint }): Promise<string> }`
+  - `type ValidationOutcome = 'valid' | 'invalid' | 'unvalidatable'`
+  - `validateDeployBlock(getCode: CodeReader, address: Address, block: bigint): Promise<ValidationOutcome>`
   - `probeArchive(getCode: CodeReader, probe: { address: Address; block: number }, opts?: { attempts?: number }): Promise<boolean>`
   - `binarySearchDeployBlock(getCode: CodeReader, address: Address, safeHead: bigint): Promise<bigint>`
-  - `fetchCreationBlockFromExplorer(a: { chainId, address, apiKey, fetchFn? }): Promise<number | undefined>`
-  - `resolveDeployBlock(a: { getCode, chainId, address, safeHead, archiveProbe, override?, etherscanApiKey?, fetchFn? }): Promise<{ block: number; source: DeployBlockSource }>`
+  - `type ExplorerResult = { ok: true; block: number } | { ok: false; reason: string }`
+  - `fetchCreationBlockFromExplorer(a: { chainId: number; address: Address; apiKey: string; fetchFn?: typeof fetch; limit?: <T>(fn: () => Promise<T>) => Promise<T> }): Promise<ExplorerResult>`
+  - `resolveDeployBlock(a: { getCode; chainId; address; safeHead; archiveProbe; override?; etherscanApiKey?; fetchFn?; explorerLimit?; onWarn? }): Promise<{ block: number; source: DeployBlockSource; validated: boolean }>`
 
-- [ ] **Step 1: Write the failing test**
+---
+
+**Everything below was measured against the real explorer and the real chains before this
+plan was written. Five findings, two of which overturn the original design.**
+
+**1. `blockNumber` IS in the response, so there is no `txHash` fallback.**
+
+```
+getcontractcreation, chain 1, BAYC -> HTTP 200, status=1, message=OK
+  fields: contractAddress, contractCreator, txHash, blockNumber, timestamp,
+          contractFactory, creationBytecode
+  blockNumber = 12287507   (matches BAYC's known deploy block exactly)
+```
+
+A resolution via `eth_getTransactionByHash` is therefore dead code. If the field ever
+vanished, `Number.isInteger` already rejects it and the explorer path falls through to
+binary search — a safe degradation needing no new branch. Measured and absent beats
+speculated and present.
+
+**2. Failure arrives as HTTP 200 with the error in the BODY. Never trust the status code.**
+
+```
+no key / empty key -> HTTP 200 OK
+  {"status":"0","message":"NOTOK","result":"Missing/Invalid API Key"}
+```
+
+So `response.ok` is worthless. `status` is the signal, and `result` carries the human reason.
+Etherscan's free tier is 5 calls/second and signals rate limiting the same way, which is why
+the explorer needs **its own rate-limiter bucket** — sharing the RPC bucket would let RPC
+traffic starve explorer calls and vice versa, and their limits are unrelated.
+
+**3. Base is not covered by the free Etherscan plan.**
+
+```
+chain 8453 -> HTTP 200, status=0, NOTOK
+  "Free API access is not supported for this chain. Please upgrade your api plan
+   for full chain coverage."
+```
+
+So on Base the explorer always falls through, and the archive-guarded binary search is
+Base's **only** path. That was verified end to end against two real Base collections during
+planning: deploy blocks 1371714 and 13843719, found in 26 and 25 `getCode` calls, both
+validating (code at the block, empty at block−1) and both consistent with the earliest
+transfer ever recorded for the contract.
+
+**4. Validation has THREE outcomes, not two — and this is the finding that matters most.**
+
+```
+ethereum BAYC   getCode@12287507 -> code(33582)   getCode@12287506 -> EMPTY   VALID
+arbitrum WETH   blockNumber = 55 (PRE-NITRO)
+                getCode@55 -> THREW "Requested resource not found."
+                getCode@54 -> THREW "Requested resource not found."
+```
+
+The explorer returns a **correct** deploy block for Arbitrum WETH that simply cannot be
+checked, because the provider does not serve pre-Nitro state. Treating that as a validation
+failure would discard a correct answer and fall through to binary search — which also cannot
+run there, since the archive probe disables it. The collection would be permanently
+unindexable despite a known-good deploy block.
+
+So:
+
+| Outcome | Meaning | Explorer | Override | Binary search |
+|---|---|---|---|---|
+| `valid` | code at block, empty at block−1 | accept | accept | accept |
+| `invalid` | code missing at block, or present at block−1 | **warn, fall through** | **throw** | **throw** |
+| `unvalidatable` | `getCode` throws `state_unavailable` | accept, unvalidated | accept, unvalidated | n/a |
+
+An override that fails validation fails the run loudly, because it is an explicit human claim
+and a typo there silently starts the index in the wrong place. A transient `getCode` error is
+neither outcome — it rethrows, and the limiter and retry deal with it.
+
+**5. Validation state is recorded in the ROW, not just a log line.** A new column
+`deploy_block_validated INTEGER NOT NULL DEFAULT 0 CHECK (deploy_block_validated IN (0,1))`.
+Chosen over multiplying `deploy_block_source` into `explorer_unvalidated`,
+`binary_search_unvalidated` and so on: source stays orthogonal to validation state, the CHECK
+stays at three values, and "show me every unvalidated deploy block" is a trivial query.
+Note only two of the three outcomes are ever stored — `invalid` never becomes a row, because
+the explorer falls through and the other sources throw.
+
+Editing `001_init.sql` rather than adding `002` was verified safe: no `data/*.db` exists and
+no `.db` file exists anywhere in the repo, so no checksum has ever been recorded. Same
+precedent and same verification as the Task 3 lowercase CHECKs. `finishBootstrap` gains a
+`validated: boolean` parameter, and Task 3's schema test and Task 4's repository test are
+updated in the same commit.
+
+
+- [ ] **Step 1: Add the column to `db/migrations/001_init.sql`**
+
+In the `collections` table, immediately after `deploy_block_source`:
+
+```sql
+  -- 1 when the deploy block was checked against the chain (code at the block,
+  -- no code at block-1); 0 when it was accepted without validation because the
+  -- provider could not serve state for that block. A block that FAILED
+  -- validation never reaches a row: the explorer falls through and the other
+  -- sources throw. Kept separate from deploy_block_source so source stays
+  -- orthogonal to validation state.
+  deploy_block_validated INTEGER NOT NULL DEFAULT 0
+                           CHECK (deploy_block_validated IN (0, 1)),
+```
+
+Update `test/unit/migrate.test.ts`'s column assertions to cover it (type INTEGER, default 0,
+and that 2 is rejected by the CHECK). Assert the CHECK by attempting an insert, not by
+grepping the schema.
+
+- [ ] **Step 2: Thread it through `finishBootstrap`**
+
+`src/db/repositories/collections.ts` — add `validated: boolean` to the argument object and
+`deploy_block_validated = @validated` to the UPDATE, converting to 0/1. Update
+`test/unit/collections.repo.test.ts`: existing calls pass `validated: true`, and add a test
+that an unvalidated bootstrap stores 0 and a validated one stores 1, read back from the row.
+
+- [ ] **Step 3: Write the failing test for `src/chain/deployBlock.ts`**
 
 `test/unit/deployBlock.test.ts`:
 
 ```ts
 import { describe, expect, it, vi } from 'vitest';
 import {
-  binarySearchDeployBlock, probeArchive, resolveDeployBlock,
+  binarySearchDeployBlock, fetchCreationBlockFromExplorer, probeArchive,
+  resolveDeployBlock, validateDeployBlock,
 } from '../../src/chain/deployBlock.js';
 import { DeployBlockUnavailableError } from '../../src/errors.js';
 import type { Address } from '../../src/types.js';
@@ -5588,15 +5708,59 @@ const archiveNode = (deployedAt: bigint) =>
   async ({ blockNumber }: { blockNumber: bigint }) =>
     (blockNumber >= deployedAt ? '0xdeadbeef' : '0x');
 
-/** A pruned node: only recent state is available, older calls return empty. */
+/** A pruned node: only recent state is served, older calls come back empty. */
 const prunedNode = (horizon: bigint) =>
   async ({ blockNumber }: { blockNumber: bigint }) =>
     (blockNumber >= horizon ? '0xdeadbeef' : '0x');
 
+/** Measured Arbitrum pre-Nitro shape: the call THROWS rather than returning empty. */
+const stateUnavailable = async () => { throw new Error('Requested resource not found.'); };
+const transientFailure = async () => { throw new Error('The request took too long to respond.'); };
+
+const explorerOk = (block: number) => async () =>
+  new Response(JSON.stringify({ status: '1', message: 'OK', result: [{ blockNumber: String(block) }] }));
+/** Measured: failures arrive as HTTP 200 with the reason in the body. */
+const explorerNotOk = (reason: string) => async () =>
+  new Response(JSON.stringify({ status: '0', message: 'NOTOK', result: reason }), { status: 200 });
+
+describe('validateDeployBlock', () => {
+  it('is valid when code exists at the block and not before it', async () => {
+    expect(await validateDeployBlock(archiveNode(100n), ADDRESS, 100n)).toBe('valid');
+  });
+
+  it('is invalid when there is no code at the block', async () => {
+    expect(await validateDeployBlock(archiveNode(200n), ADDRESS, 100n)).toBe('invalid');
+  });
+
+  it('is invalid when code already exists at block-1', async () => {
+    expect(await validateDeployBlock(archiveNode(50n), ADDRESS, 100n)).toBe('invalid');
+  });
+
+  it('is valid at block 0, where there is no previous block to check', async () => {
+    expect(await validateDeployBlock(archiveNode(0n), ADDRESS, 0n)).toBe('valid');
+  });
+
+  // The measured Arbitrum pre-Nitro case. "Cannot check" must not read as "wrong".
+  it('is unvalidatable when the provider cannot serve state for the block', async () => {
+    expect(await validateDeployBlock(stateUnavailable, ADDRESS, 55n)).toBe('unvalidatable');
+  });
+
+  it('is unvalidatable when only the block-1 call cannot be served', async () => {
+    const getCode = async ({ blockNumber }: { blockNumber: bigint }) => {
+      if (blockNumber === 99n) throw new Error('missing trie node');
+      return '0xdeadbeef';
+    };
+    expect(await validateDeployBlock(getCode, ADDRESS, 100n)).toBe('unvalidatable');
+  });
+
+  it('rethrows a transient failure rather than calling it unvalidatable', async () => {
+    await expect(validateDeployBlock(transientFailure, ADDRESS, 100n)).rejects.toThrow(/too long/);
+  });
+});
+
 describe('binarySearchDeployBlock', () => {
   it('finds the exact deploy block', async () => {
-    expect(await binarySearchDeployBlock(archiveNode(12287507n), ADDRESS, 21000000n))
-      .toBe(12287507n);
+    expect(await binarySearchDeployBlock(archiveNode(12287507n), ADDRESS, 21000000n)).toBe(12287507n);
   });
 
   it('finds a deploy at block zero', async () => {
@@ -5612,6 +5776,7 @@ describe('binarySearchDeployBlock', () => {
       .rejects.toThrow(DeployBlockUnavailableError);
   });
 
+  // Measured: two real Base collections resolved in 26 and 25 calls.
   it('uses a logarithmic number of calls', async () => {
     const getCode = vi.fn(archiveNode(12287507n));
     await binarySearchDeployBlock(getCode, ADDRESS, 21000000n);
@@ -5624,67 +5789,75 @@ describe('probeArchive', () => {
     expect(await probeArchive(archiveNode(4000000n), PROBE)).toBe(true);
   });
 
-  // The failure this guard exists for: a pruned node returns empty for old
-  // blocks, which a naive binary search reads as "not deployed yet" and
-  // converges on the pruning horizon instead of the real deploy block.
   it('fails on a pruned node', async () => {
     expect(await probeArchive(prunedNode(20000000n), PROBE)).toBe(false);
   });
+});
 
-  // A pruned node usually THROWS rather than returning empty bytes, and the
-  // wording varies by client. Both shapes must mean the same thing: probe
-  // fails, binary search is disabled, the run continues.
-  it.each([
-    'missing trie node 0xabc (path )',
-    'state not available for block 100000',
-    'Requested resource not found.',
-    'header not found',
-  ])('treats a thrown state-unavailable error as a failed probe: %s', async (message) => {
-    const throwing = async () => { throw new Error(message); };
-    expect(await probeArchive(throwing, PROBE)).toBe(false);
+describe('fetchCreationBlockFromExplorer', () => {
+  it('returns the block from a successful response', async () => {
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: 'K', fetchFn: explorerOk(12287507) as unknown as typeof fetch,
+    });
+    expect(r).toEqual({ ok: true, block: 12287507 });
   });
 
-  it('does not throw out of probeArchive on any error', async () => {
-    const throwing = async () => { throw new Error('missing trie node'); };
-    await expect(probeArchive(throwing, PROBE)).resolves.toBe(false);
+  // Measured: HTTP 200 with the failure in the body. Checking response.ok is useless.
+  it('treats a status-0 body as a failure despite HTTP 200', async () => {
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: 'K',
+      fetchFn: explorerNotOk('Missing/Invalid API Key') as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
   });
 
-  // A timeout is not evidence about archive capability, so it is retried
-  // before the probe gives up — otherwise one slow cold read would wrongly
-  // disable deploy-block search for the whole chain.
-  it('retries a transient error, then succeeds', async () => {
-    let calls = 0;
-    const flaky = async ({ blockNumber }: { blockNumber: bigint }) => {
-      calls += 1;
-      if (calls === 1) throw new Error('The request took too long to respond.');
-      return blockNumber >= 4000000n ? '0xdeadbeef' : '0x';
-    };
-    expect(await probeArchive(flaky, PROBE, { attempts: 3 })).toBe(true);
-    expect(calls).toBe(2);
+  it('carries the provider reason so the warning is actionable', async () => {
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 8453, address: ADDRESS, apiKey: 'K',
+      fetchFn: explorerNotOk('Free API access is not supported for this chain.') as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/not supported for this chain/);
   });
 
-  it('gives up after the attempt cap on a persistently transient error', async () => {
-    let calls = 0;
-    const timingOut = async () => {
-      calls += 1;
-      throw new Error('ETIMEDOUT');
-    };
-    expect(await probeArchive(timingOut, PROBE, { attempts: 3 })).toBe(false);
-    expect(calls).toBe(3);
+  it('fails when the response has no usable blockNumber', async () => {
+    const noBlock = async () =>
+      new Response(JSON.stringify({ status: '1', result: [{ txHash: '0xabc' }] }));
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: 'K', fetchFn: noBlock as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
   });
 
-  it('does not retry a state-unavailable error — it is a verdict, not a blip', async () => {
-    let calls = 0;
-    const pruned = async () => {
-      calls += 1;
-      throw new Error('missing trie node');
-    };
-    expect(await probeArchive(pruned, PROBE, { attempts: 3 })).toBe(false);
-    expect(calls).toBe(1);
+  it('fails without throwing when the request itself errors', async () => {
+    const boom = async () => { throw new Error('ECONNRESET'); };
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: 'K', fetchFn: boom as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  // The URL carries the API key. It must never reach a reason string.
+  it('never leaks the api key into the failure reason', async () => {
+    const boom = async () => { throw new Error('connect failed to https://api.etherscan.io/v2/api?apikey=SUPERSECRET'); };
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: 'SUPERSECRET', fetchFn: boom as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).not.toContain('SUPERSECRET');
+  });
+
+  it('routes the call through the injected limiter', async () => {
+    const limit = vi.fn(async <T>(fn: () => Promise<T>) => fn());
+    await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: 'K',
+      fetchFn: explorerOk(1) as unknown as typeof fetch, limit,
+    });
+    expect(limit).toHaveBeenCalledTimes(1);
   });
 });
 
-describe('resolveDeployBlock', () => {
+describe('resolveDeployBlock — precedence, each source failing in turn', () => {
   const base = {
     getCode: archiveNode(12287507n),
     chainId: 1,
@@ -5693,34 +5866,74 @@ describe('resolveDeployBlock', () => {
     archiveProbe: PROBE,
   };
 
-  it('prefers an explicit override and makes no chain call', async () => {
-    const getCode = vi.fn(archiveNode(12287507n));
-    const result = await resolveDeployBlock({ ...base, getCode, override: 999 });
-    expect(result).toEqual({ block: 999, source: 'override' });
-    expect(getCode).not.toHaveBeenCalled();
+  it('prefers a validated override and makes no chain call beyond validation', async () => {
+    const r = await resolveDeployBlock({ ...base, override: 12287507 });
+    expect(r).toEqual({ block: 12287507, source: 'override', validated: true });
   });
 
-  it('falls back to the explorer when no override is given', async () => {
-    const fetchFn = vi.fn(async () => new Response(JSON.stringify({
-      status: '1', result: [{ blockNumber: '12287507' }],
-    })));
-    const result = await resolveDeployBlock({
-      ...base, etherscanApiKey: 'KEY', fetchFn: fetchFn as unknown as typeof fetch,
+  // An override is an explicit human claim and the likeliest place for a typo.
+  it('throws when an override fails validation, rather than falling through', async () => {
+    await expect(resolveDeployBlock({ ...base, override: 999 }))
+      .rejects.toThrow(DeployBlockUnavailableError);
+  });
+
+  it('says the override was rejected and why', async () => {
+    await expect(resolveDeployBlock({ ...base, override: 999 }))
+      .rejects.toThrow(/override|--deploy-block/i);
+  });
+
+  it('accepts an unvalidatable override, recording it as unvalidated', async () => {
+    const r = await resolveDeployBlock({ ...base, getCode: stateUnavailable, override: 55 });
+    expect(r).toEqual({ block: 55, source: 'override', validated: false });
+  });
+
+  it('uses the explorer when there is no override', async () => {
+    const r = await resolveDeployBlock({
+      ...base, etherscanApiKey: 'K', fetchFn: explorerOk(12287507) as unknown as typeof fetch,
     });
-    expect(result).toEqual({ block: 12287507, source: 'explorer' });
+    expect(r).toEqual({ block: 12287507, source: 'explorer', validated: true });
   });
 
-  it('falls through to binary search when the explorer has no answer', async () => {
-    const fetchFn = async () => new Response(JSON.stringify({ status: '0', result: [] }));
-    const result = await resolveDeployBlock({
-      ...base, etherscanApiKey: 'KEY', fetchFn: fetchFn as unknown as typeof fetch,
+  it('accepts an unvalidatable explorer answer as unvalidated — the Arbitrum pre-Nitro case', async () => {
+    const r = await resolveDeployBlock({
+      ...base, getCode: stateUnavailable, etherscanApiKey: 'K',
+      fetchFn: explorerOk(55) as unknown as typeof fetch,
     });
-    expect(result).toEqual({ block: 12287507, source: 'binary_search' });
+    expect(r).toEqual({ block: 55, source: 'explorer', validated: false });
   });
 
-  it('binary searches when the archive probe passes and no explorer key is set', async () => {
+  // Unlike an override, an explorer answer that fails validation is not a human
+  // claim — warn and try the next source.
+  it('warns and falls through when the explorer answer fails validation', async () => {
+    const onWarn = vi.fn();
+    const r = await resolveDeployBlock({
+      ...base, etherscanApiKey: 'K', fetchFn: explorerOk(999) as unknown as typeof fetch, onWarn,
+    });
+    expect(r).toEqual({ block: 12287507, source: 'binary_search', validated: true });
+    expect(onWarn).toHaveBeenCalled();
+  });
+
+  it('warns and falls through when the explorer itself fails', async () => {
+    const onWarn = vi.fn();
+    const r = await resolveDeployBlock({
+      ...base, etherscanApiKey: 'K',
+      fetchFn: explorerNotOk('Free API access is not supported for this chain.') as unknown as typeof fetch,
+      onWarn,
+    });
+    expect(r.source).toBe('binary_search');
+    expect(onWarn.mock.calls.flat().join(' ')).toMatch(/not supported for this chain/);
+  });
+
+  it('skips the explorer entirely when no api key is configured', async () => {
+    const fetchFn = vi.fn(explorerOk(1) as unknown as typeof fetch);
+    const r = await resolveDeployBlock({ ...base, fetchFn });
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(r.source).toBe('binary_search');
+  });
+
+  it('binary searches when the archive probe passes', async () => {
     expect(await resolveDeployBlock(base)).toEqual({
-      block: 12287507, source: 'binary_search',
+      block: 12287507, source: 'binary_search', validated: true,
     });
   });
 
@@ -5729,167 +5942,119 @@ describe('resolveDeployBlock', () => {
       .rejects.toThrow(DeployBlockUnavailableError);
   });
 
+  // All four sources unavailable.
   it('names both escape hatches when nothing can resolve the block', async () => {
-    await expect(resolveDeployBlock({ ...base, getCode: prunedNode(20000000n) }))
-      .rejects.toThrow(/--deploy-block|ETHERSCAN_API_KEY/);
+    const onWarn = vi.fn();
+    const attempt = resolveDeployBlock({
+      ...base, getCode: prunedNode(20000000n), etherscanApiKey: 'K',
+      fetchFn: explorerNotOk('Max rate limit reached') as unknown as typeof fetch, onWarn,
+    });
+    await expect(attempt).rejects.toThrow(DeployBlockUnavailableError);
+    await expect(attempt).rejects.toThrow(/--deploy-block/);
+    await expect(attempt).rejects.toThrow(/ETHERSCAN_API_KEY/);
+  });
+
+  it('records which source won, for every source', async () => {
+    const o = await resolveDeployBlock({ ...base, override: 12287507 });
+    const e = await resolveDeployBlock({
+      ...base, etherscanApiKey: 'K', fetchFn: explorerOk(12287507) as unknown as typeof fetch });
+    const b = await resolveDeployBlock(base);
+    expect([o.source, e.source, b.source]).toEqual(['override', 'explorer', 'binary_search']);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 4: Write `src/chain/deployBlock.ts`**
 
-Run: `npx vitest run test/unit/deployBlock.test.ts`
-Expected: FAIL — cannot resolve `../../src/chain/deployBlock.js`.
+Implement exactly the precedence and validation matrix in the header. Points that are easy to
+get wrong:
 
-- [ ] **Step 3: Write `src/chain/deployBlock.ts`**
+- `validateDeployBlock` must classify a thrown error with `classifyProbeError` and return
+  `'unvalidatable'` only for `state_unavailable`; a `transient` error rethrows.
+- `fetchCreationBlockFromExplorer` must parse `status` from the body and must never place the
+  request URL (which carries the API key) into a `reason`. Build reasons from
+  `result`/`message` only, and from an error's `message` with the key stripped.
+- The explorer call goes through the injected `limit`, which the caller supplies as a
+  **separate** 5-per-second bucket: `createRateLimiter({ capacity: 5, refillPerSec: 5 })`.
+  Do not reuse the chain's RPC limiter — their limits are unrelated, and sharing one lets
+  either starve the other.
+- An override that validates `'invalid'` throws; an explorer answer that validates
+  `'invalid'` warns via `onWarn` and falls through.
+- Binary search runs only when `probeArchive` passes, and its result is validated too.
 
-```ts
-import { DeployBlockUnavailableError } from '../errors.js';
-import { classifyProbeError } from './probeErrors.js';
-import type { Address, DeployBlockSource } from '../types.js';
+- [ ] **Step 5: Run the tests and typecheck**
 
-export interface CodeReader {
-  (a: { address: Address; blockNumber: bigint }): Promise<string>;
-}
+`npx vitest run test/unit/deployBlock.test.ts test/unit/migrate.test.ts test/unit/collections.repo.test.ts && npm run typecheck`, then `npm test`.
 
-const hasCode = (code: string): boolean => code !== '0x' && code.length > 2;
+- [ ] **Step 6: Mutation-verify the four guards — mandatory**
 
-/**
- * Confirms the node serves historical state.
- *
- * Most non-archive RPCs prune old state and return empty rather than erroring,
- * so a binary search against them converges on the pruning horizon and reports
- * a confidently wrong deploy block. The probe is a contract known to have
- * existed at `probe.block` on this chain: empty code there means pruned.
- */
-export async function probeArchive(
-  getCode: CodeReader,
-  probe: { address: Address; block: number },
-  opts: { attempts?: number } = {},
-): Promise<boolean> {
-  const attempts = Math.max(1, opts.attempts ?? 3);
+In a scratch file OUTSIDE `src/`:
 
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      const code = await getCode({ address: probe.address, blockNumber: BigInt(probe.block) });
-      return hasCode(code);
-    } catch (err) {
-      // A pruned node throws rather than returning empty bytes, with wording
-      // that varies by client. That is a verdict — stop and report failure.
-      if (classifyProbeError(err) === 'state_unavailable') return false;
-      // A timeout says nothing about archive capability, so retry rather than
-      // wrongly disabling deploy-block search for the whole chain.
-      if (attempt === attempts) return false;
-    }
-  }
-  return false;
-}
+- **A — collapse `unvalidatable` into `invalid`.** Expected: the Arbitrum pre-Nitro tests
+  fail. Report what `resolveDeployBlock` does for a `stateUnavailable` node with a correct
+  explorer answer — my expectation is `DeployBlockUnavailableError`, i.e. a correct block
+  discarded and the collection unindexable. Confirm or correct that.
+- **B — make an invalid override fall through instead of throwing.** Expected: the override
+  tests fail. Report which block and source it silently resolves to instead, since that is
+  the wrong-start-block scenario.
+- **C — trust `response.ok` instead of the body `status`.** Expected: the status-0 tests fail.
+  Report what `fetchCreationBlockFromExplorer` returns for the measured
+  `{"status":"0","result":"Missing/Invalid API Key"}` body — my expectation is
+  `{ ok: true, block: NaN }` or similar nonsense reaching validation.
+- **D — skip validation of the binary-search result.** Expected: report whether any test
+  fails at all. If none does, say so — it would mean binary-search validation is unpinned,
+  and I would rather know than assume.
 
-/** Lowest block at which the address has code. Assumes archive state. */
-export async function binarySearchDeployBlock(
-  getCode: CodeReader,
-  address: Address,
-  safeHead: bigint,
-): Promise<bigint> {
-  if (!hasCode(await getCode({ address, blockNumber: safeHead }))) {
-    throw new DeployBlockUnavailableError(
-      `${address} has no code at block ${safeHead}; it is not deployed, or was self-destructed.`,
-    );
-  }
+- [ ] **Step 7: Verify against the real explorer and chains — do not skip**
 
-  let lo = 0n;
-  let hi = safeHead;
-  while (lo < hi) {
-    const mid = lo + (hi - lo) / 2n;
-    if (hasCode(await getCode({ address, blockNumber: mid }))) hi = mid;
-    else lo = mid + 1n;
-  }
-  return lo;
-}
+The unit tests use captured shapes. Confirm they still hold, with a throwaway script (delete
+it afterwards; scrub everything through `deriveSecretTokens`/`scrubSecrets`, and never print
+the API key or an RPC URL):
 
-/** Etherscan V2 is one multichain endpoint taking a chainid parameter. */
-export async function fetchCreationBlockFromExplorer(a: {
-  chainId: number;
-  address: Address;
-  apiKey: string;
-  fetchFn?: typeof fetch;
-}): Promise<number | undefined> {
-  const doFetch = a.fetchFn ?? fetch;
-  const url =
-    `https://api.etherscan.io/v2/api?chainid=${a.chainId}` +
-    `&module=contract&action=getcontractcreation&contractaddresses=${a.address}` +
-    `&apikey=${a.apiKey}`;
-  try {
-    const response = await doFetch(url);
-    if (!response.ok) return undefined;
-    const body = (await response.json()) as {
-      status?: string;
-      result?: Array<{ blockNumber?: string }>;
-    };
-    const blockNumber = body.result?.[0]?.blockNumber;
-    if (body.status !== '1' || !blockNumber) return undefined;
-    const parsed = Number(blockNumber);
-    return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
+- chain 1, BAYC: explorer returns `status: '1'` and `blockNumber` 12287507, and
+  `validateDeployBlock` returns `'valid'`
+- chain 8453, any address: explorer returns `status: '0'` with the free-plan message, so
+  `resolveDeployBlock` falls through to binary search
+- chain 42161, WETH `0x82af49447d8a07e3bd95bd0d56f35241523fbab1`: explorer returns
+  `blockNumber` 55 and `validateDeployBlock` returns `'unvalidatable'`
+- chain 8453, `0x827922686190790b37229fd06084350e74485b72`: `resolveDeployBlock` yields
+  13843719 via `binary_search` with `validated: true`
 
-export async function resolveDeployBlock(a: {
-  getCode: CodeReader;
-  chainId: number;
-  address: Address;
-  safeHead: bigint;
-  archiveProbe: { address: Address; block: number };
-  override?: number;
-  etherscanApiKey?: string;
-  fetchFn?: typeof fetch;
-}): Promise<{ block: number; source: DeployBlockSource }> {
-  if (a.override !== undefined) {
-    return { block: a.override, source: 'override' };
-  }
+Report each. If any differs, the captured fixtures need updating — say so rather than
+loosening a predicate.
 
-  if (a.etherscanApiKey) {
-    const fromExplorer = await fetchCreationBlockFromExplorer({
-      chainId: a.chainId,
-      address: a.address,
-      apiKey: a.etherscanApiKey,
-      fetchFn: a.fetchFn,
-    });
-    if (fromExplorer !== undefined) {
-      return { block: fromExplorer, source: 'explorer' };
-    }
-  }
-
-  if (!(await probeArchive(a.getCode, a.archiveProbe))) {
-    throw new DeployBlockUnavailableError(
-      `RPC for chain ${a.chainId} does not serve archive state, so the deploy block for ` +
-      `${a.address} cannot be found by binary search (it would converge on the pruning ` +
-      'horizon and report a wrong block). Pass --deploy-block, or set ETHERSCAN_API_KEY.',
-    );
-  }
-
-  const block = await binarySearchDeployBlock(a.getCode, a.address, a.safeHead);
-  return { block: Number(block), source: 'binary_search' };
-}
-```
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `npx vitest run test/unit/deployBlock.test.ts && npm run typecheck`
-Expected: PASS, 15 tests.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/chain/deployBlock.ts test/unit/deployBlock.test.ts
-git commit -m "feat: deploy-block resolution guarded by an archive-state probe
+git add src/chain/deployBlock.ts test/unit/deployBlock.test.ts db/migrations/001_init.sql \
+        src/db/repositories/collections.ts test/unit/migrate.test.ts test/unit/collections.repo.test.ts
+git commit -m "feat: deploy-block resolution with three-outcome validation
 
-Precedence: explicit override, Etherscan V2 creation block, then binary
-search only when the archive probe passes. A pruned node returns empty
-code for old blocks, which a naive search reads as 'not yet deployed'
-and converges on the pruning horizon; the probe makes that fail loudly
-instead, naming both escape hatches.
+Measured against the real explorer and chains before designing.
+
+blockNumber IS present in getcontractcreation (12287507 for BAYC), so the
+eth_getTransactionByHash fallback is dead code and is not built; an absent
+field already falls through via the integer guard.
+
+Failures arrive as HTTP 200 with the reason in the body, so status is
+parsed and response.ok is ignored. The explorer runs on its own 5/s
+bucket, never the RPC one.
+
+Base is not covered by the free Etherscan plan, so the archive-guarded
+binary search is Base's only path — verified end to end against two real
+Base collections (deploy 1371714 and 13843719, 26 and 25 getCode calls,
+both validating and both consistent with the earliest transfer recorded).
+
+Validation has THREE outcomes. Arbitrum WETH's deploy block is 55,
+pre-Nitro, and the provider cannot serve state there: the explorer returns
+a CORRECT block that cannot be checked. Collapsing that into 'invalid'
+would discard it and fall through to a binary search the archive probe has
+already disabled, leaving the collection permanently unindexable. So
+unvalidatable is accepted and recorded as unvalidated, invalid falls
+through for the explorer and throws for an override, and a transient error
+rethrows.
+
+deploy_block_validated records which, in the row rather than a log line.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
