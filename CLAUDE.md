@@ -58,6 +58,13 @@ partial.
 When a test cannot be made to fail against the mutant, say so and record the
 gap. An honest "argued, not tested" comment beats a contrived pass.
 
+**Mutation work never edits the working tree in place.** Put the mutant on a
+branch or a stash, so restoring is `git checkout`/`git stash pop` rather than a
+manual copy that can be forgotten. This rule exists because a manual restore
+was forgotten once and a scrubbing guard sat mutated in the working tree until
+it was noticed. Same structural fix as scrubbing at the boundary: remove the
+step that depends on remembering.
+
 ### Derive expectations from the spec, never from the fixture
 
 When a fixture is hand-authored — ABI-encoded log data, a hex blob, a
