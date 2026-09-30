@@ -7186,231 +7186,167 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 15: Real-chain fixtures, integration tests, and README
+### Task 15 (RESCOPED): README and a real-provider smoke test
+
+**Rescoped on 2026-09-30**, after the anvil fixtures landed. What the original task set
+out to do is now mostly done by other means, and saying so is cheaper than building it
+twice:
+
+| original step | status |
+|---|---|
+| `scripts/capture-fixtures.ts` | **Dropped.** Its purpose was "so unit tests stay offline and deterministic". `test/integration/*.anvil.test.ts` gives that with contracts we control and expectations derived from the spec. Captured JSON would be a second fixture mechanism for the same job. |
+| choose a collection with a *short span* | **Dropped as a constraint.** It existed so a full unbounded backfill would finish. `--to-block` bounds the run instead, so span no longer governs test cost. |
+| `backfill.integration.test.ts` with `REPLACE_ME` | **Superseded** by `backfill.anvil.test.ts` (bootstrap, bounded run, resume, `firstMinters` in mined order) and `density.anvil.test.ts`. |
+| run the full suite | Not a task. |
+| README | **Outstanding.** Nothing else touches it, and it has no external dependency. |
+
+What remains is two things: the README, and a smoke test for the three properties a local
+chain **structurally cannot have**. Those three are worth the effort because they are
+where this project's worst bugs have actually been:
+
+1. **A range cap.** anvil has none, so `iterateLogs`' shrink/ceiling/decay path only ever
+   meets synthetic errors. The 10-block cap was itself a surprise discovery.
+2. **A credential in the URL.** anvil's URL has no key, so end-to-end scrubbing is covered
+   only by a fake-key process test. A real key in a real viem dump is the exact shape that
+   leaked once.
+3. **A rate limit.** The token bucket never meets a real 429 locally.
+
+**The Base Sepolia deploy is NOT a dependency.** A bounded run against an existing real
+collection covers real-provider shape completely. The deploy's only remaining value is a
+contract whose entire history is small and known, which is a convenience for exact
+assertions rather than a requirement, so it stays optional indefinitely.
 
 **Files:**
-- Create: `scripts/capture-fixtures.ts`, `test/integration/backfill.integration.test.ts`, `README.md`
-- Create: `test/fixtures/real-<chain>-<contract>.json` (captured)
+- Create: `README.md`
+- Create: `test/integration/smoke.provider.test.ts`
+- Already created: `scripts/find-smoke-collection.ts` (the selection probe, kept as a tool)
 
-**Interfaces:**
-- Consumes: everything above
-- Produces: no new exports — this task proves the milestone
-
-This task needs RPC keys in `.env`. Do not hardcode any collection value until it has been printed and confirmed against a block explorer.
-
-- [ ] **Step 1: Write the fixture capture script**
-
-`scripts/capture-fixtures.ts`:
-
-```ts
-/**
- * Captures real logs and txs so unit tests stay offline and deterministic.
- * Usage: npx tsx scripts/capture-fixtures.ts --chain 8453 --contract 0x… --blocks 5
- */
-import { writeFileSync } from 'node:fs';
-import { getChainClient } from '../src/chain/client.js';
-import { loadConfig } from '../src/config.js';
-import { parseArgs } from '../src/cli/args.js';
-import { TRANSFER_TOPICS } from '../src/indexer/decode.js';
-import type { Address } from '../src/types.js';
-
-const config = loadConfig();
-const args = parseArgs(process.argv.slice(2).filter((_, i, a) => {
-  const prev = a[i - 1];
-  return prev !== '--blocks' && a[i] !== '--blocks';
-}), config.defaultChainId);
-
-const { client } = getChainClient(args.chainId, config);
-const address = args.contract as Address;
-
-const deployBlock = BigInt(args.deployBlock ?? 0);
-const logs = await client.getLogs({
-  address,
-  fromBlock: deployBlock,
-  toBlock: deployBlock + 200n,
-  topics: [TRANSFER_TOPICS[args.standard ?? '721']],
-});
-
-const serialized = JSON.stringify(
-  logs,
-  (_key, value) => (typeof value === 'bigint' ? value.toString() : value),
-  2,
-);
-const out = `test/fixtures/real-${args.chainId}-${args.contract}.json`;
-writeFileSync(out, serialized);
-process.stdout.write(`wrote ${logs.length} logs to ${out}\n`);
-```
-
-- [ ] **Step 2: Choose and verify the test collection**
-
-Run a discovery pass and **print, do not hardcode**:
-
-```bash
-npx tsx scripts/capture-fixtures.ts --chain 8453 --contract <candidate> --standard 721
-npm run index -- --chain 8453 --contract <candidate>
-```
-
-Then print, for the candidate: deploy block, deploy-block source, first mint tx hash, mint count, burn count, and whether ERC-721 Enumerable is supported. **Choosing the collection — constrained by a measured provider limit.**
-
-The configured account caps `eth_getLogs` at **10 blocks**, flat. Measured: a query against
-an address that has never emitted anything still caps at 10 on all three chains, and the
-provider suggests 10 regardless of the span requested; dense mint window and quiet recent
-window behave identically. So it is a plan-tier cap, not a result-density limit.
-
-Runtime is therefore governed by the `deployBlock -> head` SPAN, not by supply. Pick for a
-short span, not merely a small collection:
-
-- supply in the low thousands, minted over a short block span
-- **deployed recently**, so the span is tens of thousands of blocks rather than millions. At
-  10 blocks per request and 25 rps: 50k blocks is ~5k requests (~3 minutes); a year-old
-  mainnet collection is ~263k requests (~3 hours); a year-old Arbitrum collection is ~11M
-  requests (~5 days)
-- non-burnable and fully minted, so the supply assertion is stable
-
-A larger or older collection buys nothing here — this test proves pipeline correctness, not
-throughput.
-
-**Stop here and give the user the explorer links** for the deploy block and the first mint tx hash. Only after they confirm, hardcode the values into the integration test constants below. Do not proceed on your own verification alone — the milestone's acceptance criteria say the user verifies this.
-
-- [ ] **Step 3: Write the integration test**
-
-`test/integration/backfill.integration.test.ts`. Replace each `REPLACE_ME` with a user-confirmed value from Step 2.
-
-```ts
-import { describe, expect, it } from 'vitest';
-import { parseAbi } from 'viem';
-import { getChainClient } from '../../src/chain/client.js';
-import { loadConfig } from '../../src/config.js';
-import { openDb } from '../../src/db/connection.js';
-import { runMigrations } from '../../src/db/migrate.js';
-import { backfill } from '../../src/indexer/backfill.js';
-import { makeSupportsInterface, supportsEnumerable } from '../../src/chain/standard.js';
-import { makeTxSource } from '../../src/chain/tx.js';
-import { TRANSFER_TOPICS } from '../../src/indexer/decode.js';
-import { countByKind } from '../../src/db/repositories/transfers.js';
-import type { Address, Standard } from '../../src/types.js';
-
-const CHAIN_ID = 8453;
-const CONTRACT = 'REPLACE_ME';                 // user-confirmed
-const FIRST_MINT_TX = 'REPLACE_ME';            // user-confirmed on the explorer
-const EXPECTED_MINTS = 0;                      // user-confirmed; used when Enumerable is absent
-
-const configured = Boolean(process.env[`RPC_URL_${CHAIN_ID}`]);
-
-describe.skipIf(!configured)('backfill against a real collection', () => {
-  function run() {
-    const config = loadConfig();
-    const db = openDb(':memory:');
-    runMigrations(db);
-    const { client } = getChainClient(CHAIN_ID, config);
-    const address = CONTRACT as Address;
-    const chain = config.chains.get(CHAIN_ID);
-    if (!chain) throw new Error(`chain ${CHAIN_ID} not configured`);
-
-    return {
-      db,
-      client,
-      address,
-      chain,
-      promise: backfill(
-        {
-          db,
-          getCode: async (a) =>
-            (await client.getCode({ address: a.address, blockNumber: a.blockNumber })) ?? '0x',
-          supports: makeSupportsInterface(client, address),
-          makeFetchLogs: (standard) => async ({ fromBlock, toBlock }) =>
-            (await client.getLogs({
-              address, fromBlock, toBlock, topics: [TRANSFER_TOPICS[standard]],
-            })) as never,
-          txSource: makeTxSource(client),
-          getHead: () => client.getBlockNumber(),
-          now: () => new Date(),
-        },
-        {
-          chainId: CHAIN_ID,
-          contract: CONTRACT,
-          chain,
-          ...(config.etherscanApiKey ? { etherscanApiKey: config.etherscanApiKey } : {}),
-        },
-      ),
-    };
-  }
-
-  it('matches on-chain supply and the known first mint', async () => {
-    const { db, client, address, promise } = run();
-    await promise;
-
-    const counts = countByKind(db, CHAIN_ID, CONTRACT);
-    const enumerable = await supportsEnumerable(makeSupportsInterface(client, address));
-
-    if (enumerable) {
-      // totalSupply() is Enumerable, not base ERC-721.
-      const totalSupply = await client.readContract({
-        address,
-        abi: parseAbi(['function totalSupply() view returns (uint256)']),
-        functionName: 'totalSupply',
-      });
-      expect(counts.mint - counts.burn).toBe(Number(totalSupply));
-    } else {
-      expect(counts.mint).toBe(EXPECTED_MINTS);
-    }
-
-    const firstMint = db
-      .prepare(`
-        SELECT tx_hash FROM transfers
-         WHERE chain_id = ? AND contract = ? AND kind = 'mint'
-         ORDER BY block_number, log_index, batch_index LIMIT 1
-      `)
-      .get(CHAIN_ID, CONTRACT) as { tx_hash: string };
-    expect(firstMint.tx_hash).toBe(FIRST_MINT_TX);
-  }, 300_000);
-
-  it('re-running leaves the row count unchanged', async () => {
-    const first = run();
-    await first.promise;
-    const before = first.db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
-
-    const second = run();
-    await second.promise;
-    const after = second.db.prepare('SELECT COUNT(*) AS n FROM transfers').get() as { n: number };
-
-    expect(after.n).toBe(before.n);
-  }, 600_000);
-});
-```
-
-- [ ] **Step 4: Run the full suite**
-
-Run: `npm test && npm run typecheck`
-Expected: every unit suite passes. Integration tests run if `RPC_URL_8453` is set, skip otherwise. **Report the actual output — if anything fails or skips, say so plainly rather than describing the milestone as done.**
-
-- [ ] **Step 5: Write the README**
-
-`README.md` must contain: what the project is, the Milestone 1 scope, setup (`.env` from `.env.example`, `npm install`, `npm run migrate`), usage (`npm run index -- --chain 8453 --contract 0x…`), how to run tests, and a **Known limitations** section reproducing verbatim the seven limitations from the spec's "Known limitations" section, PLUS the one discovered during Task 6: a non-compliant early ERC-721 that emits a **non-indexed** `tokenId` produces a 3-topic log indistinguishable from an ERC-20 `Transfer`, so the topic-count guard skips it and such a collection indexes as zero transfers — including that ERC-20/WETH sales read as `transfer`, that `burn` detects only `0x0`, that reorgs are handled by confirmation lag with no rewrite of indexed rows, and that the deploy-block binary search assumes code presence is monotonic and therefore breaks for self-destructed or CREATE2-redeployed addresses.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add scripts/ test/integration/ test/fixtures/ README.md
-git commit -m "test: real-chain integration tests and README
-
-Enumerable support is detected before asserting against totalSupply(),
-falling back to a confirmed mint count when it is absent. Known
-limitations are documented rather than left implicit.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
-```
-
-- [ ] **Step 7: Stop and summarize**
-
-Per the project working rules, Milestone 1 ends here. Report: what was built, the actual `npm test` and `npm run typecheck` output, which integration tests ran versus skipped, and the known limitations. **Wait for the user's confirmation before any Milestone 2 work.** Do not add a git remote or push — the user has said the repo stays local until M1 tests pass.
+**Interfaces:** no new exports. This task proves the milestone and documents it.
 
 ---
 
-## Self-Review
+- [x] **Step 1: Choose the collection by inverse query** — done, recorded here
 
-**Spec coverage.** Every spec section maps to a task: config → 1; logger/security → 2; data model and migrations → 3; locking, cleanup, read guard → 4; idempotent writes and chunked IN → 5; decoding incl. `batch_index` → 6; classification → 7; client and rate limit → 8; adaptive chunking and `isRangeError` → 9; ERC-165 and Enumerable → 10; deploy-block precedence and archive probe → 11; enrichment heuristic → 12; reorg safety, head extension, orchestration, fault-injection hook → 13; CLI → 14; integration tests, fixtures, README limitations → 15.
+There is no "collections by deploy date" endpoint, so `scripts/find-smoke-collection.ts`
+asks it backwards: `alchemy_getAssetTransfers` with `fromAddress = 0x0` over a recent
+window returns mints across every contract at once; group by contract; then for each
+candidate ask whether it had **any** transfer before that window (one call each) — none
+means its history begins inside the window. Then read `name`/`symbol` to reject protocol
+artifacts, which are ERC-721 by interface but are not collections anyone collects.
 
-**Type consistency.** `BackfillDeps.makeFetchLogs(standard)` is defined that way in Task 13 and used unchanged by Tasks 14 and 15. An earlier draft had Task 13 declare a plain `fetchLogs` and Task 14 rewrite it — a signature known to be wrong when written, which would have left Task 13's tests drifting from the shipped shape.
+That first pass was **not sufficient**, and the correction matters: "first transfer is
+recent" is not "deployed recently", and a backfill starts at the deploy block. Measured
+deploy-to-first-mint gaps on Base (head 52005262):
 
-**Placeholders.** The only `REPLACE_ME` values are the three integration-test constants, which cannot be known before Step 2 and which the spec requires the user to verify. The `archiveProbe` entries in Task 1 are real addresses but are explicitly marked as requiring per-chain verification before commit.
+| collection | deploy | first mint | gap | chunks @10 | minutes @5rps |
+|---|---|---|---|---|---|
+| Zoo Genesis Club | 51486576 | 51905672 | 419,096 | 41,910 | **139.7** |
+| TAGGED CREW | 51905209 | 51905426 | 217 | 22 | 0.1 |
+| Candles NFT | 51905098 | 51905187 | 89 | 9 | 0.0 |
+| Chibi Women | 51905204 | 51905260 | 56 | 6 | 0.0 |
+| MIX INSPIRED... | 51905561 | 51905564 | 3 | 1 | 0.0 |
+
+Zoo Genesis Club looked best on mint count (400 in a single block) and is the worst
+choice: it sat dormant for 419,096 blocks after deployment, so reaching its own mints
+costs 140 minutes. It is rejected for exactly the reason the table exists.
+
+**Chosen: `0xec04bedeec2f23307bba10468822d5b76a4284f5` — "TAGGED CREW" (Ta), Base.**
+
+- deploy block **51905209**, resolved by binary search and validated (code at the block,
+  none at the block before)
+- 152 mints across blocks **51905426 to 51905843**, so mints land in **many different
+  blocks** — real `(block_number, log_index)` ordering rather than one tie group
+- `totalSupply()` is supported and reads **152**, giving a cross-check against the chain's
+  own accounting rather than against a number either of us wrote down
+- no transfers before its deploy window, so the bounded range holds its entire history
+- bounded at **51905900** the span is 691 blocks, about **70 chunks** at the measured
+  10-block cap: genuinely multi-chunk, so the cap is really hit, and roughly 14 seconds at
+  5 requests per second
+
+Rejected as a protocol artifact by the same probe: `0x8279...5b72`, which reports its own
+name as **Slipstream Position NFT v1 (AERO-CL-POS)** — Aerodrome concentrated-liquidity
+positions. Worth recording because the earlier density measurements were taken against it
+and these notes described it as Uniswap V3 Positions. The structural point stands either
+way (every "mint" is an independent LP action, hence unclustered), but the name was wrong.
+
+- [ ] **Step 2: Write the smoke test**
+
+`test/integration/smoke.provider.test.ts`. Skips cleanly, like the anvil suites, when
+`RPC_URL_8453` is absent — printed via **`process.stderr.write`, not `console.warn`**,
+because vitest discards console output from a file whose every test is skipped and the
+notice would be invisible. CI and a fresh clone must not fail for want of credentials.
+
+Constants: the contract above, chain 8453, `toBlock` 51905900. The deploy block is
+**asserted, not supplied**, so the binary search is exercised.
+
+Assertions — the three anvil cannot reach:
+
+- **The cap was hit and the chunker responded.** Record every range passed to `fetchLogs`.
+  Assert that at least one requested range was **wider** than the narrowest subsequently
+  used, so the walker demonstrably shrank, and that the final effective width is at or
+  below what `probeEffectiveChunk` measures. Asserting merely "the run completed" would
+  pass against a chunker that never adapted.
+- **No credential in any output.** Capture stdout and stderr for the whole run and assert
+  the URL's secret tokens do not appear. Derive those tokens from `config.secrets`; never
+  write a key into a test.
+- **The rate limiter.** A 429 may well not occur at this size, and one must **not be
+  manufactured** against a real provider. If none occurs the test says so explicitly and
+  records the bucket as un-exercised rather than implying otherwise. If one does occur,
+  assert the run still completed and that the rate was reduced.
+
+Assertions — invariants, since expectations here cannot be spec-derived:
+
+- distinct mint rows equals `totalSupply()` read **at the bound block** — chain-derived,
+  not a number from either of us
+- `last_indexed_block` equals the bound exactly
+- a second identical run inserts **zero** rows and reports `up_to_date`
+- `firstMinters` output is ordered by `(block_number, log_index, batch_index)` ascending,
+  and every `minter` is non-null at `full`
+- every stored address is lowercase, and every `tx_hash` belongs to the block it claims
+
+- [ ] **Step 3: Verify the skip path by removing the credential**
+
+Not by reading the code. Run with `RPC_URL_8453` absent from the child environment and
+confirm the file skips, the suite is green, and the reason is printed. This is how the
+`console.warn` defect in the anvil suite was found.
+
+- [ ] **Step 4: Write the README**
+
+For someone who is neither of us: a developer meeting this repo for the first time with no
+context from these sessions.
+
+1. **What it is.** A Telegram bot that tracks NFT minters and buyers across EVM
+   collections. Read-only: it holds no keys and signs nothing, and a test asserts the
+   config schema has no private-key field.
+2. **Setup, clone to first answer.** Node 20+, `npm install`, `.env` from `.env.example`
+   with `RPC_URL_<chainId>` per chain, `npm run migrate`, then
+   `npm run index -- --contract 0x... --chain 8453 --dry-run`, the same without
+   `--dry-run`, then the first query. Foundry is needed only for the fixture tests, which
+   skip without it.
+3. **The three enrichment levels and which queries each supports**, as a table, because
+   this is the thing a newcomer gets wrong. `logs_only` gives `firstRecipients` only;
+   `mints_only` adds `firstMinters`; `full` adds `overlap`. State that the level is fixed
+   at first index, that resuming at a different one is refused rather than silently mixed,
+   and name `upgradeEnrichment` as the way across.
+4. **The free-tier reality, honestly.** `eth_getLogs` is capped at **10 blocks** on the
+   free tier — measured, flat, and not density-derived. At 5 sustained calls per second
+   that is about **5.6 hours per million blocks** of span, and `--dry-run` measures the cap
+   live rather than trusting config. Enrichment is separate and dominates, roughly 142x the
+   fetch cost on a measured collection, which is what the levels exist to control.
+5. **Known limitations.** A sale paid in WETH or any ERC-20 has `tx.value == 0` and
+   classifies as `transfer`. A purchase routed through a contract, where `tx.from` is the
+   router, classifies as `transfer`. `burn` detects the zero address only, so `0x...dEaD`
+   reads as a transfer. The deploy-block binary search assumes code presence is monotonic,
+   which a `SELFDESTRUCT`-and-redeploy would break. The Etherscan deploy-block path **does
+   not work on Base** — measured: "Free API access is not supported for this chain" — so
+   Base falls entirely to the archive-probe-guarded binary search. Arbitrum pre-Nitro state
+   is unserved, so blocks below 22207817 are `unvalidatable` rather than invalid.
+   `token_id`, `amount` and `tx_value_wei` are TEXT and therefore sort lexicographically.
+6. **Exit codes**, as a table, for anyone scripting it: 0 ok, 1 internal, 2 usage,
+   3 unavailable, 4 busy, 5 local state.
+
+- [ ] **Step 5: Full suite and an honest milestone report**
+
+`npm test` and `npm run typecheck`. Then report what was built, the test counts, which
+suites skipped and why, every known limitation above, and anything claimed but not
+verified — including, if it is still true, that no real 429 was ever observed.
