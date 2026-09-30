@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS collections (
   deploy_block        INTEGER,
   deploy_block_source TEXT    CHECK (deploy_block_source IN
                                      ('override','explorer','binary_search')),
+  -- 1 when the deploy block was checked against the chain (code at the block,
+  -- no code at block-1); 0 when it was accepted without validation because the
+  -- provider could not serve state for that block. A block that FAILED
+  -- validation never reaches a row: the explorer falls through and the other
+  -- sources throw. Kept separate from deploy_block_source so source stays
+  -- orthogonal to validation state.
+  deploy_block_validated INTEGER NOT NULL DEFAULT 0
+                           CHECK (deploy_block_validated IN (0, 1)),
   last_indexed_block  INTEGER,
   indexed_at          INTEGER,   -- epoch ms
   locked_by           TEXT,

@@ -227,12 +227,36 @@ describe('getCollection', () => {
     claim('job-a');
     finishBootstrap(db, {
       chainId: CHAIN, contract: CONTRACT, standard: '721',
-      deployBlock: 12287507, deployBlockSource: 'binary_search', name: 'BAYC',
+      deployBlock: 12287507, deployBlockSource: 'binary_search', validated: true, name: 'BAYC',
     });
     expect(getCollection(db, CHAIN, CONTRACT)).toEqual({
       state: 'indexed', standard: '721', deployBlock: 12287507,
       lastIndexedBlock: 12287506, name: 'BAYC',
     });
+  });
+});
+
+describe('finishBootstrap — validation state', () => {
+  const stored = () => (db.prepare(
+    'SELECT deploy_block_validated AS v FROM collections',
+  ).get() as { v: number }).v;
+
+  it('stores 1 for a validated deploy block, read back from the row', () => {
+    claim('job-a');
+    finishBootstrap(db, {
+      chainId: CHAIN, contract: CONTRACT, standard: '721',
+      deployBlock: 100, deployBlockSource: 'explorer', validated: true, name: null,
+    });
+    expect(stored()).toBe(1);
+  });
+
+  it('stores 0 for an unvalidated deploy block, read back from the row', () => {
+    claim('job-a');
+    finishBootstrap(db, {
+      chainId: CHAIN, contract: CONTRACT, standard: '721',
+      deployBlock: 55, deployBlockSource: 'explorer', validated: false, name: null,
+    });
+    expect(stored()).toBe(0);
   });
 });
 
@@ -244,7 +268,7 @@ describe('deleteUnbootstrapped', () => {
     claim('job-a');
     finishBootstrap(db, {
       chainId: CHAIN, contract: CONTRACT, standard: '721',
-      deployBlock: 100, deployBlockSource: 'override', name: null,
+      deployBlock: 100, deployBlockSource: 'override', validated: true, name: null,
     });
     db.prepare(`
       INSERT INTO transfers
@@ -271,7 +295,7 @@ describe('deleteUnbootstrapped', () => {
     claim('job-a');
     finishBootstrap(db, {
       chainId: CHAIN, contract: CONTRACT, standard: '721',
-      deployBlock: 100, deployBlockSource: 'override', name: null,
+      deployBlock: 100, deployBlockSource: 'override', validated: true, name: null,
     });
     deleteUnbootstrapped(db, { chainId: CHAIN, contract: CONTRACT, jobId: 'job-a' });
     expect(getCollection(db, CHAIN, CONTRACT).state).toBe('indexed');
@@ -290,7 +314,7 @@ describe('advanceWatermark', () => {
     claim('job-a', T0);
     finishBootstrap(db, {
       chainId: CHAIN, contract: CONTRACT, standard: '721',
-      deployBlock: 100, deployBlockSource: 'override', name: null,
+      deployBlock: 100, deployBlockSource: 'override', validated: true, name: null,
     });
     advanceWatermark(db, {
       chainId: CHAIN, contract: CONTRACT, jobId: 'job-a',

@@ -96,6 +96,41 @@ describe('runMigrations — real schema', () => {
   });
 });
 
+describe('collections.deploy_block_validated', () => {
+  const fresh = () => {
+    const db = openDb(':memory:');
+    runMigrations(db);
+    return db;
+  };
+  const stored = (db: ReturnType<typeof fresh>) =>
+    (db.prepare('SELECT deploy_block_validated AS v FROM collections').get() as { v: number }).v;
+
+  it('is an INTEGER that defaults to 0', () => {
+    const db = fresh();
+    const col = (db.prepare('PRAGMA table_info(collections)').all() as Array<{
+      name: string; type: string;
+    }>).find((c) => c.name === 'deploy_block_validated');
+    expect(col?.type).toBe('INTEGER');
+    db.prepare('INSERT INTO collections (chain_id, contract) VALUES (1, ?)').run('0xabc');
+    expect(stored(db)).toBe(0);
+  });
+
+  it('rejects a value other than 0 or 1', () => {
+    const db = fresh();
+    expect(() => db.prepare(
+      'INSERT INTO collections (chain_id, contract, deploy_block_validated) VALUES (1, ?, 2)',
+    ).run('0xabc')).toThrow(/CHECK/);
+  });
+
+  it('accepts 1', () => {
+    const db = fresh();
+    db.prepare(
+      'INSERT INTO collections (chain_id, contract, deploy_block_validated) VALUES (1, ?, 1)',
+    ).run('0xabc');
+    expect(stored(db)).toBe(1);
+  });
+});
+
 describe('runMigrations — checksum ledger', () => {
   it('records a checksum per applied file', () => {
     process.env.MIGRATIONS_DIR = fixtureDir({ '001_a.sql': 'CREATE TABLE a (x);' });

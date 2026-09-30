@@ -76,7 +76,8 @@ export function finishBootstrap(
   db: Database.Database,
   a: {
     chainId: number; contract: string; standard: Standard;
-    deployBlock: number; deployBlockSource: DeployBlockSource; name: string | null;
+    deployBlock: number; deployBlockSource: DeployBlockSource; validated: boolean;
+    name: string | null;
   },
 ): void {
   db.prepare(`
@@ -85,9 +86,10 @@ export function finishBootstrap(
            name = @name,
            deploy_block = @deployBlock,
            deploy_block_source = @deployBlockSource,
+           deploy_block_validated = @validated,
            last_indexed_block = COALESCE(last_indexed_block, @deployBlock - 1)
      WHERE chain_id = @chainId AND contract = @contract
-  `).run(a);
+  `).run({ ...a, validated: a.validated ? 1 : 0 });
 }
 
 /**
