@@ -175,6 +175,7 @@ async function main(argv: string[]): Promise<number> {
       deployBlockValidated: resolved.validated,
       level: args.level,
       safeHead: head,
+      requestsPerSecond: chain.requestsPerSecond,
     }));
     return EXIT.OK;
   }

@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -94,4 +95,41 @@ export function runMigrations(
   }
 
   return applied;
+}
+
+/**
+ * `npm run migrate` — applies pending migrations to the configured database.
+ *
+ * This entry point exists because the npm script pointed at this file and the file had
+ * no entry point, so `npm run migrate` printed nothing, created nothing, and exited 0.
+ * A declared script that silently does nothing is worse than one that does not exist:
+ * the README told people to run it, and they would reasonably have believed it worked.
+ *
+ * Running it is optional — the CLI applies migrations itself before indexing — but
+ * creating the schema up front is a reasonable thing to want, and reporting which files
+ * were applied is the only way to see the state of the ledger without opening the file.
+ *
+ * Guarded on being the entry module so importing `runMigrations` from a test or the CLI
+ * does not set a database up as a side effect.
+ */
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  await import('../outputScrubbing.js');
+  const { loadConfig } = await import('../config.js');
+  const { openDb } = await import('./connection.js');
+
+  const config = loadConfig();
+  const db = openDb(config.dbPath);
+  try {
+    const applied = runMigrations(db);
+    if (applied.length === 0) {
+      process.stdout.write(`${config.dbPath} is already up to date; nothing to apply.\n`);
+    } else {
+      process.stdout.write(
+        `applied ${applied.length} migration(s) to ${config.dbPath}:\n` +
+        applied.map((m) => `  ${m.filename}  ${m.checksum.slice(0, 12)}…\n`).join(''),
+      );
+    }
+  } finally {
+    db.close();
+  }
 }

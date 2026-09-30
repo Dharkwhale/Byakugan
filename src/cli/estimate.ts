@@ -121,6 +121,8 @@ export function formatEstimate(a: {
   deployBlockValidated: boolean;
   level: string;
   safeHead: bigint;
+  /** Printed beside the time, because a rate taken on trust deserves saying so. */
+  requestsPerSecond: number;
   /** How the chunk size was established. See probeEffectiveChunk. */
   chunkNote?: string;
   chunkMeasured?: boolean;
@@ -144,6 +146,10 @@ export function formatEstimate(a: {
     ...(a.chunkNote ? [`                    ${a.chunkNote}`] : []),
     `  getLogs calls     ${e.logsCalls.toLocaleString()}`,
     `  estimated time    ${humanizeSeconds(e.logsSeconds)}  for log fetching alone`,
+    `                    at the CONFIGURED ${a.requestsPerSecond}/s, which is an`,
+    '                    assumption and not a measurement — on a free tier the',
+    '                    compute-unit ceiling can make the real rate lower, and',
+    '                    then this figure is optimistic by that ratio',
   ];
 
   if (e.logsCu !== null) {

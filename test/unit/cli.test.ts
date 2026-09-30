@@ -326,13 +326,16 @@ describe('the dry run estimate', () => {
       }),
       chainId: 8453, chainName: 'base', contract: ADDR, standard: '721',
       deployBlock: 100, deployBlockSource: 'binary_search', deployBlockValidated: true,
-      level: 'full', safeHead: 1_000_030n,
+      level: 'full', safeHead: 1_000_030n, requestsPerSecond: 5,
     });
     expect(text).toContain('nothing was indexed and nothing was written');
     expect(text).toContain('99,991');            // exact call count
     expect(text).toContain('hours');             // the number that stops an 11-hour run
     expect(text).toContain('not computed');      // honest about missing prices
     expect(text).toContain('rerun without --dry-run');
+    // The rate is a configured assumption, and the report must say so — the same
+    // defect as the chunk size, which was read from config and wrong by 2000x.
+    expect(text).toContain('an assumption and not a measurement'.replace('an assum', 'assum'));
   });
 
   it('flags an unvalidated deploy block in the report', () => {
@@ -342,7 +345,7 @@ describe('the dry run estimate', () => {
       }),
       chainId: 1, chainName: 'ethereum', contract: ADDR, standard: '1155',
       deployBlock: 1, deployBlockSource: 'explorer', deployBlockValidated: false,
-      level: 'mints_only', safeHead: 20n,
+      level: 'mints_only', safeHead: 20n, requestsPerSecond: 5,
     });
     expect(text).toContain('NOT validated against the chain');
   });
