@@ -55,6 +55,53 @@ already committed and the test asserts resumption while proving none. Spread
 the fixtures across chunk boundaries and verify the partial state is genuinely
 partial.
 
+**Recorded gap (argued, not tested):** the `AND tx_from IS NULL` on
+`applyEnrichment`'s UPDATE. Mutation-tested; the mutant survived with 88 passed,
+0 failed, because the SELECT already excludes enriched rows. Kept as defence in
+depth. The interleaving that would distinguish it needs two processes writing
+after both have read, which a synchronous driver inside one transaction cannot
+produce — the same limitation as the stale-lock racing test above.
+
+### Never let missing data pick the cheaper answer
+
+**When a value is unavailable, the code says so. It does not fall through to
+whichever valid-looking answer needs no extra work.** A default that is
+indistinguishable from a real result converts a missing fetch into a confident
+wrong answer, and nothing downstream can tell.
+
+This has now arrived twice through different doors, which is what makes it a
+rule rather than an incident:
+
+- `classify` receiving a raw DB row: `tx.value` as a string, `undefined` or `''`
+  all compare false against `0n` without throwing, so a genuine buy read as
+  unpaid and became `transfer`. Fixed by a `typeof` guard that throws.
+- `mints_only` enrichment: an unenriched non-mint stored as `kind = 'transfer'`
+  is indistinguishable from a real transfer, so every buy in the range is lost
+  and `overlap` — which scores wallets on [mint, buy] — returns zero for a
+  wallet that bought seven of fifteen collections. Fixed by `'unclassified'`
+  plus a table CHECK that makes `'buy'`/`'transfer'` unrepresentable without a
+  transaction.
+
+`transfer` was the trap both times because it is the residual branch: the answer
+you reach by failing to look. Audit every residual `else`/default for whether it
+can be reached by absent input rather than by decided input.
+
+Three things follow, and they are cheap:
+
+1. Give "not looked at" its own representable state, distinct from every real
+   answer. Then make the wrong combination impossible at the database layer, not
+   merely discouraged in code.
+2. **Derive a completeness claim from the data, never from a column recording an
+   intent.** A column saying `full` beside unclassified rows waves the query
+   through; counting the unclassified rows cannot drift, because there is
+   nothing to drift from. It is also more precise in the honest direction — a
+   `mints_only` collection whose every transfer was log-decidable really is
+   complete, and deriving it permits that instead of demanding a pointless
+   re-index.
+3. A query that cannot be answered completely **throws, naming what is missing
+   and how to fix it.** It does not return a partial result. An undercount is
+   not a degraded answer; it is a wrong one wearing the shape of a right one.
+
 When a test cannot be made to fail against the mutant, say so and record the
 gap. An honest "argued, not tested" comment beats a contrived pass.
 

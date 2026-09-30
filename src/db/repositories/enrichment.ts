@@ -144,6 +144,17 @@ export function findTxHashesNeedingEnrichment(
  * than guessed at — a partial fetch leaves a partial index that the gate still
  * correctly refuses, instead of a complete-looking one that is wrong.
  *
+ * ARGUED, NOT TESTED — the `AND tx_from IS NULL` on the UPDATE below. Idempotency
+ * is really enforced by the SELECT, which never hands an already-enriched row to
+ * the UPDATE, so removing the UPDATE's copy of the condition passes the whole
+ * suite: it was mutation-tested and the mutant SURVIVED (88 passed, 0 failed).
+ * It is kept as a statement of the invariant at the point of the write, and it
+ * would matter if two processes ever selected the same rows and then both wrote.
+ * No single-process test can produce that interleaving — better-sqlite3 is
+ * synchronous and this all runs inside one transaction — which is the same
+ * limitation recorded for the stale-lock racing test in CLAUDE.md. Treated as
+ * defence in depth, not as a tested guarantee.
+ *
  * One statement, one transaction: an upgrade that committed half a chunk under a
  * flipped `enrichment_level` would leave the column claiming 'full' over rows
  * that are not.

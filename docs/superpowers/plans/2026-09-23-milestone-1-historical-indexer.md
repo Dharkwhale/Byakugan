@@ -6067,6 +6067,30 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Create: `src/chain/tx.ts`
 - Test: `test/unit/tx.test.ts`
 
+> **AMENDED — enrichment level (landed ahead of this task, commit `26053ed`).**
+> The storage side is already built and tested: `kind` carries `'unclassified'`,
+> `tx_from`/`tx_value_wei` are nullable under two table CHECKs,
+> `collections.enrichment_level` records declared intent, and
+> `src/db/repositories/enrichment.ts` holds the gate, the upgrade query and
+> `applyEnrichment`. What remains for THIS task:
+>
+> 1. `enrichTxs` takes the level. Under `'mints_only'` it fetches **nothing** and
+>    returns an empty map — `mint` and `burn` are decidable from the log alone, so
+>    `firstMinters` is complete and exact at zero enrichment cost. It is not a
+>    reduced fetch; it is no fetch.
+> 2. Rows the level leaves unenriched are stored via `classify(transfer, null)`,
+>    which yields `'unclassified'`. **`mints_only` still stores every decoded
+>    transfer** — never only the mints. Omitting them would leave nothing for the
+>    gate to detect, `overlap` would undercount against an apparently clean index,
+>    and an upgrade would have to re-read chain logs instead of the `tx_hash`es
+>    already on disk.
+> 3. The upgrade path is `findTxHashesNeedingEnrichment` → fetch → `applyEnrichment`,
+>    keyed on `tx_from IS NULL` so only the missing transactions are fetched.
+> 4. `blockFetchThreshold` is **not** a config constant. Measured break-even is
+>    `C_block / C_tx < uniqueTxs / uniqueBlocks`; the sampled ratio was 1.04, so the
+>    decision is computed per window from observed density. Nothing ships here until
+>    the dashboard CU deltas land.
+
 **Interfaces:**
 - Consumes: `TxInfo`, `Hash`, `Address` (Task 1)
 - Produces:
