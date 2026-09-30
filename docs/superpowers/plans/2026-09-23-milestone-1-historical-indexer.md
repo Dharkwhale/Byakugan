@@ -6067,6 +6067,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Create: `src/chain/tx.ts`
 - Test: `test/unit/tx.test.ts`
 
+> **IMPLEMENTED.** `src/chain/tx.ts` + `test/unit/tx.test.ts` (23 tests). `selectNeeded`
+> applies the level policy, `enrichTxs` chooses its strategy per window from the density
+> of what is actually needed, and `makeTxSource` wires the per-chain rate limiter. The
+> `TxSource`/`enrichTxs` signatures below differ from what is written here: there is no
+> `blockFetchThreshold` parameter, because the threshold is computed rather than
+> configured — `costs: FetchCosts` is passed instead.
+>
 > **AMENDED — enrichment level (landed ahead of this task, commit `26053ed`).**
 > The storage side is already built and tested: `kind` carries `'unclassified'`,
 > `tx_from`/`tx_value_wei` are nullable under two table CHECKs,

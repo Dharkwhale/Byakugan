@@ -24,3 +24,14 @@ export class ClassifyError extends ByakuganError {}
  * in the output would say why.
  */
 export class EnrichmentLevelError extends ByakuganError {}
+
+/**
+ * Transaction enrichment could not produce usable data for a transfer.
+ *
+ * Distinct from a transport failure, which retries: this means what came back was
+ * wrong rather than absent — a transaction missing from its own block (a reorg below
+ * the confirmations depth), or a sender or value of the wrong shape. Retrying would
+ * not help, and continuing would store an unenriched row under an index about to be
+ * recorded as complete.
+ */
+export class TxEnrichmentError extends ByakuganError {}
