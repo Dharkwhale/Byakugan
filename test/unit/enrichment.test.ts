@@ -5,7 +5,7 @@ import { runMigrations } from '../../src/db/migrate.js';
 import { firstMinters, overlap } from '../../src/db/repositories/analytics.js';
 import {
   applyEnrichment, countUnclassified, findTxHashesNeedingEnrichment,
-  getEnrichmentLevel, requireFullEnrichment, setEnrichmentLevel,
+  getEnrichmentLevel, requireFullEnrichment, requireMintEnrichment, setEnrichmentLevel,
 } from '../../src/db/repositories/enrichment.js';
 import { countByKind, findKnownTxs, insertTransfers } from '../../src/db/repositories/transfers.js';
 import { EnrichmentLevelError } from '../../src/errors.js';
@@ -17,6 +17,12 @@ const COLL_B = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2';
 const WALLET = '0xcccccccccccccccccccccccccccccccccccccce1' as Address;
 const OTHER = '0xdddddddddddddddddddddddddddddddddddddde2' as Address;
 const SELLER = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee3' as Address;
+const BOT = '0xbbbb0000000000000000000000000000000000b0' as Address;
+const FRESH = [
+  '0xf0000000000000000000000000000000000000f1',
+  '0xf0000000000000000000000000000000000000f2',
+  '0xf0000000000000000000000000000000000000f3',
+] as Address[];
 const ZERO = '0x0000000000000000000000000000000000000000' as Address;
 
 let db: Database.Database;
@@ -29,7 +35,7 @@ beforeEach(() => {
   }
 });
 
-function row(over: Partial<TransferRow> = {}): TransferRow {
+function base(over: Partial<TransferRow> = {}): TransferRow {
   return {
     chainId: 1, contract: COLL_A, tokenId: '1', amount: '1',
     fromAddr: ZERO, toAddr: WALLET, txHash: '0xtx1', blockNumber: 100,
@@ -39,16 +45,17 @@ function row(over: Partial<TransferRow> = {}): TransferRow {
 }
 
 /**
- * What a `mints_only` run writes for one transfer: no transaction fetched, so
- * `classify` is handed null and the kind is whatever the log alone supports.
- * This is the production path, not a shortcut — the point of these tests is that
- * the level is expressed in the ROWS, so the rows have to be built the way the
- * indexer builds them.
+ * A row whose transaction was NOT fetched — what every level writes for the rows
+ * it does not enrich, and what `logs_only` writes for all of them.
+ *
+ * Built through `classify(..., null)` rather than by hard-coding a kind, because
+ * the point of these tests is that the level is expressed in the ROWS. Hard-coding
+ * would let the fixture disagree with the function under test.
  */
-function mintsOnlyRow(
+function unenrichedRow(
   over: Partial<TransferRow> & { fromAddr: string; toAddr: string },
 ): TransferRow {
-  return row({
+  return base({
     ...over,
     txFrom: null,
     txValueWei: null,
@@ -56,12 +63,12 @@ function mintsOnlyRow(
   });
 }
 
-/** What a `full` run writes: the transaction was fetched, so the kind is decided. */
-function fullRow(
+/** A row whose transaction WAS fetched, classified with it. */
+function enrichedRow(
   over: Partial<TransferRow> & { fromAddr: string; toAddr: string },
   tx: TxInfo,
 ): TransferRow {
-  return row({
+  return base({
     ...over,
     txFrom: tx.from,
     txValueWei: tx.value.toString(),
@@ -69,11 +76,30 @@ function fullRow(
   });
 }
 
+/**
+ * The scenario the acting wallet exists for: one bot mints three tokens to three
+ * fresh addresses, and one ordinary collector mints one to itself. Grouped by
+ * recipient that reads as four minters; grouped by acting wallet, as two.
+ */
+function indexBotMints(level: 'logs_only' | 'mints_only'): void {
+  setEnrichmentLevel(db, { chainId: 1, contract: COLL_A, level });
+  const mints = FRESH.map((to, i) => ({
+    fromAddr: ZERO, toAddr: to, txHash: `0xbot${i}`,
+    blockNumber: 10 + i, tokenId: String(i + 1),
+  }));
+  const collector = {
+    fromAddr: ZERO, toAddr: WALLET, txHash: '0xcol', blockNumber: 20, tokenId: '9',
+  };
+  insertTransfers(db, level === 'logs_only'
+    ? [...mints, collector].map(unenrichedRow)
+    : [
+        ...mints.map((m) => enrichedRow(m, { from: BOT, value: 1n })),
+        enrichedRow(collector, { from: WALLET, value: 1n }),
+      ]);
+}
+
 describe('classify without a transaction', () => {
   it('returns unclassified, NOT transfer, for a movement needing the tx', () => {
-    // THE HEADLINE CASE. 'transfer' is the answer you get by failing to look; it
-    // is indistinguishable from a real transfer once stored, and it loses every
-    // buy in the range.
     expect(classify({ from: SELLER, to: WALLET }, null)).toBe('unclassified');
   });
 
@@ -90,9 +116,6 @@ describe('classify without a transaction', () => {
   });
 
   it('still validates a transaction it WAS given, even for a mint', () => {
-    // The bigint guard runs before the log-decidable shortcut. A caller passing
-    // raw DB rows is broken for every row; catching it only on the first sale
-    // would let a mint-heavy backfill through and surface the fault much later.
     expect(() => classify(
       { from: ZERO, to: WALLET },
       { from: WALLET, value: '10' as unknown as bigint },
@@ -108,9 +131,7 @@ describe('classify without a transaction', () => {
 });
 
 describe('the database refuses an unenriched classification', () => {
-  // Behaviour, not configuration: each case asserts the INSERT is rejected, not
-  // that the schema text contains a CHECK.
-  const insert = (over: Partial<TransferRow>) => () => insertTransfers(db, [row(over)]);
+  const insert = (over: Partial<TransferRow>) => () => insertTransfers(db, [base(over)]);
 
   it("rejects kind 'transfer' with no transaction — the silent downgrade", () => {
     expect(insert({ fromAddr: SELLER, toAddr: WALLET, kind: 'transfer' }))
@@ -123,7 +144,6 @@ describe('the database refuses an unenriched classification', () => {
   });
 
   it("rejects kind 'unclassified' when the transaction IS present", () => {
-    // The work was done; discarding its result is as wrong as inventing one.
     expect(insert({
       fromAddr: SELLER, toAddr: WALLET, kind: 'unclassified',
       txFrom: WALLET, txValueWei: '5',
@@ -142,122 +162,150 @@ describe('the database refuses an unenriched classification', () => {
 
   it('accepts a mint or burn with no transaction', () => {
     expect(insertTransfers(db, [
-      row({ fromAddr: ZERO, toAddr: WALLET, kind: 'mint', txHash: '0xm' }),
-      row({ fromAddr: SELLER, toAddr: ZERO, kind: 'burn', txHash: '0xb' }),
+      base({ fromAddr: ZERO, toAddr: WALLET, kind: 'mint', txHash: '0xm' }),
+      base({ fromAddr: SELLER, toAddr: ZERO, kind: 'burn', txHash: '0xb' }),
     ])).toBe(2);
   });
 
-  it('accepts an unclassified row with no transaction', () => {
-    expect(insertTransfers(db, [
-      row({ fromAddr: SELLER, toAddr: WALLET, kind: 'unclassified' }),
-    ])).toBe(1);
+  it('rejects an unknown enrichment level', () => {
+    expect(() => db.prepare(
+      "INSERT INTO collections (chain_id, contract, enrichment_level) VALUES (1, ?, 'partial')",
+    ).run('0x0000000000000000000000000000000000000009'))
+      .toThrow(/CHECK constraint failed/);
   });
 });
 
-describe('a mints_only index', () => {
-  /**
-   * Wallet mints in collection A and BUYS in collection B. Under mints_only the
-   * buy is unclassified, so an ungated `overlap` sees the wallet in one
-   * collection instead of two.
-   */
+describe('a logs_only index (no transactions at all)', () => {
+  it('cannot answer firstMinters, and refuses instead of reporting recipients', () => {
+    // THE HEADLINE CASE for this level. tx_from is NULL on every mint, so there is
+    // no acting wallet: the bot's three mints and the collector's one would read as
+    // four unrelated minters.
+    indexBotMints('logs_only');
+    expect(() => firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 }))
+      .toThrow(EnrichmentLevelError);
+  });
+
+  it('says how many mints are affected, the level, and the fix', () => {
+    indexBotMints('logs_only');
+    let message = '';
+    try {
+      firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 });
+    } catch (err) { message = (err as Error).message; }
+    expect(message).toContain('4 mint(s)');
+    expect(message).toContain('logs_only');
+    expect(message).toMatch(/only the RECIPIENT/);
+    expect(message).toMatch(/re-index/i);
+  });
+
+  it('is never what an unconfigured collection gets', () => {
+    expect(getEnrichmentLevel(db, 1, COLL_B)).toBe('full');
+  });
+
+  it('owes no fetches when it is itself the target', () => {
+    indexBotMints('logs_only');
+    expect(findTxHashesNeedingEnrichment(db, 1, COLL_A, 'logs_only')).toEqual([]);
+  });
+});
+
+describe('a mints_only index (mints enriched, non-mints not)', () => {
+  /** Wallet mints in A and BUYS in B; only the mint side is enriched. */
   function indexMintsOnly(): void {
-    setEnrichmentLevel(db, { chainId: 1, contract: COLL_A, level: 'mints_only' });
-    setEnrichmentLevel(db, { chainId: 1, contract: COLL_B, level: 'mints_only' });
+    for (const contract of [COLL_A, COLL_B]) {
+      setEnrichmentLevel(db, { chainId: 1, contract, level: 'mints_only' });
+    }
     insertTransfers(db, [
-      mintsOnlyRow({ contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xa1', blockNumber: 10 }),
-      mintsOnlyRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb1', blockNumber: 20 }),
-      mintsOnlyRow({ contract: COLL_B, fromAddr: ZERO, toAddr: OTHER, txHash: '0xb2', blockNumber: 21 }),
+      enrichedRow(
+        { contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xa1', blockNumber: 10 },
+        { from: WALLET, value: 1n },
+      ),
+      unenrichedRow(
+        { contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb1', blockNumber: 20 },
+      ),
     ]);
   }
 
-  it('stores non-mint rows as unclassified rather than omitting them', () => {
-    // Load-bearing invariant. If mints_only stored ONLY the mints there would be
-    // nothing for the gate to detect, overlap would undercount against an
-    // apparently clean index, and an upgrade would have to re-read chain logs
-    // instead of the tx_hashes already on disk.
+  it('answers firstMinters with tx_from POPULATED, not null', () => {
+    // The requirement this level exists to satisfy.
     indexMintsOnly();
-    expect(countUnclassified(db, 1, COLL_B)).toBe(1);
-    expect(db.prepare('SELECT COUNT(*) AS n FROM transfers').get()).toEqual({ n: 3 });
+    const [first] = firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 });
+    expect(first?.minter).toBe(WALLET);
+    expect(first?.minter).not.toBeNull();
   });
 
-  it('leaves mint rows classified but with no transaction fetched', () => {
-    indexMintsOnly();
-    expect(db.prepare(
-      "SELECT kind, tx_from FROM transfers WHERE tx_hash = '0xa1'",
-    ).get()).toEqual({ kind: 'mint', tx_from: null });
+  it('surfaces a mint whose sender differs from the receiver', () => {
+    indexBotMints('mints_only');
+    expect(firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 })).toEqual([
+      {
+        minter: BOT, firstRecipient: FRESH[0], recipients: 3, minted: 3,
+        mintedToOthers: true, blockNumber: 10, logIndex: 0, batchIndex: 0, tokenId: '1',
+      },
+      {
+        minter: WALLET, firstRecipient: WALLET, recipients: 1, minted: 1,
+        mintedToOthers: false, blockNumber: 20, logIndex: 0, batchIndex: 0, tokenId: '9',
+      },
+    ]);
   });
 
-  it('reports unclassified as its own count, never folded into transfer', () => {
-    indexMintsOnly();
-    expect(countByKind(db, 1, COLL_B)).toEqual({
-      mint: 1, buy: 0, transfer: 0, burn: 0, unclassified: 1,
-    });
+  it('collapses one wallet minting to many addresses into ONE minter', () => {
+    // Grouped by recipient this would be four rows and the bot would look like
+    // three separate collectors.
+    indexBotMints('mints_only');
+    const rows = firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 });
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.minter)).toEqual([BOT, WALLET]);
   });
 
-  it('answers firstMinters completely, with no gate and no transactions', () => {
-    indexMintsOnly();
-    expect(firstMinters(db, { chainId: 1, contract: COLL_B, limit: 10 }))
-      .toEqual([{ address: OTHER, blockNumber: 21, logIndex: 0, batchIndex: 0, tokenId: '1' }]);
-  });
-
-  it('REFUSES overlap loudly instead of returning zeros', () => {
+  it('still REFUSES overlap, because non-mints are unclassified', () => {
     indexMintsOnly();
     expect(() => overlap(db, { chainId: 1, contracts: [COLL_A, COLL_B], minCollections: 2 }))
       .toThrow(EnrichmentLevelError);
   });
 
-  it('names the offending collections and how to fix them', () => {
+  it('blames only the collection actually holding unclassified rows', () => {
     indexMintsOnly();
     let message = '';
     try {
       overlap(db, { chainId: 1, contracts: [COLL_A, COLL_B], minCollections: 2 });
-    } catch (err) {
-      message = (err as Error).message;
-    }
+    } catch (err) { message = (err as Error).message; }
     expect(message).toContain(COLL_B);
-    expect(message).toContain('mints_only');
-    expect(message).toMatch(/1 unclassified transfers/);
-    expect(message).toMatch(/re-index/i);
-    // COLL_A is fully classified (its only row is a mint), so it is not blamed.
     expect(message).not.toContain(COLL_A);
   });
 
-  it('does NOT refuse when every transfer happened to be log-decidable', () => {
-    // Precision in the honest direction: a mints_only collection holding only
-    // mints and burns has nothing unclassified, so its overlap answer really is
-    // complete. Refusing on the declared level alone would force a pointless
-    // re-index. This is why the gate reads the rows, not the column.
-    setEnrichmentLevel(db, { chainId: 1, contract: COLL_A, level: 'mints_only' });
-    insertTransfers(db, [
-      mintsOnlyRow({ contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xa1' }),
-      mintsOnlyRow({ contract: COLL_A, fromAddr: SELLER, toAddr: ZERO, txHash: '0xa2', logIndex: 1 }),
-    ]);
-    expect(getEnrichmentLevel(db, 1, COLL_A)).toBe('mints_only');
-    expect(overlap(db, { chainId: 1, contracts: [COLL_A], minCollections: 1 }))
-      .toEqual([{ address: WALLET, collections: 1 }]);
+  it('reports unclassified as its own count, never folded into transfer', () => {
+    indexMintsOnly();
+    expect(countByKind(db, 1, COLL_B)).toEqual({
+      mint: 0, buy: 0, transfer: 0, burn: 0, unclassified: 1,
+    });
+  });
+
+  it('owes only its mint transactions when it is the target', () => {
+    indexBotMints('logs_only');
+    insertTransfers(db, [unenrichedRow({
+      contract: COLL_A, fromAddr: SELLER, toAddr: OTHER, txHash: '0xsale', blockNumber: 30,
+    })]);
+    expect(findTxHashesNeedingEnrichment(db, 1, COLL_A, 'mints_only').map((r) => r.txHash))
+      .toEqual(['0xbot0', '0xbot1', '0xbot2', '0xcol']);
+    // 'full' additionally owes the sale.
+    expect(findTxHashesNeedingEnrichment(db, 1, COLL_A, 'full').map((r) => r.txHash))
+      .toEqual(['0xbot0', '0xbot1', '0xbot2', '0xcol', '0xsale']);
   });
 
   it('never returns an unenriched row from findKnownTxs', () => {
-    // Otherwise the backfill would treat a row with no transaction as already
-    // known, skip fetching it, and BigInt(null) would throw downstream.
     indexMintsOnly();
-    expect(findKnownTxs(db, 1, ['0xa1', '0xb1']).size).toBe(0);
+    expect(findKnownTxs(db, 1, ['0xb1']).size).toBe(0);
+    expect(findKnownTxs(db, 1, ['0xa1']).size).toBe(1);
   });
 });
 
 describe('a full index', () => {
   function indexFull(): void {
     insertTransfers(db, [
-      fullRow({ contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xa1', blockNumber: 10 },
+      enrichedRow({ contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xa1', blockNumber: 10 },
         { from: WALLET, value: 1n }),
-      fullRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb1', blockNumber: 20 },
+      enrichedRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb1', blockNumber: 20 },
         { from: WALLET, value: 5n }),
     ]);
   }
-
-  it('defaults to full when nothing asked for otherwise', () => {
-    expect(getEnrichmentLevel(db, 1, COLL_A)).toBe('full');
-  });
 
   it('classifies the purchase as a buy', () => {
     indexFull();
@@ -274,7 +322,7 @@ describe('a full index', () => {
 
   it('excludes the zero address, since a burn recipient is not an acquirer', () => {
     insertTransfers(db, [
-      fullRow({ contract: COLL_A, fromAddr: ZERO, toAddr: ZERO, txHash: '0xa1' },
+      enrichedRow({ contract: COLL_A, fromAddr: ZERO, toAddr: ZERO, txHash: '0xa1' },
         { from: WALLET, value: 0n }),
     ]);
     expect(overlap(db, { chainId: 1, contracts: [COLL_A], minCollections: 1 })).toEqual([]);
@@ -284,53 +332,59 @@ describe('a full index', () => {
     expect(() => overlap(db, {
       chainId: 1, contracts: [COLL_A.toUpperCase().replace('0X', '0x')], minCollections: 1,
     })).toThrow(/must be lowercase/);
+    expect(() => firstMinters(db, {
+      chainId: 1, contract: COLL_A.toUpperCase().replace('0X', '0x'), limit: 1,
+    })).toThrow(/must be lowercase/);
   });
 });
 
-describe('upgrading mints_only to full', () => {
+describe('climbing the levels', () => {
   beforeEach(() => {
-    setEnrichmentLevel(db, { chainId: 1, contract: COLL_B, level: 'mints_only' });
+    setEnrichmentLevel(db, { chainId: 1, contract: COLL_B, level: 'logs_only' });
     insertTransfers(db, [
-      mintsOnlyRow({ contract: COLL_B, fromAddr: ZERO, toAddr: OTHER, txHash: '0xb1', blockNumber: 10 }),
-      mintsOnlyRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb2', blockNumber: 20 }),
+      unenrichedRow({ contract: COLL_B, fromAddr: ZERO, toAddr: FRESH[0]!, txHash: '0xb1', blockNumber: 10 }),
+      unenrichedRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb2', blockNumber: 20 }),
     ]);
   });
 
-  it('lists every transaction still missing, mints included', () => {
-    // Keyed on tx_from IS NULL, not on kind: the mint's kind was already known,
-    // but a 'full' index must still carry its transaction or mint price is NULL
-    // with no explanation.
-    expect(findTxHashesNeedingEnrichment(db, 1, COLL_B)).toEqual([
-      { txHash: '0xb1', blockNumber: 10 },
-      { txHash: '0xb2', blockNumber: 20 },
-    ]);
+  it('logs_only -> mints_only fetches the mint and unblocks firstMinters', () => {
+    expect(() => firstMinters(db, { chainId: 1, contract: COLL_B, limit: 5 }))
+      .toThrow(EnrichmentLevelError);
+
+    const owed = findTxHashesNeedingEnrichment(db, 1, COLL_B, 'mints_only');
+    expect(owed.map((r) => r.txHash)).toEqual(['0xb1']);
+
+    applyEnrichment(db, { chainId: 1, txs: new Map([['0xb1', { from: BOT, value: 2n }]]) });
+    setEnrichmentLevel(db, { chainId: 1, contract: COLL_B, level: 'mints_only' });
+
+    const [row] = firstMinters(db, { chainId: 1, contract: COLL_B, limit: 5 });
+    expect(row?.minter).toBe(BOT);
+    expect(row?.firstRecipient).toBe(FRESH[0]);
+    expect(row?.mintedToOthers).toBe(true);
+
+    // The sale is still unclassified, so overlap stays refused.
+    expect(() => overlap(db, { chainId: 1, contracts: [COLL_B], minCollections: 1 }))
+      .toThrow(EnrichmentLevelError);
   });
 
-  it('enriches ONLY the missing transactions on a second pass', () => {
-    // Requirement: upgrading enriches what is missing, not everything.
-    expect(applyEnrichment(db, {
-      chainId: 1, txs: new Map([['0xb1', { from: OTHER, value: 3n }]]),
-    })).toBe(1);
+  it('mints_only -> full fetches ONLY what is still missing', () => {
+    applyEnrichment(db, { chainId: 1, txs: new Map([['0xb1', { from: BOT, value: 2n }]]) });
+    expect(findTxHashesNeedingEnrichment(db, 1, COLL_B, 'full').map((r) => r.txHash))
+      .toEqual(['0xb2']);
 
-    expect(findTxHashesNeedingEnrichment(db, 1, COLL_B))
-      .toEqual([{ txHash: '0xb2', blockNumber: 20 }]);
-
-    // Re-offering the already-enriched hash updates nothing.
+    // Re-offering the already-enriched hash changes nothing.
     expect(applyEnrichment(db, {
       chainId: 1, txs: new Map([['0xb1', { from: OTHER, value: 999n }]]),
     })).toBe(0);
-    expect(db.prepare("SELECT tx_value_wei FROM transfers WHERE tx_hash = '0xb1'").get())
-      .toEqual({ tx_value_wei: '3' });
+    expect(db.prepare("SELECT tx_from FROM transfers WHERE tx_hash = '0xb1'").get())
+      .toEqual({ tx_from: BOT });
   });
 
-  it('reclassifies the unclassified row into a buy and unblocks overlap', () => {
-    expect(() => overlap(db, { chainId: 1, contracts: [COLL_B], minCollections: 1 }))
-      .toThrow(EnrichmentLevelError);
-
+  it('reaches a state where both queries answer', () => {
     applyEnrichment(db, {
       chainId: 1,
       txs: new Map([
-        ['0xb1', { from: OTHER, value: 1n }],
+        ['0xb1', { from: BOT, value: 2n }],
         ['0xb2', { from: WALLET, value: 7n }],
       ]),
     });
@@ -340,56 +394,81 @@ describe('upgrading mints_only to full', () => {
     expect(countByKind(db, 1, COLL_B)).toEqual({
       mint: 1, buy: 1, transfer: 0, burn: 0, unclassified: 0,
     });
-    // Equal counts tie-break on address ascending: WALLET is 0xccc…, OTHER 0xddd….
+    expect(firstMinters(db, { chainId: 1, contract: COLL_B, limit: 5 })).toHaveLength(1);
     expect(overlap(db, { chainId: 1, contracts: [COLL_B], minCollections: 1 }))
       .toEqual([
         { address: WALLET, collections: 1 },
-        { address: OTHER, collections: 1 },
+        { address: FRESH[0], collections: 1 },
       ]);
   });
 
-  it('leaves a hash it was not given untouched, so the gate still refuses', () => {
-    // A partial fetch must leave a partial index that is still refused, not a
-    // complete-looking one that is wrong.
-    applyEnrichment(db, { chainId: 1, txs: new Map([['0xb1', { from: OTHER, value: 1n }]]) });
+  it('leaves a hash it was not given untouched, so the gates still refuse', () => {
+    applyEnrichment(db, { chainId: 1, txs: new Map([['0xb1', { from: BOT, value: 1n }]]) });
     expect(countUnclassified(db, 1, COLL_B)).toBe(1);
     expect(() => overlap(db, { chainId: 1, contracts: [COLL_B], minCollections: 1 }))
       .toThrow(EnrichmentLevelError);
   });
 
   it('classifies a WETH sale as transfer once enriched, not as unclassified', () => {
-    // tx.value === 0n is a known limitation, but it is a DECIDED answer: the
-    // transaction was fetched and said zero. That is different from never having
-    // looked, and the two must not collapse into one state.
+    // A DECIDED zero is different from never having looked; the two must not
+    // collapse into one state.
     applyEnrichment(db, { chainId: 1, txs: new Map([['0xb2', { from: WALLET, value: 0n }]]) });
     expect(db.prepare("SELECT kind FROM transfers WHERE tx_hash = '0xb2'").get())
       .toEqual({ kind: 'transfer' });
   });
 });
 
-describe('requireFullEnrichment', () => {
-  it('passes on an empty contract list', () => {
+describe('the gates are derived from rows, not from the level column', () => {
+  it('lets overlap through when every transfer happened to be log-decidable', () => {
+    // A mints_only collection holding only mints and burns has nothing
+    // unclassified, so its overlap answer really is complete. Refusing on the
+    // declared level alone would force a pointless re-index.
+    setEnrichmentLevel(db, { chainId: 1, contract: COLL_A, level: 'mints_only' });
+    insertTransfers(db, [
+      enrichedRow({ contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xa1' },
+        { from: WALLET, value: 1n }),
+      enrichedRow({ contract: COLL_A, fromAddr: SELLER, toAddr: ZERO, txHash: '0xa2', logIndex: 1 },
+        { from: SELLER, value: 0n }),
+    ]);
+    expect(getEnrichmentLevel(db, 1, COLL_A)).toBe('mints_only');
+    expect(overlap(db, { chainId: 1, contracts: [COLL_A], minCollections: 1 }))
+      .toEqual([{ address: WALLET, collections: 1 }]);
+  });
+
+  it('lets firstMinters through on a logs_only collection that has no mints', () => {
+    setEnrichmentLevel(db, { chainId: 1, contract: COLL_A, level: 'logs_only' });
+    insertTransfers(db, [
+      unenrichedRow({ contract: COLL_A, fromAddr: SELLER, toAddr: WALLET, txHash: '0xa1' }),
+    ]);
+    expect(firstMinters(db, { chainId: 1, contract: COLL_A, limit: 5 })).toEqual([]);
+  });
+
+  it('passes requireFullEnrichment on an empty contract list', () => {
     expect(() => requireFullEnrichment(db, { chainId: 1, contracts: [], queryName: 'q' }))
       .not.toThrow();
   });
 
   it('ignores unclassified rows belonging to a collection not asked about', () => {
     insertTransfers(db, [
-      mintsOnlyRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb1' }),
+      unenrichedRow({ contract: COLL_B, fromAddr: SELLER, toAddr: WALLET, txHash: '0xb1' }),
     ]);
     expect(() => requireFullEnrichment(db, {
       chainId: 1, contracts: [COLL_A], queryName: 'overlap',
     })).not.toThrow();
   });
 
-  it('ignores unclassified rows on a different chain', () => {
+  it('ignores rows on a different chain', () => {
     db.prepare('INSERT INTO collections (chain_id, contract, standard) VALUES (8453, ?, ?)')
       .run(COLL_A, '721');
     insertTransfers(db, [
-      mintsOnlyRow({ chainId: 8453, contract: COLL_A, fromAddr: SELLER, toAddr: WALLET, txHash: '0xz1' }),
+      unenrichedRow({ chainId: 8453, contract: COLL_A, fromAddr: SELLER, toAddr: WALLET, txHash: '0xz1' }),
+      unenrichedRow({ chainId: 8453, contract: COLL_A, fromAddr: ZERO, toAddr: WALLET, txHash: '0xz2', logIndex: 1 }),
     ]);
     expect(() => requireFullEnrichment(db, {
       chainId: 1, contracts: [COLL_A], queryName: 'overlap',
+    })).not.toThrow();
+    expect(() => requireMintEnrichment(db, {
+      chainId: 1, contract: COLL_A, queryName: 'firstMinters',
     })).not.toThrow();
   });
 });

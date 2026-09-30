@@ -107,28 +107,78 @@ export function requireFullEnrichment(
 }
 
 /**
- * The transaction hashes an upgrade to `full` still has to fetch.
+ * Refuses a query that needs the ACTING wallet against an index that never
+ * fetched it.
+ *
+ * `firstMinters` reports `tx_from` — who sent the mint — alongside the recipient,
+ * because that is how one wallet minting to many fresh addresses is told apart
+ * from many wallets each minting once. On a `logs_only` index `tx_from` is NULL
+ * on every mint, so the query could only report recipients, and the bot pattern
+ * it exists to surface would read as unrelated collectors. That is a wrong answer
+ * of the same kind as an undercounted `overlap`, so it gets the same treatment: a
+ * throw naming the fix, not a partial result.
+ *
+ * Derived from the rows, like `requireFullEnrichment` and for the same reasons —
+ * and precise in the honest direction: a collection with no mints, or one whose
+ * mints were all enriched, has nothing missing and is allowed through whatever
+ * `enrichment_level` claims.
+ */
+export function requireMintEnrichment(
+  db: Database.Database,
+  a: { chainId: number; contract: string; queryName: string },
+): void {
+  const row = db
+    .prepare(`
+      SELECT COUNT(*) AS n FROM transfers
+       WHERE chain_id = ? AND contract = ? AND kind = 'mint' AND tx_from IS NULL
+    `)
+    .get(a.chainId, a.contract) as { n: number };
+  if (row.n === 0) return;
+
+  const level = getEnrichmentLevel(db, a.chainId, a.contract) ?? 'unknown';
+  throw new EnrichmentLevelError(
+    `${a.queryName} needs the minting wallet, but ${row.n} mint(s) of ` +
+    `${a.contract} on chain ${a.chainId} were indexed without their transaction ` +
+    `(level '${level}'). tx_from is NULL on those rows, so only the RECIPIENT of ` +
+    'each mint is known, not the wallet that sent it — one wallet minting to many ' +
+    'fresh addresses would be reported as many unrelated minters. Re-index this ' +
+    "collection at 'mints_only' or 'full'; the upgrade fetches only the missing " +
+    'transactions, not the logs again.',
+  );
+}
+
+/**
+ * The transaction hashes an upgrade to `target` still has to fetch.
  *
  * Keyed on `tx_from IS NULL`, NOT on `kind = 'unclassified'`. The two differ and
- * both are right for their own job: the gate above cares only about rows whose
- * KIND is unknown, while completeness means every row carries its transaction —
- * including the mints and burns, whose kind was already decidable from the log
- * but whose `tx_value_wei` (the mint price) a later feature will want. Gating on
- * `kind` here would leave a 'full' index full of NULL mint prices.
+ * both are right for their own job: the `overlap` gate cares only about rows
+ * whose KIND is unknown, while enrichment completeness means a row carries its
+ * transaction at all — including mints, whose kind was already decidable from the
+ * log but whose `tx_from` (the acting wallet) and `tx_value_wei` (the mint price)
+ * are the reason to fetch them. Keying on `kind` here would leave a 'full' index
+ * full of NULL minters.
+ *
+ * Narrowed by `target` so each upgrade fetches only what that level owes:
+ * `'mints_only'` collects mint rows alone, `'full'` collects everything still
+ * missing, and `'logs_only'` owes nothing. This is what makes logs_only ->
+ * mints_only -> full a staircase rather than three separate backfills.
  *
  * Reads hashes off disk rather than re-scanning the chain's logs, which is the
- * whole reason a `mints_only` run stores every row instead of just the mints.
+ * whole reason every level below 'full' stores all rows and not just the mints.
  */
 export function findTxHashesNeedingEnrichment(
   db: Database.Database,
   chainId: number,
   contract: string,
+  target: EnrichmentLevel,
 ): Array<{ txHash: string; blockNumber: number }> {
+  if (target === 'logs_only') return [];
+  const onlyMints = target === 'mints_only' ? "AND kind = 'mint'" : '';
   return db
     .prepare(`
       SELECT tx_hash AS txHash, MIN(block_number) AS blockNumber
         FROM transfers
-       WHERE chain_id = ? AND contract = ? AND tx_from IS NULL
+       WHERE chain_id = ? AND contract = ? AND tx_from IS NULL ${onlyMints}
        GROUP BY tx_hash
        ORDER BY blockNumber, tx_hash
     `)
@@ -158,6 +208,13 @@ export function findTxHashesNeedingEnrichment(
  * One statement, one transaction: an upgrade that committed half a chunk under a
  * flipped `enrichment_level` would leave the column claiming 'full' over rows
  * that are not.
+ *
+ * A transaction fetched for a mint also enriches any OTHER row sharing that
+ * transaction, because the data is already in hand — free, and strictly better
+ * than discarding it. So a `mints_only` run can leave fewer unclassified rows than
+ * its level implies. That is not a discrepancy to correct: the gates read the rows,
+ * so the extra classifications simply count, and a collection whose sales all
+ * shared a transaction with a mint is genuinely complete.
  *
  * @returns how many rows were updated.
  */

@@ -23,11 +23,22 @@ export type LogDecidableKind = Extract<Kind, 'mint' | 'burn'>;
 /**
  * How much transaction data an index was asked to carry.
  *
- * `'mints_only'` fetches no transactions at all and leaves every row that needs
- * one `'unclassified'`; `firstMinters` is complete and exact on it because mints
- * are log-decidable. `'full'` fetches the transaction for every row.
+ * - `'logs_only'` fetches nothing. Every `kind` that needs a transaction is
+ *   `'unclassified'`, and mint rows carry a null `tx_from`. Cheapest and LEAST
+ *   USEFUL: it can name who received a mint but not who sent it. Never a default.
+ * - `'mints_only'` fetches the transaction for every MINT row, leaving non-mints
+ *   `'unclassified'`. This is the cheap-but-useful level: `firstMinters` works,
+ *   including the acting wallet.
+ * - `'full'` fetches the transaction for every row. Required by `overlap`.
+ *
+ * WHY `'mints_only'` STILL FETCHES, though `mint` is decidable from the log
+ * alone: `tx_from` on a mint is the ACTING wallet, and the acting wallet is the
+ * product. One bot minting 200 tokens to 200 fresh addresses and 200 separate
+ * collectors produce identical rows once `tx_from` is null — the index can only
+ * report recipients, so the single most important pattern it exists to surface
+ * becomes invisible. Classification is not the only thing a transaction is for.
  */
-export type EnrichmentLevel = 'mints_only' | 'full';
+export type EnrichmentLevel = 'logs_only' | 'mints_only' | 'full';
 
 export type DeployBlockSource = 'override' | 'explorer' | 'binary_search';
 

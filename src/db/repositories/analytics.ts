@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import { ByakuganError } from '../../errors.js';
 import { ZERO_ADDRESS } from '../../types.js';
 import { chunked } from '../chunked.js';
-import { requireFullEnrichment } from './enrichment.js';
+import { requireFullEnrichment, requireMintEnrichment } from './enrichment.js';
 
 /**
  * Query inputs are asserted lowercase rather than normalised, for the same
@@ -24,7 +24,16 @@ function assertLowercaseAddress(label: string, value: string): void {
 }
 
 export interface FirstMinter {
-  address: string;
+  /** The wallet that SENT the mint transaction — the acting wallet. */
+  minter: string;
+  /** Who received this wallet's earliest mint. Equal to `minter` in the ordinary case. */
+  firstRecipient: string;
+  /** Distinct addresses this wallet minted to in this collection. */
+  recipients: number;
+  /** Token movements this wallet minted in this collection. */
+  minted: number;
+  /** True when any of them went somewhere other than the minter itself. */
+  mintedToOthers: boolean;
   blockNumber: number;
   logIndex: number;
   batchIndex: number;
@@ -32,12 +41,25 @@ export interface FirstMinter {
 }
 
 /**
- * The wallets that minted earliest, one row per wallet, in chain order.
+ * The wallets that minted earliest, one row per ACTING wallet, in chain order.
  *
- * NO ENRICHMENT GATE, deliberately — this is the query that makes `mints_only`
- * worth having. `mint` is `from == 0x0`, decidable from the log alone, so a
- * `mints_only` index answers this completely and exactly while having fetched no
- * transactions at all. The gate belongs on `overlap`, which needs `buy`.
+ * GROUPED BY `tx_from`, NOT by recipient. The acting wallet is the unit the
+ * product cares about: a bot minting 200 tokens to 200 fresh addresses is one
+ * minter, and grouping by recipient would report it as 200 — filling a top-10
+ * with a single actor and hiding the genuine minters behind it. `recipients`,
+ * `minted` and `mintedToOthers` carry the pattern out to the caller instead of
+ * discarding it, so mint-to-others is visible rather than merely not wrong.
+ *
+ * GATED by `requireMintEnrichment`. An earlier revision of this function had no
+ * gate, on the reasoning that `mint` is decidable from the log alone and so a
+ * zero-fetch index could answer it exactly. That was true of the CLASSIFICATION
+ * and false of the query: with no transaction, `tx_from` is NULL on every mint,
+ * there is no acting wallet to group by, and the answer collapses back to a list
+ * of recipients — the exact failure above. Deciding `kind` is not the only thing
+ * a transaction is needed for.
+ *
+ * The gate is also what makes `tx_from` safe to group by here: it guarantees no
+ * mint row for this collection has a null one.
  *
  * Ordered by (block_number, log_index, batch_index). `batch_index` is in the key
  * because an ERC-1155 `TransferBatch` is a single log: without it, mints inside
@@ -49,23 +71,45 @@ export function firstMinters(
   a: { chainId: number; contract: string; limit: number },
 ): FirstMinter[] {
   assertLowercaseAddress('contract', a.contract);
-  return db
+  requireMintEnrichment(db, {
+    chainId: a.chainId,
+    contract: a.contract,
+    queryName: 'firstMinters',
+  });
+
+  const rows = db
     .prepare(`
-      SELECT to_addr AS address, block_number AS blockNumber,
-             log_index AS logIndex, batch_index AS batchIndex, token_id AS tokenId
-        FROM (
-          SELECT to_addr, block_number, log_index, batch_index, token_id,
-                 ROW_NUMBER() OVER (
-                   PARTITION BY to_addr ORDER BY block_number, log_index, batch_index
-                 ) AS rn
-            FROM transfers
-           WHERE chain_id = @chainId AND contract = @contract AND kind = 'mint'
-        )
-       WHERE rn = 1
-       ORDER BY blockNumber, logIndex, batchIndex
+      WITH mints AS (
+        SELECT tx_from, to_addr, block_number, log_index, batch_index, token_id
+          FROM transfers
+         WHERE chain_id = @chainId AND contract = @contract AND kind = 'mint'
+      ),
+      firsts AS (
+        SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY tx_from ORDER BY block_number, log_index, batch_index
+                  ) AS rn
+          FROM mints
+      ),
+      totals AS (
+        SELECT tx_from,
+               COUNT(*) AS minted,
+               COUNT(DISTINCT to_addr) AS recipients,
+               MAX(CASE WHEN to_addr <> tx_from THEN 1 ELSE 0 END) AS toOthers
+          FROM mints
+         GROUP BY tx_from
+      )
+      SELECT f.tx_from AS minter, f.to_addr AS firstRecipient,
+             f.block_number AS blockNumber, f.log_index AS logIndex,
+             f.batch_index AS batchIndex, f.token_id AS tokenId,
+             t.minted, t.recipients, t.toOthers
+        FROM firsts f JOIN totals t ON t.tx_from = f.tx_from
+       WHERE f.rn = 1
+       ORDER BY f.block_number, f.log_index, f.batch_index
        LIMIT @limit
     `)
-    .all(a) as FirstMinter[];
+    .all(a) as Array<Omit<FirstMinter, 'mintedToOthers'> & { toOthers: number }>;
+
+  return rows.map(({ toOthers, ...rest }) => ({ ...rest, mintedToOthers: toOthers === 1 }));
 }
 
 export interface OverlapRow {

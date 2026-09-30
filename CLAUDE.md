@@ -86,6 +86,20 @@ rule rather than an incident:
 you reach by failing to look. Audit every residual `else`/default for whether it
 can be reached by absent input rather than by decided input.
 
+**And a corollary, learned by getting it wrong immediately afterwards: deciding
+`kind` is not the only thing a fetch is for.** Having established that `mint` is
+`from == 0x0` and needs no transaction, the obvious optimisation was a level that
+fetched nothing at all — correct about classification, and it quietly destroyed
+the product. `tx_from` on a mint is the ACTING wallet, and one bot minting 200
+tokens to 200 fresh addresses produces rows identical to 200 collectors once
+`tx_from` is null. The index could still report every mint, so nothing looked
+broken; it just could not answer the question the whole bot exists to answer.
+
+Before cutting a fetch because the classifier does not need the data, check what
+the QUERIES report out of it. The cheap level must stay useful, not merely
+correct. Levels now run `logs_only` (fetches nothing, gated away from
+`firstMinters`, never a default) → `mints_only` (mints enriched) → `full`.
+
 Three things follow, and they are cheap:
 
 1. Give "not looked at" its own representable state, distinct from every real

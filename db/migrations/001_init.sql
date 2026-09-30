@@ -48,14 +48,23 @@ CREATE TABLE IF NOT EXISTS collections (
                            CHECK (deploy_block_validated IN (0, 1)),
   -- Which enrichment level the indexer was ASKED to produce:
   --
-  --   'mints_only'  fetches NO transactions at all. mint and burn are decidable
-  --                 from the log alone, so `firstMinters` is complete and exact
-  --                 on this level at zero enrichment cost. Every other row is
-  --                 stored 'unclassified'.
-  --   'full'        fetches the transaction for EVERY row, including mints. The
-  --                 mint rows do not need it for their `kind`, but 'full' has to
-  --                 mean what it says, or a later feature reading mint price off
-  --                 a 'full' index finds NULLs and no explanation.
+  --   'logs_only'   fetches NOTHING. mint and burn are decidable from the log
+  --                 alone, so their `kind` is correct — but `tx_from` is NULL on
+  --                 every row, so the index can name who RECEIVED a mint and not
+  --                 who SENT it. See below for why that is nearly useless.
+  --                 Never the default for anything; `firstMinters` refuses it.
+  --   'mints_only'  fetches the transaction for every MINT row. Non-mints are
+  --                 stored 'unclassified'. The cheap level that still works.
+  --   'full'        fetches the transaction for EVERY row. Required by `overlap`,
+  --                 which cannot tell a buy from a transfer without one.
+  --
+  -- WHY 'mints_only' FETCHES TRANSACTIONS AT ALL, when `mint` is decidable from
+  -- the log: `tx_from` on a mint is the ACTING wallet, which is the entire point
+  -- of tracking minters. With `tx_from` NULL, one bot minting 200 tokens to 200
+  -- fresh addresses is indistinguishable from 200 independent collectors — the
+  -- rows are identical and only recipients can be reported. Deciding `kind` is
+  -- not the only thing a transaction is needed for, and optimising enrichment
+  -- against classification alone silently removes the product's main signal.
   --
   -- This column is the declared INTENT, used to decide what an upgrade must
   -- fetch and to tell the owner what to re-run. It is deliberately NOT what
@@ -69,7 +78,8 @@ CREATE TABLE IF NOT EXISTS collections (
   -- Defaults to 'full' so a caller that never mentions enrichment gets the
   -- complete, correct index rather than a silently cheaper one.
   enrichment_level    TEXT    NOT NULL DEFAULT 'full'
-                           CHECK (enrichment_level IN ('mints_only','full')),
+                           CHECK (enrichment_level IN ('logs_only','mints_only',
+                                                       'full')),
   last_indexed_block  INTEGER,
   indexed_at          INTEGER,   -- epoch ms
   locked_by           TEXT,
@@ -108,12 +118,13 @@ CREATE TABLE IF NOT EXISTS collections (
 --      present, 'unclassified' is conversely forbidden — the work was done, so
 --      the row must carry its result.
 --
--- INVARIANT NOT EXPRESSIBLE HERE, stated so it is not lost: a 'mints_only' run
--- stores EVERY decoded transfer, marking the undecidable ones 'unclassified'.
--- It must never store just the mints. If non-mint rows were absent instead of
--- unclassified there would be nothing for the gate to detect, `overlap` would
--- undercount against an apparently clean index, and an upgrade would have to
--- re-read the chain's logs rather than the tx_hashes already on disk.
+-- INVARIANT NOT EXPRESSIBLE HERE, stated so it is not lost: a run at ANY level
+-- below 'full' stores EVERY decoded transfer, marking the undecidable ones
+-- 'unclassified'. It must never store just the mints. If non-mint rows were
+-- absent instead of unclassified there would be nothing for the gate to detect,
+-- `overlap` would undercount against an apparently clean index, and an upgrade
+-- would have to re-read the chain's logs rather than the tx_hashes already on
+-- disk.
 CREATE TABLE IF NOT EXISTS transfers (
   chain_id     INTEGER NOT NULL,
   contract     TEXT    NOT NULL CHECK (contract = lower(contract)),

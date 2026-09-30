@@ -6074,10 +6074,14 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 > `src/db/repositories/enrichment.ts` holds the gate, the upgrade query and
 > `applyEnrichment`. What remains for THIS task:
 >
-> 1. `enrichTxs` takes the level. Under `'mints_only'` it fetches **nothing** and
->    returns an empty map — `mint` and `burn` are decidable from the log alone, so
->    `firstMinters` is complete and exact at zero enrichment cost. It is not a
->    reduced fetch; it is no fetch.
+> 1. `enrichTxs` takes the level, one of `'logs_only' | 'mints_only' | 'full'`.
+>    `'logs_only'` fetches nothing and returns an empty map; `'mints_only'` fetches
+>    the transaction for every MINT row; `'full'` fetches every row. Default `'full'`.
+>    `'mints_only'` does NOT mean zero fetches: `tx_from` on a mint is the acting
+>    wallet, so a zero-fetch index can name recipients but not minters, and one bot
+>    minting to 200 fresh addresses reads as 200 collectors. `firstMinters` is gated
+>    against `'logs_only'` by `requireMintEnrichment` the way `overlap` is gated
+>    against unclassified rows.
 > 2. Rows the level leaves unenriched are stored via `classify(transfer, null)`,
 >    which yields `'unclassified'`. **`mints_only` still stores every decoded
 >    transfer** — never only the mints. Omitting them would leave nothing for the
