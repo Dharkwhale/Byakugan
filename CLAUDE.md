@@ -96,6 +96,34 @@ dependent on timing.
 
 ## Security bar
 
+### No secret ever reaches output. This is a hard rule, not a preference.
+
+**No secret of the owner's may reach any output path: not stdout, not stderr,
+not a log, not an error message, not a commit, not a report, not a scratch
+script.** That covers throwaway probes, one-off debugging, and anything run in
+a controller session — every path, without exception.
+
+A script that touches a credentialed endpoint **does not run** until its output
+is scrubbed at the boundary. If it is unclear whether a path is covered, it is
+not covered: add the guard first.
+
+Every file in `scripts/`, and every throwaway probe, imports
+`scripts/_scrub-output.ts` as its **first** import. That module intercepts
+`process.stdout.write` and `process.stderr.write` and installs
+`uncaughtException`/`unhandledRejection` handlers, so no print site can be
+forgotten and no thrown error can bypass it.
+
+This rule exists because it was broken. A scratch probe hit HTTP 429, the
+unhandled viem error printed its full dump including the request URL, and the
+owner's Alchemy API key went into a conversation transcript in plain text and
+had to be rotated. The probe *did* scrub — per call site, in the happy path
+only. That is the same mistake Task 2 exists to prevent: redaction at each
+print site gets forgotten, which is why the logger scrubs at serialization
+instead. The lesson had been applied to the product and not to the tooling.
+
+Rotating a key is the owner's work, not Claude's, so the cost of forgetting
+lands on them. Add the guard first.
+
 - Addresses are stored lowercase, enforced by `CHECK (col = lower(col))` at
   the database layer as well as at the boundary.
 - RPC URLs carry API keys in their path. Nothing may write one unredacted to

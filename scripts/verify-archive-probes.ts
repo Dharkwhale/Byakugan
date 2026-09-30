@@ -1,4 +1,7 @@
 /** Confirms each chains.json archiveProbe really has code at its block. */
+// MUST be the first import: installs output-boundary secret scrubbing before
+// anything can print. See CLAUDE.md, "No secret ever reaches output".
+import './_scrub-output.js';
 import { createPublicClient, http } from 'viem';
 import { loadConfig } from '../src/config.js';
 import { classifyProbeError } from '../src/chain/probeErrors.js';
