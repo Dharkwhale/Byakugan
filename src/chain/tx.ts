@@ -103,7 +103,14 @@ export function selectNeeded(
 export async function enrichTxs(a: {
   source: TxSource;
   needed: NeededTx[];
-  costs: FetchCosts;
+  /**
+   * NULL MEANS "the prices have not been measured", which is a real state and not an
+   * excuse to invent them. Under it the strategy is per-tx, because that is the path
+   * that cannot over-fetch: block-fetch downloads a whole block's transactions, and
+   * without prices there is no basis for believing that is cheaper. Defaulting to
+   * plausible-looking numbers instead would silently pick a path on invented evidence.
+   */
+  costs: FetchCosts | null;
   known?: Map<string, TxInfo>;
 }): Promise<Map<string, TxInfo>> {
   const out = new Map<string, TxInfo>();
@@ -121,14 +128,17 @@ export async function enrichTxs(a: {
   if (toFetch.size === 0) return out;
 
   const pending = [...toFetch.values()];
-  const density = measureDensity(
-    pending.map((p) => ({ txHash: p.txHash, blockNumber: p.blockNumber })),
-  );
-  const strategy: FetchStrategy = chooseFetchStrategy({
-    uniqueTxs: density.uniqueTxs,
-    uniqueBlocks: density.uniqueBlocks,
-    costs: a.costs,
-  });
+  let strategy: FetchStrategy = 'per-tx';
+  if (a.costs !== null) {
+    const density = measureDensity(
+      pending.map((p) => ({ txHash: p.txHash, blockNumber: p.blockNumber })),
+    );
+    strategy = chooseFetchStrategy({
+      uniqueTxs: density.uniqueTxs,
+      uniqueBlocks: density.uniqueBlocks,
+      costs: a.costs,
+    });
+  }
 
   const fetched = strategy === 'block-fetch'
     ? await fetchByBlock(a.source, pending)

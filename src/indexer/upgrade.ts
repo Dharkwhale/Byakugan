@@ -54,7 +54,7 @@ export async function upgradeEnrichment(a: {
   contract: string;
   target: EnrichmentLevel;
   txSource: TxSource;
-  costs: FetchCosts;
+  costs: FetchCosts | null;
 }): Promise<UpgradeResult> {
   const contract = a.contract.toLowerCase();
   const current = getEnrichmentLevel(a.db, a.chainId, contract);

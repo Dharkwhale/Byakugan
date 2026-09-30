@@ -63,7 +63,8 @@ export interface BackfillOptions {
   toBlock?: bigint;
   initialChunk: number;
   maxChunk: number;
-  costs: FetchCosts;
+  /** Null when compute-unit prices are unmeasured; see enrichTxs. */
+  costs: FetchCosts | null;
   staleLockMs: number;
   faults?: BackfillFaults;
   onProgress?(ctx: ChunkContext & { inserted: number }): void;

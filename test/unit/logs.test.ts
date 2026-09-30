@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { errorText, isRangeError, iterateLogs, suggestedRange } from '../../src/indexer/logs.js';
+import { errorText, isRangeError, iterateLogs, suggestedRange, probeEffectiveChunk
+} from '../../src/indexer/logs.js';
 import { RangeExhaustedError } from '../../src/errors.js';
 import type { RawLog } from '../../src/indexer/decode.js';
 
@@ -496,5 +497,104 @@ describe('iterateLogs — bounded failure', () => {
       fromBlock: 0n, toBlock: 10n, initialChunk: 10, maxChunk: 10,
     });
     await expect(gen.next()).rejects.toThrow(/JSON is not a valid request object/);
+  });
+});
+
+describe('probeEffectiveChunk', () => {
+  /**
+   * This exists because the dry-run estimate read its chunk size from config.maxChunk
+   * (20,000 on Base) while the measured cap on the configured account is 10 — reporting
+   * a 38-million-block backfill as "76 seconds" when the honest answer is 42 hours. An
+   * estimate three orders of magnitude optimistic invites the very accident it guards.
+   */
+  const rangeError = (suggestion?: string) =>
+    Object.assign(new Error('query failed'), {
+      details: suggestion
+        ? `Log response size exceeded. You can make eth_getLogs requests with up to a 10 block range. Based on your parameters and the response size limit, this block range should work: [${suggestion}]`
+        : 'query returned more than 10000 results',
+    });
+
+  it('reports the requested size when the endpoint accepts it', async () => {
+    const fetch = vi.fn(async () => []);
+    const result = await probeEffectiveChunk({
+      fetch, nearBlock: 1_000n, requested: 5_000,
+    });
+    expect(result).toMatchObject({ blocks: 5_000, measured: true });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('adopts the range the provider names, rather than halving blindly', async () => {
+    // Measured behaviour: Alchemy names a workable range in the error. Halving from
+    // 20,000 to 10 takes eleven calls; reading the suggestion takes one.
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) throw rangeError('0x1, 0xa');
+      return [];
+    });
+    const result = await probeEffectiveChunk({
+      fetch, nearBlock: 1_000n, requested: 20_000,
+    });
+    expect(result).toMatchObject({ blocks: 10, measured: true });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('halves when the provider suggests nothing', async () => {
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) throw rangeError();
+      return [];
+    });
+    const result = await probeEffectiveChunk({ fetch, nearBlock: 1_000n, requested: 100 });
+    expect(result).toMatchObject({ blocks: 50, measured: true });
+  });
+
+  it('ignores a suggestion that is not narrower than what already failed', async () => {
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) throw rangeError('0x0, 0xffffff'); // wider than requested
+      return [];
+    });
+    const result = await probeEffectiveChunk({ fetch, nearBlock: 1_000n, requested: 100 });
+    expect(result.blocks).toBe(50); // halved, not widened
+  });
+
+  it('says NOT MEASURED rather than inventing a cap when every range is refused', async () => {
+    const fetch = vi.fn(async () => { throw rangeError(); });
+    const result = await probeEffectiveChunk({
+      fetch, nearBlock: 1_000n, requested: 64, maxAttempts: 4,
+    });
+    expect(result.measured).toBe(false);
+    expect(result.note).toMatch(/gave up after 4 probes/);
+  });
+
+  it('does not claim a measurement when the failure is unrelated to range', async () => {
+    // A refused socket tells us nothing about the cap. Reporting the requested size as
+    // "measured" would be a fabricated fact in the one output meant to be trusted.
+    const fetch = vi.fn(async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:1'); });
+    const result = await probeEffectiveChunk({ fetch, nearBlock: 1_000n, requested: 5_000 });
+    expect(result.measured).toBe(false);
+    expect(result.note).toMatch(/unrelated to range/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('never probes below a single block', async () => {
+    const fetch = vi.fn(async () => { throw rangeError(); });
+    const result = await probeEffectiveChunk({
+      fetch, nearBlock: 1_000n, requested: 2, maxAttempts: 10,
+    });
+    expect(result.blocks).toBeGreaterThanOrEqual(1);
+  });
+
+  it('never asks for a negative fromBlock near the start of a chain', async () => {
+    const seen: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+    const fetch = vi.fn(async (r: { fromBlock: bigint; toBlock: bigint }) => {
+      seen.push(r);
+      return [];
+    });
+    await probeEffectiveChunk({ fetch, nearBlock: 5n, requested: 1_000 });
+    expect(seen[0]!.fromBlock).toBe(0n);
   });
 });

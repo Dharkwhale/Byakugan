@@ -249,3 +249,77 @@ export async function* iterateLogs(a: {
     }
   }
 }
+
+/**
+ * Measures the provider's real `eth_getLogs` range cap, with at most a few calls.
+ *
+ * WHY THIS EXISTS: the dry-run cost estimate was reading its chunk size from
+ * `config.maxChunk`, which on Base is 20,000 — while the MEASURED cap on the
+ * configured account is 10. That made a 38-million-block backfill report as "76
+ * seconds" when the honest figure is days. An estimate exists to be trusted before
+ * committing to a long run, so one that is optimistic by three orders of magnitude is
+ * worse than none: it actively invites the accident it was built to prevent.
+ *
+ * The cap is a PLAN-TIER property, not a chain property, so it cannot be configured
+ * honestly — it has to be asked. Measured, not assumed, which is the same rule applied
+ * everywhere else in this project.
+ *
+ * Costs one call when the requested range is allowed, and typically two when it is not:
+ * providers that cap usually name a workable range in the error, and `suggestedRange`
+ * reads it rather than halving blindly. Falls back to halving, bounded, and reports
+ * `measured: false` rather than inventing a number if nothing is ever accepted.
+ *
+ * Queried against a range ENDING at `nearBlock` so it probes real recent history; a
+ * zero-result window still caps, which is measured and is why any range will do.
+ */
+export async function probeEffectiveChunk(a: {
+  fetch: LogFetcher;
+  nearBlock: bigint;
+  requested: number;
+  maxAttempts?: number;
+}): Promise<{ blocks: number; measured: boolean; note: string }> {
+  const maxAttempts = a.maxAttempts ?? 8;
+  let range = BigInt(Math.max(1, a.requested));
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const from = a.nearBlock - range + 1n;
+    try {
+      await a.fetch({ fromBlock: from < 0n ? 0n : from, toBlock: a.nearBlock });
+      return {
+        blocks: Number(range),
+        measured: true,
+        note: attempt === 0
+          ? `the requested ${range}-block range was accepted`
+          : `measured by probing: ${range} blocks accepted after ${attempt + 1} attempts`,
+      };
+    } catch (err) {
+      if (!isRangeError(err)) {
+        // Not a range complaint — a transport failure, or an endpoint refusing the
+        // request itself. Narrowing cannot help and pretending otherwise would report
+        // a cap that was never established.
+        return {
+          blocks: Number(range),
+          measured: false,
+          note: 'could not be measured: the endpoint failed for a reason unrelated to ' +
+            'range, so this figure is the requested size and not a verified cap',
+        };
+      }
+      const suggestion = suggestedRange(err);
+      const suggestedWidth = suggestion
+        ? suggestion.toBlock - suggestion.fromBlock + 1n
+        : undefined;
+      // Only adopt a suggestion that is actually narrower, matching iterateLogs.
+      range = suggestedWidth !== undefined && suggestedWidth < range
+        ? suggestedWidth
+        : range / 2n;
+      if (range < 1n) range = 1n;
+    }
+  }
+
+  return {
+    blocks: Number(range),
+    measured: false,
+    note: `gave up after ${maxAttempts} probes; the endpoint refused every range down ` +
+      `to ${range} blocks`,
+  };
+}

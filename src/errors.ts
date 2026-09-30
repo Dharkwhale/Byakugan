@@ -6,6 +6,18 @@ export class ByakuganError extends Error {
 }
 
 export class ConfigError extends ByakuganError {}
+
+/**
+ * The COMMAND was wrong: a malformed address, an unknown option, a flag missing its
+ * value, an unrecognised enrichment level.
+ *
+ * Split from `ConfigError` because the two have different fixes and the CLI attaches a
+ * different hint to each. Folded together, a mistyped address was being told to "set
+ * the missing environment variable and add the chain to config/chains.json", which is
+ * advice about a problem it does not have — and a misleading hint is worse than none,
+ * since it sends the reader somewhere the fault is not.
+ */
+export class UsageError extends ByakuganError {}
 export class UnsupportedStandardError extends ByakuganError {}
 export class DeployBlockUnavailableError extends ByakuganError {}
 export class RangeExhaustedError extends ByakuganError {}
