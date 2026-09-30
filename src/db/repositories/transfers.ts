@@ -49,6 +49,12 @@ export function insertTransfers(db: Database.Database, rows: TransferRow[]): num
  * nothing. The `IN` list is chunked to stay under the bound-variable limit, and
  * the results are unioned into one Map — which also dedupes a hash that appears
  * in more than one chunk.
+ *
+ * `tx_from IS NOT NULL` is load-bearing, not defensive. Rows written by a
+ * `mints_only` run carry no transaction, and without this filter such a row
+ * would be returned as known: `BigInt(null)` throws, and if it did not, the
+ * caller would skip fetching a transaction it does not actually have and store
+ * a null sender. An unenriched row is precisely a row that is NOT known.
  */
 export function findKnownTxs(
   db: Database.Database,
@@ -62,7 +68,8 @@ export function findKnownTxs(
       .prepare(`
         SELECT tx_hash, tx_from, tx_value_wei
           FROM transfers
-         WHERE chain_id = ? AND tx_hash IN (${placeholders})
+         WHERE chain_id = ? AND tx_from IS NOT NULL
+           AND tx_hash IN (${placeholders})
       `)
       .all(chainId, ...group) as Array<{
         tx_hash: string; tx_from: string; tx_value_wei: string;
@@ -77,12 +84,20 @@ export function findKnownTxs(
   return out;
 }
 
+/**
+ * `unclassified` is reported as its own count, never folded into `transfer` and
+ * never dropped. A caller showing these numbers to the owner needs to be able to
+ * say "and 412 we haven't looked at yet" rather than implying everything is
+ * accounted for.
+ */
 export function countByKind(
   db: Database.Database,
   chainId: number,
   contract: string,
 ): Record<Kind, number> {
-  const counts: Record<Kind, number> = { mint: 0, buy: 0, transfer: 0, burn: 0 };
+  const counts: Record<Kind, number> = {
+    mint: 0, buy: 0, transfer: 0, burn: 0, unclassified: 0,
+  };
   const rows = db
     .prepare(`
       SELECT kind, COUNT(*) AS n FROM transfers

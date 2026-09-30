@@ -288,7 +288,8 @@ describe('countByKind', () => {
       row({ txHash: '0x2', kind: 'mint' }),
       row({ txHash: '0x3', kind: 'burn', fromAddr: MINTER, toAddr: ZERO }),
     ]);
-    expect(countByKind(db, 1, CONTRACT)).toEqual({ mint: 2, buy: 0, transfer: 0, burn: 1 });
+    expect(countByKind(db, 1, CONTRACT))
+      .toEqual({ mint: 2, buy: 0, transfer: 0, burn: 1, unclassified: 0 });
   });
 
   it('counts every row of a batch log separately', () => {
@@ -298,6 +299,6 @@ describe('countByKind', () => {
 
   it('returns all zeros for an unknown contract', () => {
     expect(countByKind(db, 1, '0x0000000000000000000000000000000000000000'))
-      .toEqual({ mint: 0, buy: 0, transfer: 0, burn: 0 });
+      .toEqual({ mint: 0, buy: 0, transfer: 0, burn: 0, unclassified: 0 });
   });
 });

@@ -42,6 +42,17 @@ function assertLowercase(label: string, value: string): void {
  * place to catch it is right here, by field name, rather than downstream as
  * an opaque SQLite CHECK failure (or, worse, not at all).
  *
+ * A NULL `tx` IS A REAL INPUT, not an error. Under the `mints_only` enrichment
+ * level no transaction is fetched at all, because `mint` and `burn` follow from
+ * the log alone. Telling `buy` from `transfer` does not, so with no transaction
+ * this returns `'unclassified'` — deliberately NOT `'transfer'`. Returning
+ * `'transfer'` would be the cheap, natural, wrong answer: it is what you get by
+ * failing to look, it is indistinguishable from a genuine transfer once stored,
+ * and it would lose every buy in the range while `overlap` reported plausible
+ * zeroes. The database refuses that row outright (see `db/migrations/001_init.sql`),
+ * and `requireFullEnrichment` refuses to answer `overlap` from any index still
+ * holding unclassified rows.
+ *
  * Known limitations, each pinned by a test:
  * - A sale paid in WETH or another ERC-20 carries `tx.value === 0n` and
  *   classifies as `transfer`.
@@ -52,36 +63,48 @@ function assertLowercase(label: string, value: string): void {
  */
 export function classify(
   transfer: Pick<DecodedTransfer, 'from' | 'to'>,
-  tx: TxInfo,
+  tx: TxInfo | null,
 ): Kind {
-  // TxInfo.value is typed bigint, but the repository stores tx_value_wei as
-  // TEXT, so a caller handing over a raw row passes a string.
-  //
-  // Measured: a NUMERIC string compares correctly ('10' > 0n is true, '0' is
-  // false), so that is not the risk. The risk is that `undefined`, `null`, ''
-  // and any non-numeric string ALL compare as false against 0n WITHOUT
-  // throwing — so a missing or malformed value reads as unpaid and silently
-  // downgrades a genuine buy to a transfer. Numeric strings happening to work
-  // is precisely why trusting the comparison rather than the type is fragile.
-  if (typeof tx.value !== 'bigint') {
-    throw new ClassifyError(
-      `tx.value must be a bigint, received ${typeof tx.value}. A non-bigint ` +
-      'value cannot be compared reliably, and a missing or malformed one ' +
-      "(undefined, null, '', or a non-numeric string) would silently read as " +
-      'unpaid and downgrade a genuine buy to a transfer. Convert with BigInt() ' +
-      'before classifying.',
-    );
+  // Validated BEFORE the log-decidable shortcut below, on purpose. A caller
+  // passing raw rows is broken for every row, not just its non-mints; checking
+  // after the `mint`/`burn` returns would let a whole mint-heavy backfill pass
+  // and surface the fault only on the first sale.
+  if (tx !== null) {
+    // TxInfo.value is typed bigint, but the repository stores tx_value_wei as
+    // TEXT, so a caller handing over a raw row passes a string.
+    //
+    // Measured: a NUMERIC string compares correctly ('10' > 0n is true, '0' is
+    // false), so that is not the risk. The risk is that `undefined`, `null`, ''
+    // and any non-numeric string ALL compare as false against 0n WITHOUT
+    // throwing — so a missing or malformed value reads as unpaid and silently
+    // downgrades a genuine buy to a transfer. Numeric strings happening to work
+    // is precisely why trusting the comparison rather than the type is fragile.
+    if (typeof tx.value !== 'bigint') {
+      throw new ClassifyError(
+        `tx.value must be a bigint, received ${typeof tx.value}. A non-bigint ` +
+        'value cannot be compared reliably, and a missing or malformed one ' +
+        "(undefined, null, '', or a non-numeric string) would silently read as " +
+        'unpaid and downgrade a genuine buy to a transfer. Convert with BigInt() ' +
+        'before classifying. To classify without a transaction, pass null ' +
+        'explicitly — that yields "unclassified", not a guess.',
+      );
+    }
+    assertLowercase('tx.from', tx.from);
   }
 
   assertLowercase('transfer.from', transfer.from);
   assertLowercase('transfer.to', transfer.to);
-  assertLowercase('tx.from', tx.from);
 
   const from = transfer.from;
   const to = transfer.to;
 
+  // Decidable from the log alone, at either enrichment level.
   if (from === ZERO_ADDRESS) return 'mint';
   if (to === ZERO_ADDRESS) return 'burn';
+
+  // Everything below needs the transaction. Without it, say so.
+  if (tx === null) return 'unclassified';
+
   if (tx.value > 0n && tx.from === to) return 'buy';
   return 'transfer';
 }
