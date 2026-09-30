@@ -7,6 +7,7 @@ import { DeployBlockUnavailableError } from '../../src/errors.js';
 import type { Address } from '../../src/types.js';
 
 const ADDRESS = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d' as Address;
+const KEY = 'TESTKEY1234567890ABCDEF';
 const PROBE = { address: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' as Address, block: 4719569 };
 
 /** An archive node: code exists at and after `deployedAt`. */
@@ -110,26 +111,68 @@ describe('probeArchive', () => {
   });
 });
 
+describe('probeArchive — retry policy', () => {
+  const noSleep = async () => undefined;
+  // Mutation-verified: no-retry mutant fails the first two; retry-everything fails the third.
+  it('retries a transient failure and returns true once it succeeds', async () => {
+    let calls = 0;
+    const getCode = vi.fn(async () => { if (++calls < 3) throw new Error('timeout'); return '0xdeadbeef'; });
+    expect(await probeArchive(getCode, PROBE, { attempts: 3, sleep: noSleep })).toBe(true);
+    expect(getCode).toHaveBeenCalledTimes(3);
+  });
+
+  it('gives up on a persistent transient failure after exactly attempts calls', async () => {
+    const getCode = vi.fn(transientFailure);
+    await expect(probeArchive(getCode, PROBE, { attempts: 3, sleep: noSleep })).rejects.toThrow(/too long/);
+    expect(getCode).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry state_unavailable: one call, verdict false', async () => {
+    const getCode = vi.fn(stateUnavailable);
+    expect(await probeArchive(getCode, PROBE, { attempts: 3, sleep: noSleep })).toBe(false);
+    expect(getCode).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('fetchCreationBlockFromExplorer', () => {
   it('returns the block from a successful response', async () => {
     const r = await fetchCreationBlockFromExplorer({
-      chainId: 1, address: ADDRESS, apiKey: 'K', fetchFn: explorerOk(12287507) as unknown as typeof fetch,
+      chainId: 1, address: ADDRESS, apiKey: KEY, fetchFn: explorerOk(12287507) as unknown as typeof fetch,
     });
     expect(r).toEqual({ ok: true, block: 12287507 });
   });
 
   // Measured: HTTP 200 with the failure in the body. Checking response.ok is useless.
-  it('treats a status-0 body as a failure despite HTTP 200', async () => {
+  it('rejects a refusal body (HTTP 200, status 0, no blockNumber)', async () => {
     const r = await fetchCreationBlockFromExplorer({
-      chainId: 1, address: ADDRESS, apiKey: 'K',
+      chainId: 1, address: ADDRESS, apiKey: KEY,
       fetchFn: explorerNotOk('Missing/Invalid API Key') as unknown as typeof fetch,
     });
     expect(r.ok).toBe(false);
   });
 
+  // Pins status parsing itself: the blockNumber guard cannot save this one.
+  // Mutation-verified (mutant C: trust response.ok).
+  it('rejects status 0 even when the body carries a valid blockNumber', async () => {
+    const sneaky = async () => new Response(JSON.stringify(
+      { status: '0', message: 'NOTOK', result: [{ blockNumber: '12287507' }] }), { status: 200 });
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: KEY, fetchFn: sneaky as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  it('does not blank the reason when the api key is empty', async () => {
+    const r = await fetchCreationBlockFromExplorer({
+      chainId: 1, address: ADDRESS, apiKey: '',
+      fetchFn: explorerNotOk('Missing/Invalid API Key') as unknown as typeof fetch,
+    });
+    expect(r).toEqual({ ok: false, reason: 'explorer refused: Missing/Invalid API Key' });
+  });
+
   it('carries the provider reason so the warning is actionable', async () => {
     const r = await fetchCreationBlockFromExplorer({
-      chainId: 8453, address: ADDRESS, apiKey: 'K',
+      chainId: 8453, address: ADDRESS, apiKey: KEY,
       fetchFn: explorerNotOk('Free API access is not supported for this chain.') as unknown as typeof fetch,
     });
     expect(r.ok).toBe(false);
@@ -140,7 +183,7 @@ describe('fetchCreationBlockFromExplorer', () => {
     const noBlock = async () =>
       new Response(JSON.stringify({ status: '1', result: [{ txHash: '0xabc' }] }));
     const r = await fetchCreationBlockFromExplorer({
-      chainId: 1, address: ADDRESS, apiKey: 'K', fetchFn: noBlock as unknown as typeof fetch,
+      chainId: 1, address: ADDRESS, apiKey: KEY, fetchFn: noBlock as unknown as typeof fetch,
     });
     expect(r.ok).toBe(false);
   });
@@ -148,7 +191,7 @@ describe('fetchCreationBlockFromExplorer', () => {
   it('fails without throwing when the request itself errors', async () => {
     const boom = async () => { throw new Error('ECONNRESET'); };
     const r = await fetchCreationBlockFromExplorer({
-      chainId: 1, address: ADDRESS, apiKey: 'K', fetchFn: boom as unknown as typeof fetch,
+      chainId: 1, address: ADDRESS, apiKey: KEY, fetchFn: boom as unknown as typeof fetch,
     });
     expect(r.ok).toBe(false);
   });
@@ -167,7 +210,7 @@ describe('fetchCreationBlockFromExplorer', () => {
     let calls = 0;
     const limit = async <T>(fn: () => Promise<T>): Promise<T> => { calls++; return fn(); };
     await fetchCreationBlockFromExplorer({
-      chainId: 1, address: ADDRESS, apiKey: 'K',
+      chainId: 1, address: ADDRESS, apiKey: KEY,
       fetchFn: explorerOk(1) as unknown as typeof fetch, limit,
     });
     expect(calls).toBe(1);
@@ -206,14 +249,14 @@ describe('resolveDeployBlock — precedence, each source failing in turn', () =>
 
   it('uses the explorer when there is no override', async () => {
     const r = await resolveDeployBlock({
-      ...base, etherscanApiKey: 'K', fetchFn: explorerOk(12287507) as unknown as typeof fetch,
+      ...base, etherscanApiKey: KEY, fetchFn: explorerOk(12287507) as unknown as typeof fetch,
     });
     expect(r).toEqual({ block: 12287507, source: 'explorer', validated: true });
   });
 
   it('accepts an unvalidatable explorer answer as unvalidated — the Arbitrum pre-Nitro case', async () => {
     const r = await resolveDeployBlock({
-      ...base, getCode: stateUnavailable, etherscanApiKey: 'K',
+      ...base, getCode: stateUnavailable, etherscanApiKey: KEY,
       fetchFn: explorerOk(55) as unknown as typeof fetch,
     });
     expect(r).toEqual({ block: 55, source: 'explorer', validated: false });
@@ -224,7 +267,7 @@ describe('resolveDeployBlock — precedence, each source failing in turn', () =>
   it('warns and falls through when the explorer answer fails validation', async () => {
     const onWarn = vi.fn();
     const r = await resolveDeployBlock({
-      ...base, etherscanApiKey: 'K', fetchFn: explorerOk(999) as unknown as typeof fetch, onWarn,
+      ...base, etherscanApiKey: KEY, fetchFn: explorerOk(999) as unknown as typeof fetch, onWarn,
     });
     expect(r).toEqual({ block: 12287507, source: 'binary_search', validated: true });
     expect(onWarn).toHaveBeenCalled();
@@ -233,7 +276,7 @@ describe('resolveDeployBlock — precedence, each source failing in turn', () =>
   it('warns and falls through when the explorer itself fails', async () => {
     const onWarn = vi.fn();
     const r = await resolveDeployBlock({
-      ...base, etherscanApiKey: 'K',
+      ...base, etherscanApiKey: KEY,
       fetchFn: explorerNotOk('Free API access is not supported for this chain.') as unknown as typeof fetch,
       onWarn,
     });
@@ -263,7 +306,7 @@ describe('resolveDeployBlock — precedence, each source failing in turn', () =>
   it('names both escape hatches when nothing can resolve the block', async () => {
     const onWarn = vi.fn();
     const attempt = resolveDeployBlock({
-      ...base, getCode: prunedNode(20000000n), etherscanApiKey: 'K',
+      ...base, getCode: prunedNode(20000000n), etherscanApiKey: KEY,
       fetchFn: explorerNotOk('Max rate limit reached') as unknown as typeof fetch, onWarn,
     });
     await expect(attempt).rejects.toThrow(DeployBlockUnavailableError);
@@ -274,7 +317,7 @@ describe('resolveDeployBlock — precedence, each source failing in turn', () =>
   it('records which source won, for every source', async () => {
     const o = await resolveDeployBlock({ ...base, override: 12287507 });
     const e = await resolveDeployBlock({
-      ...base, etherscanApiKey: 'K', fetchFn: explorerOk(12287507) as unknown as typeof fetch });
+      ...base, etherscanApiKey: KEY, fetchFn: explorerOk(12287507) as unknown as typeof fetch });
     const b = await resolveDeployBlock(base);
     expect([o.source, e.source, b.source]).toEqual(['override', 'explorer', 'binary_search']);
   });

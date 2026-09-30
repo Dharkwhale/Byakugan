@@ -50,16 +50,17 @@ const PROBE_BACKOFF_MS = 250;
 export async function probeArchive(
   getCode: CodeReader,
   probe: { address: Address; block: number },
-  opts: { attempts?: number } = {},
+  opts: { attempts?: number; sleep?: (ms: number) => Promise<void> } = {},
 ): Promise<boolean> {
   const attempts = Math.max(1, opts.attempts ?? 3);
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   for (let i = 1; ; i++) {
     try {
       return hasCode(await getCode({ address: probe.address, blockNumber: BigInt(probe.block) }));
     } catch (err) {
       if (classifyProbeError(err) === 'state_unavailable') return false;
       if (i >= attempts) throw err;
-      await new Promise((r) => setTimeout(r, PROBE_BACKOFF_MS * 2 ** (i - 1)));
+      await sleep(PROBE_BACKOFF_MS * 2 ** (i - 1));
     }
   }
 }
