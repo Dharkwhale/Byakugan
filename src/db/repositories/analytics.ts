@@ -112,6 +112,75 @@ export function firstMinters(
   return rows.map(({ toOthers, ...rest }) => ({ ...rest, mintedToOthers: toOthers === 1 }));
 }
 
+export interface FirstRecipient {
+  /** The address the token landed in. */
+  recipient: string;
+  /**
+   * The wallet that sent the mint, or null when the transaction was never
+   * fetched (a `logs_only` index).
+   *
+   * Nullable ON PURPOSE, and this is the one query where that is right. The
+   * recipient is the answer here and it comes from the log, so a `logs_only`
+   * index can answer completely; the acting wallet is supplementary, and a null
+   * reads as "not fetched" rather than standing in for a real address. Compare
+   * `firstMinters`, where `tx_from` IS the answer and a null makes the result
+   * meaningless — so that one refuses instead.
+   */
+  minter: string | null;
+  /** Token movements this address received in this collection. */
+  received: number;
+  blockNumber: number;
+  logIndex: number;
+  batchIndex: number;
+  tokenId: string;
+}
+
+/**
+ * The addresses that received the earliest mints, one row per address.
+ *
+ * The companion to `firstMinters`, not a replacement: "which wallets minted
+ * first" and "which addresses got the first mints" are different questions with
+ * different uses. Copy-mint needs the acting wallet; holder analysis needs the
+ * recipient, because the recipient is who holds the token.
+ *
+ * NO ENRICHMENT GATE, and unlike the earlier ungated `firstMinters` that is
+ * sound here: `to_addr` comes from the log, so this answers completely and
+ * exactly on any level including `logs_only`. It reports `minter` as null there
+ * rather than refusing, because the acting wallet is extra information for this
+ * question instead of being the question.
+ */
+export function firstRecipients(
+  db: Database.Database,
+  a: { chainId: number; contract: string; limit: number },
+): FirstRecipient[] {
+  assertLowercaseAddress('contract', a.contract);
+  return db
+    .prepare(`
+      WITH mints AS (
+        SELECT to_addr, tx_from, block_number, log_index, batch_index, token_id
+          FROM transfers
+         WHERE chain_id = @chainId AND contract = @contract AND kind = 'mint'
+      ),
+      firsts AS (
+        SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY to_addr ORDER BY block_number, log_index, batch_index
+                  ) AS rn
+          FROM mints
+      ),
+      totals AS (
+        SELECT to_addr, COUNT(*) AS received FROM mints GROUP BY to_addr
+      )
+      SELECT f.to_addr AS recipient, f.tx_from AS minter,
+             f.block_number AS blockNumber, f.log_index AS logIndex,
+             f.batch_index AS batchIndex, f.token_id AS tokenId, t.received
+        FROM firsts f JOIN totals t ON t.to_addr = f.to_addr
+       WHERE f.rn = 1
+       ORDER BY f.block_number, f.log_index, f.batch_index
+       LIMIT @limit
+    `)
+    .all(a) as FirstRecipient[];
+}
+
 export interface OverlapRow {
   address: string;
   collections: number;

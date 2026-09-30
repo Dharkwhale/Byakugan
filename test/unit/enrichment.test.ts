@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type Database from 'better-sqlite3';
 import { openDb } from '../../src/db/connection.js';
 import { runMigrations } from '../../src/db/migrate.js';
-import { firstMinters, overlap } from '../../src/db/repositories/analytics.js';
+import { firstMinters, firstRecipients, overlap } from '../../src/db/repositories/analytics.js';
 import {
   applyEnrichment, countUnclassified, findTxHashesNeedingEnrichment,
   getEnrichmentLevel, requireFullEnrichment, requireMintEnrichment, setEnrichmentLevel,
@@ -470,5 +470,62 @@ describe('the gates are derived from rows, not from the level column', () => {
     expect(() => requireMintEnrichment(db, {
       chainId: 1, contract: COLL_A, queryName: 'firstMinters',
     })).not.toThrow();
+  });
+});
+
+describe('firstRecipients, the recipient-level companion', () => {
+  it('answers on a logs_only index, where firstMinters refuses', () => {
+    // The recipient comes from the log, so this needs no transaction. It is what
+    // makes logs_only useful for holder analysis rather than useless outright.
+    indexBotMints('logs_only');
+    const rows = firstRecipients(db, { chainId: 1, contract: COLL_A, limit: 10 });
+    expect(rows.map((r) => r.recipient)).toEqual([...FRESH, WALLET]);
+    expect(() => firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 }))
+      .toThrow(EnrichmentLevelError);
+  });
+
+  it('reports minter as null there, rather than inventing one', () => {
+    indexBotMints('logs_only');
+    expect(firstRecipients(db, { chainId: 1, contract: COLL_A, limit: 1 })[0]?.minter)
+      .toBeNull();
+  });
+
+  it('carries the acting wallet through once it is known', () => {
+    indexBotMints('mints_only');
+    const rows = firstRecipients(db, { chainId: 1, contract: COLL_A, limit: 10 });
+    expect(rows.map((r) => [r.recipient, r.minter])).toEqual([
+      [FRESH[0], BOT], [FRESH[1], BOT], [FRESH[2], BOT], [WALLET, WALLET],
+    ]);
+  });
+
+  it('is the counterpart view, not a duplicate: four recipients, two minters', () => {
+    // The same three bot mints and one collector mint. This is the distinction the
+    // two functions exist to keep separate — copy-mint wants the 2, holder
+    // analysis wants the 4.
+    indexBotMints('mints_only');
+    expect(firstRecipients(db, { chainId: 1, contract: COLL_A, limit: 10 })).toHaveLength(4);
+    expect(firstMinters(db, { chainId: 1, contract: COLL_A, limit: 10 })).toHaveLength(2);
+  });
+
+  it('counts how many a recipient received, one row per address', () => {
+    setEnrichmentLevel(db, { chainId: 1, contract: COLL_A, level: 'mints_only' });
+    insertTransfers(db, [
+      enrichedRow({ fromAddr: ZERO, toAddr: WALLET, txHash: '0xm1', blockNumber: 5, tokenId: '1' },
+        { from: BOT, value: 0n }),
+      enrichedRow({ fromAddr: ZERO, toAddr: WALLET, txHash: '0xm2', blockNumber: 6, tokenId: '2' },
+        { from: BOT, value: 0n }),
+    ]);
+    expect(firstRecipients(db, { chainId: 1, contract: COLL_A, limit: 10 })).toEqual([
+      {
+        recipient: WALLET, minter: BOT, received: 2, blockNumber: 5,
+        logIndex: 0, batchIndex: 0, tokenId: '1',
+      },
+    ]);
+  });
+
+  it('rejects a checksummed contract argument', () => {
+    expect(() => firstRecipients(db, {
+      chainId: 1, contract: COLL_A.toUpperCase().replace('0X', '0x'), limit: 1,
+    })).toThrow(/must be lowercase/);
   });
 });
