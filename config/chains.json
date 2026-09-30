@@ -6,7 +6,10 @@
     "requestsPerSecond": 25,
     "confirmations": 12,
     "blockFetchThreshold": 3,
-    "archiveProbe": { "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "block": 4719569 }
+    "archiveProbe": {
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "block": 4719569
+    }
   },
   "8453": {
     "name": "base",
@@ -15,7 +18,10 @@
     "requestsPerSecond": 25,
     "confirmations": 30,
     "blockFetchThreshold": 3,
-    "archiveProbe": { "address": "0x4200000000000000000000000000000000000006", "block": 100000 }
+    "archiveProbe": {
+      "address": "0x4200000000000000000000000000000000000006",
+      "block": 100000
+    }
   },
   "42161": {
     "name": "arbitrum",
@@ -24,6 +30,21 @@
     "requestsPerSecond": 25,
     "confirmations": 30,
     "blockFetchThreshold": 3,
-    "archiveProbe": { "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", "block": 30000000 }
+    "archiveProbe": {
+      "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "block": 30000000
+    }
+  },
+  "84532": {
+    "name": "base-sepolia",
+    "initialChunk": 5000,
+    "maxChunk": 20000,
+    "requestsPerSecond": 25,
+    "confirmations": 30,
+    "blockFetchThreshold": 3,
+    "archiveProbe": {
+      "address": "0x4200000000000000000000000000000000000006",
+      "block": 1000
+    }
   }
 }
