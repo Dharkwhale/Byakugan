@@ -73,7 +73,19 @@ describe('getChainClient — failures are not memoized', () => {
 });
 
 describe('getChainClient — one bucket per chain', () => {
-  // A slow mainnet backfill must not throttle Base.
+  // PREMISE REVISED — the original assumption predated the compute-unit
+  // finding. "A slow mainnet backfill must not throttle Base" is no longer
+  // literally true and cannot be: Alchemy's CU/s ceiling is ACCOUNT-WIDE, so
+  // chains running concurrently draw on one shared budget. A mainnet backfill
+  // saturating that budget necessarily slows Base. Measured cause: getLogs is
+  // 60 CU and the documented free-tier ceiling is 300 CU/s, so a
+  // request-counting bucket at 25/s draws 1,500 CU/s and 429s — which is what
+  // happened.
+  //
+  // What survives, and what this file still pins: per-chain buckets for
+  // FAIRNESS, so no chain monopolises ordering or pacing. The account-level CU
+  // budget they draw from is the separate mechanism that stops them
+  // collectively breaching a ceiling none of them can see alone.
   //
   // Behavioural independence of two buckets (one draining, one untouched) is
   // already pinned with an injected clock in rateLimit.test.ts ("gives two
