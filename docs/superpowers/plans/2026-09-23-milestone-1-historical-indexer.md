@@ -6488,6 +6488,82 @@ describe('backfill — head extension', () => {
   });
 });
 
+// The bound exists so a fixture test costs the same forever. Base Sepolia runs
+// at ~2.00s per block (~43,200/day), so an unbounded fixture run grows by ~4,320
+// getLogs calls per DAY at the measured 10-block cap: ~3 minutes after a day,
+// ~20 after a week, ~90 after a month. A bounded run stays at ~20 calls.
+describe('backfill — toBlock bound', () => {
+  it('stops at the bound instead of safeHead', async () => {
+    const result = await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 150 });
+    expect(result.lastIndexedBlock).toBe(150);
+  });
+
+  it('clamps a bound above safeHead down to safeHead', async () => {
+    const result = await backfill(makeDeps({ getHead: async () => 200n }), { ...opts, toBlock: 9999 });
+    expect(result.lastIndexedBlock).toBe(190);   // 200 - 10 confirmations
+  });
+
+  it('records the bound reached, so an unbounded run resumes from there', async () => {
+    const bounded = await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 150 });
+    expect(bounded.lastIndexedBlock).toBe(150);
+
+    const resumed = await backfill(makeDeps({ getHead: async () => 1000n }), opts);
+    expect(resumed.lastIndexedBlock).toBe(990);
+  });
+
+  // The path most likely to be got wrong: the resume must start ABOVE the bound,
+  // not re-read from the deploy block and not skip a block either.
+  it('resumes from exactly one block past the bound', async () => {
+    const seen: Array<[bigint, bigint]> = [];
+    await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 150 });
+    await backfill(
+      makeDeps({
+        getHead: async () => 1000n,
+        makeFetchLogs: () => async ({ fromBlock, toBlock }) => { seen.push([fromBlock, toBlock]); return []; },
+      }),
+      opts,
+    );
+    expect(seen[0]?.[0]).toBe(151n);
+  });
+
+  it('never extends the head when bounded', async () => {
+    let head = 200n;
+    const result = await backfill(
+      makeDeps({ getHead: async () => { head += 500n; return head; } }),
+      { ...opts, toBlock: 150 },
+    );
+    expect(result.headExtensions).toBe(0);
+    expect(result.lastIndexedBlock).toBe(150);
+  });
+
+  it('is a no-op when the bound is at or below the watermark, and says so', async () => {
+    await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 300 });
+    const again = await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 200 });
+    expect(again.noop).toBe(true);
+    expect(again.rowsInserted).toBe(0);
+  });
+
+  // Rewinding would strand rows above the new watermark that a resume skips.
+  it('does not rewind the watermark on a lower bound', async () => {
+    await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 300 });
+    const again = await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 200 });
+    expect(again.lastIndexedBlock).toBe(300);
+  });
+
+  it('reads no logs at all on a no-op', async () => {
+    await backfill(makeDeps({ getHead: async () => 1000n }), { ...opts, toBlock: 300 });
+    const fetched: unknown[] = [];
+    await backfill(
+      makeDeps({
+        getHead: async () => 1000n,
+        makeFetchLogs: () => async (a) => { fetched.push(a); return []; },
+      }),
+      { ...opts, toBlock: 200 },
+    );
+    expect(fetched).toEqual([]);
+  });
+});
+
 describe('backfill — resumability', () => {
   it('resumes from the watermark after a deterministic mid-run fault', async () => {
     const boom = new Error('injected fault');
@@ -6587,6 +6663,19 @@ export interface BackfillOptions {
   maxHeadExtensions?: number;
   staleLockMs?: number;
   jobId?: string;
+  /**
+   * Stop at this block instead of `safeHead`. A real option, not a test seam:
+   * reproducible runs, bounded exploratory indexing, and M2's `firstMinters` is
+   * literally "the first N blocks after deploy".
+   *
+   * Always CLAMPED to `safeHead` — it can only ever narrow the range, never
+   * reach past the confirmation lag. `last_indexed_block` records the bound
+   * actually reached, so a later unbounded run resumes from there rather than
+   * re-reading. A bound BELOW the current watermark is a no-op that says so; it
+   * never rewinds, because rewinding would leave rows above the watermark that
+   * a resume would then never revisit.
+   */
+  toBlock?: number;
   onProgress?(p: Progress): void;
   /** Test seam: deterministic fault injection beats killing a process. */
   hooks?: {
@@ -6600,6 +6689,8 @@ export interface BackfillResult {
   lastIndexedBlock: number;
   rowsInserted: number;
   headExtensions: number;
+  /** True when the requested range was already covered and nothing was read. */
+  noop?: boolean;
 }
 
 export async function backfill(
@@ -6624,7 +6715,11 @@ export async function backfill(
 
   let bootstrapped = false;
   try {
-    let target = (await deps.getHead()) - BigInt(chain.confirmations);
+    const safeHead = (await deps.getHead()) - BigInt(chain.confirmations);
+    // The bound can only narrow. min() rather than a check-and-throw, because a
+    // caller asking for more than is safe wants "as much as is safe".
+    const bound = options.toBlock !== undefined ? BigInt(options.toBlock) : undefined;
+    let target = bound !== undefined ? min(bound, safeHead) : safeHead;
 
     // --- bootstrap -------------------------------------------------------
     let existing = getCollection(deps.db, chainId, contract);
@@ -6659,6 +6754,24 @@ export async function backfill(
     const fetchLogs = deps.makeFetchLogs(standard);
 
     let cursor = BigInt(existing.lastIndexedBlock) + 1n;
+
+    // A bound at or below the watermark is a no-op, reported rather than
+    // silently doing nothing — and emphatically not a rewind. Rewinding would
+    // leave already-indexed rows above the new watermark that a later resume
+    // would skip straight past, so the range would never be re-read.
+    if (cursor > target) {
+      options.onProgress?.({
+        fromBlock: cursor, toBlock: existing.lastIndexedBlock === null
+          ? cursor : BigInt(existing.lastIndexedBlock),
+        target, rowsInserted: 0, totalRows: 0,
+      });
+      return {
+        standard, deployBlock,
+        lastIndexedBlock: existing.lastIndexedBlock,
+        rowsInserted: 0, headExtensions: 0,
+        noop: true,
+      };
+    }
     let rowsInserted = 0;
     let chunkIndex = 0;
     let headExtensions = 0;
@@ -6733,6 +6846,8 @@ export async function backfill(
 
       // The head moves during a long backfill. Extend, but bounded, so a fast
       // L2 cannot be chased indefinitely.
+      // A bounded run never extends: the caller asked for a fixed range.
+      if (bound !== undefined) break;
       if (headExtensions >= maxHeadExtensions) break;
       const newTarget = (await deps.getHead()) - BigInt(chain.confirmations);
       if (newTarget <= target) break;
