@@ -230,6 +230,32 @@ Prefer generating adversarial or malformed fixtures programmatically
 construction, and a malformed shape usually cannot be captured from a
 compliant chain anyway.
 
+### A fixture that a fallback also handles cannot test the mechanism
+
+**When the code under test has a fallback, a secondary pass, or any other path that
+could produce the same output, a fixture satisfied by that path proves nothing about
+the mechanism. Pick a fixture only the mechanism can handle — otherwise the test
+passes against an implementation that is not wired up at all.**
+
+The worked example. The bot scrubs outbound chat text using secret tokens derived
+from `config.secrets`. Its first test used a URL-shaped fake secret — and the mutant
+that derived tokens from `[]`, i.e. a completely unwired `secrets` list, SURVIVED.
+`scrubSecrets` has fallback passes that redact URL-shaped keys with no tokens at all,
+so the fallback did the redaction and the assertion could not tell the difference. A
+plain string that no fallback pass can catch kills the mutant immediately.
+
+This is the same shape as a gate reading `enrichment_level` instead of counting the
+rows: two mechanisms that agree on the easy cases, and a fixture drawn from the
+overlap tests neither. The questions that catch it:
+
+- What else in this code path could produce the output I am asserting?
+- If the mechanism I am testing were deleted entirely, would this fixture still pass?
+
+So the fixture has to sit where only one path reaches: a secret with no URL shape, a
+`mints_only` collection with zero unclassified rows, a `logs_only` collection with
+zero mints. A fixture in the overlap is worth keeping as a second case, never as the
+only one.
+
 ### Where a test depends on exact bytes, assert the bytes
 
 **When a test's meaning rests on a precise byte sequence — a control character,
