@@ -4,7 +4,10 @@ import {
 } from '../../src/telegram/failures.js';
 
 /**
- * Fixtures copied from MEASURED output, not from documentation.
+ * Fixtures copied from MEASURED output, not from documentation — with ONE exception, called
+ * out here because a reader of this header alone would otherwise be misled: the
+ * `isPermanentEditFailure` fixtures below come from the published Bot API reference and have
+ * never been observed against a live bot. Their own `describe` says so too.
  *
  * `docs/superpowers/notes/2026-10-02-grammy-behaviour.md` holds the probe results these are
  * taken from — including that `parameters` comes back as `{}` rather than `undefined` on a

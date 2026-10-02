@@ -95,8 +95,19 @@ export function createJobRegistry(a: { clock: Clock; staleMs: number }): JobRegi
       running.set(k, entry);
 
       let spent = false;
-      // Deletes only if the slot is still THIS claim's. Without the identity check a stale
-      // handle released late could free a slot that a later claim now owns.
+      /**
+       * Deletes only if the slot is still THIS claim's.
+       *
+       * ARGUED, NOT TESTED, and the honest account is that `spent` is the real guard: it is
+       * set by the first `release` or `run`, so a late second `release` returns before
+       * reaching here, and `run`'s own cleanup fires once while the slot is still its own.
+       * There is therefore no reachable path on which the identity check changes the
+       * outcome — delete it and every test still passes. It stays as defence in depth
+       * because it is the check that would matter if `spent` were ever removed or a handle
+       * were shared, and because freeing another claim's slot is the failure that lets two
+       * jobs run on one collection. It is NOT load-bearing today, and an earlier version of
+       * this comment claimed it was.
+       */
       const free = (): void => { if (running.get(k) === entry) running.delete(k); };
 
       return {

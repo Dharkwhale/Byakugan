@@ -214,8 +214,11 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
     return;
   }
 
-  const through = indexedThrough(d.db, parsed.chainId, contract);
   try {
+    // INSIDE the try: this reads the database, so a throw here has to reach
+    // `replyError` like every other failure in this handler rather than rejecting the
+    // handler and leaving the user with nothing.
+    const through = indexedThrough(d.db, parsed.chainId, contract);
     const rows = firstMinters(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
       title: `First minters of ${contract} (chain ${parsed.chainId}), ` +
@@ -258,8 +261,11 @@ export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
     return;
   }
 
-  const through = indexedThrough(d.db, parsed.chainId, contract);
   try {
+    // INSIDE the try: this reads the database, so a throw here has to reach
+    // `replyError` like every other failure in this handler rather than rejecting the
+    // handler and leaving the user with nothing.
+    const through = indexedThrough(d.db, parsed.chainId, contract);
     const rows = firstRecipients(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
       title: `First mint recipients of ${contract} (chain ${parsed.chainId}), ` +
@@ -303,8 +309,10 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
     return;
   }
 
-  const through = leastIndexedThrough(d.db, parsed.chainId, parsed.contracts);
   try {
+    // INSIDE the try, for the same reason as the other two handlers: it reads the
+    // database and a throw must be reported, not escape the handler.
+    const through = leastIndexedThrough(d.db, parsed.chainId, parsed.contracts);
     // Throws EnrichmentLevelError on an index that cannot tell a buy from a transfer. It is
     // surfaced below rather than caught here: an empty table would be a wrong answer.
     const rows = overlap(d.db, {
