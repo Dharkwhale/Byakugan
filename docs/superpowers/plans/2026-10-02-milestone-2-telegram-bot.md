@@ -695,8 +695,16 @@ export const MESSAGE_BUDGET = 3500;
 const NAME_LIMIT = 64;
 /** C0 and C1 controls. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
-/** Bidi embedding and isolate controls, which can make text display as something else. */
-const BIDI = /[‪-‮⁦-⁩]/g;
+/**
+ * Unicode FORMAT characters, not only the bidi controls.
+ *
+ * Probed: U+200B-200D, U+2060, U+200E, U+200F and U+061C are all General_Category=Cf, so one
+ * class covers zero-width characters, LRM/RLM and the bidi embedding, override and isolate
+ * controls together. It also strips ZWJ, so an emoji family degrades to separate glyphs, and
+ * ZWNJ, which is orthographically meaningful in Persian, Urdu and Kurdish — both accepted for
+ * a 64-character display label built from attacker-controlled input.
+ */
+const FORMAT = /\p{Cf}/gu;
 
 /**
  * Makes on-chain text safe to put in a message.
@@ -713,34 +721,58 @@ const BIDI = /[‪-‮⁦-⁩]/g;
 export function sanitizeOnChainText(value: string | null | undefined): string {
   if (typeof value !== 'string') return '(unnamed)';
   // ORDER IS LOAD-BEARING. Newlines and tabs ARE C0 control characters, so stripping
-  // controls first deletes them outright and fuses words: "Cool
-Collection" becomes
-  // "CoolCollection" rather than "Cool Collection". Collapse whitespace to a space FIRST,
+  // controls first deletes them outright and fuses words: a name with a newline between two
+  // words becomes one run-together word. Collapse whitespace to a space FIRST,
   // then strip what remains, then collapse again to absorb any gap the stripping left.
   // (An earlier draft of this plan had the two steps the other way round and its own
   // newline test would have failed.)
   const cleaned = value
     .replace(/\s+/g, ' ')
     .replace(CONTROL, '')
-    .replace(BIDI, '')
+    .replace(FORMAT, '')
     .replace(/\s+/g, ' ')
     .trim();
   if (cleaned.length === 0) return '(unnamed)';
-  return cleaned.length > NAME_LIMIT ? `${cleaned.slice(0, NAME_LIMIT)}…` : cleaned;
+  // Truncate by CODE POINT, not UTF-16 code unit. `slice(0, 64)` cuts mid-surrogate on an
+  // emoji and emits a lone half, which becomes U+FFFD when sent. Grapheme clusters may still
+  // split, which is accepted for a display label and recorded so it reads as a decision.
+  const points = Array.from(cleaned);
+  return points.length > NAME_LIMIT ? `${points.slice(0, NAME_LIMIT).join('')}…` : cleaned;
 }
 
 export function renderTable(a: { title: string; headers: string[]; rows: string[][] }): string {
+  if (a.rows.length === 0) return [a.title, '', '(no rows)'].join('
+');
   const lines = [a.title, ''];
-  if (a.rows.length === 0) return [a.title, '', '(no rows)'].join('\n');
-  for (const row of a.rows) {
-    lines.push(a.headers.map((h, i) => `${h}: ${row[i] ?? ''}`).join('  '));
-  }
-  return lines.join('\n');
+  a.rows.forEach((row, r) => {
+    // A short row would render as a silently blank cell: missing data picking the cheaper
+    // answer, which this project has a standing rule against. Say so instead.
+    if (row.length !== a.headers.length) {
+      throw new Error(
+        `renderTable: row ${r} has ${row.length} cells, expected ${a.headers.length}`,
+      );
+    }
+    lines.push(a.headers.map((h, i) => `${h}: ${row[i]}`).join('  '));
+  });
+  return lines.join('
+');
 }
 
-/** RFC-4180 quoting: a field containing a comma, quote or newline is quoted, quotes doubled. */
+/**
+ * RFC-4180 quoting, plus spreadsheet-formula neutralisation.
+ *
+ * A field beginning `=`, `+`, `-`, `@`, tab or CR becomes an EXECUTABLE CELL when the file is
+ * opened in Excel or Sheets, and collection names are attacker-controlled — anyone can deploy
+ * a contract called `=HYPERLINK(...)`. Prefix first, then quote the prefixed value. It also
+ * prefixes a legitimate leading `-`, so a column of negative numbers would gain an
+ * apostrophe; none holds one today.
+ */
+const FORMULA_LEAD = /^[=+\-@	]/;
+
 function csvField(value: string): string {
-  return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  const raw = FORMULA_LEAD.test(value) ? `'${value}` : value;
+  return /[",
+]/.test(raw) ? `"${raw.replace(/"/g, '""')}"` : raw;
 }
 
 export function toCsv(a: { headers: string[]; rows: string[][] }): string {
@@ -783,7 +815,7 @@ On a branch, make each of these changes in turn, run the suite, and record which
 1. `MESSAGE_BUDGET = 100000` — the CSV tests must fail.
 2. Switch `respond` to `a.rows.length > 50` instead of a length check — the "switches on the rendered LENGTH" test must fail.
 3. Remove `.replace(CONTROL, '')` — the control-character test must fail.
-4. Remove `.replace(BIDI, '')` — the bidi test must fail.
+4. Remove `.replace(FORMAT, '')` — the bidi test must fail.
 5. Remove the truncation — the long-name test must fail.
 Restore with `git checkout` and report all five.
 
