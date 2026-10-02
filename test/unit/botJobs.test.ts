@@ -178,3 +178,44 @@ describe('the detached runner', () => {
     })).toThrow(/already running/i);
   });
 });
+
+describe('claim', () => {
+  it('wins on an empty slot and loses on a taken one, without throwing', () => {
+    const registry = createJobRegistry({ clock: manualClock(0), staleMs: STALE_MS });
+    const first = registry.claim({ chainId: 1, contract: CONTRACT, source: 'getLogs' });
+    expect(first).not.toBeNull();
+    expect(registry.claim({ chainId: 1, contract: CONTRACT, source: 'getLogs' })).toBeNull();
+    expect(registry.claim({ chainId: 8453, contract: CONTRACT, source: 'getLogs' })).not.toBeNull();
+    expect(registry.size()).toBe(2);
+  });
+
+  it('release frees the slot, once, and a stale handle cannot free a later claim', () => {
+    const registry = createJobRegistry({ clock: manualClock(0), staleMs: STALE_MS });
+    const first = registry.claim({ chainId: 1, contract: CONTRACT, source: 'getLogs' });
+    first?.release();
+    expect(registry.size()).toBe(0);
+    const second = registry.claim({ chainId: 1, contract: CONTRACT, source: 'getLogs' });
+    first?.release();                       // a late, repeated release of the OLD handle
+    expect(registry.size()).toBe(1);
+    expect(second).not.toBeNull();
+  });
+
+  it('release after run is a no-op; the runner clears the slot when the job ends', async () => {
+    const registry = createJobRegistry({ clock: manualClock(0), staleMs: STALE_MS });
+    let finish: () => void = () => undefined;
+    const handle = registry.claim({ chainId: 1, contract: CONTRACT, source: 'getLogs' });
+    handle?.run({ run: () => new Promise<void>((r) => { finish = r; }) });
+    handle?.release();
+    expect(registry.size()).toBe(1);        // still running: release did not free it
+    finish();
+    await flush();
+    expect(registry.size()).toBe(0);
+  });
+
+  it('a claimed-but-unrun slot is visible to inspect as running', () => {
+    const registry = createJobRegistry({ clock: manualClock(5), staleMs: STALE_MS });
+    registry.claim({ chainId: 1, contract: CONTRACT, source: 'getLogs' });
+    expect(registry.inspect(db, { chainId: 1, contract: CONTRACT }))
+      .toMatchObject({ kind: 'running', startedAt: 5, source: 'getLogs' });
+  });
+});

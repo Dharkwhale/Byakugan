@@ -9,8 +9,29 @@ export type JobState =
 
 interface Entry { startedAt: number; source: string; lastBlock?: number }
 
+/**
+ * A slot held in the registry by a caller that has WON the claim.
+ *
+ * The holder must call `run` or `release`. `release` after `run` is a no-op (the runner
+ * clears its own slot when the job ends), so a caller can put `release` in a `finally`
+ * without caring which of the two paths it took.
+ */
+export interface JobHandle {
+  run(a: { run: () => Promise<void>; onError?: (err: unknown) => void }): void;
+  release(): void;
+}
+
 export interface JobRegistry {
   inspect(db: Database.Database, a: { chainId: number; contract: string }): JobState;
+  /**
+   * Insert-if-absent: takes the slot for this collection and returns a handle, or returns
+   * null when the slot is already taken. SYNCHRONOUS ON PURPOSE — there is no `await`
+   * between the existence test and the insertion, so two callers cannot both win. A caller
+   * learns it lost from the return value, not from catching a throw after it has already
+   * told the user something.
+   */
+  claim(a: { chainId: number; contract: string; source: string }): JobHandle | null;
+  /** Claim and run in one step; throws if the slot is taken. Prefer `claim` when work must happen between. */
   start(a: {
     chainId: number; contract: string; source: string;
     run: () => Promise<void>;
@@ -63,28 +84,55 @@ export function createJobRegistry(a: { clock: Clock; staleMs: number }): JobRegi
       return { kind: 'idle' };
     },
 
-    start({ chainId, contract, source, run, onError }) {
+    claim({ chainId, contract, source }) {
       const k = key(chainId, contract);
-      if (running.has(k)) {
-        throw new Error(`a job for ${k} is already running in this process`);
-      }
-      running.set(k, { startedAt: a.clock.now(), source });
+      // The test and the insertion share one synchronous block. That is the whole property:
+      // the interleavings that matter here come from `await` points in OUR OWN callers
+      // (an estimate, a reply), so a single-process test can genuinely produce them — unlike
+      // a lock contended by two OS processes, which it cannot.
+      if (running.has(k)) return null;
+      const entry: Entry = { startedAt: a.clock.now(), source };
+      running.set(k, entry);
 
-      // CLEANUP IS IN A `finally` AND THE RUNNER NEVER REJECTS. If cleanup sat in the
-      // happy path, a throwing job would leak its map entry — and the map has no expiry,
-      // so that collection would report "already indexing" until the process restarted,
-      // with nothing in the database to indicate a problem. The DB lock recovers on its
-      // own; the map does not. An unhandled rejection from a detached promise should be
-      // structurally impossible, not something to remember.
-      void (async () => {
-        try {
-          await run();
-        } catch (err) {
-          try { onError?.(err); } catch { /* a failing reporter must not break cleanup */ }
-        } finally {
-          running.delete(k);
-        }
-      })();
+      let spent = false;
+      // Deletes only if the slot is still THIS claim's. Without the identity check a stale
+      // handle released late could free a slot that a later claim now owns.
+      const free = (): void => { if (running.get(k) === entry) running.delete(k); };
+
+      return {
+        release() {
+          if (!spent) free();
+          spent = true;
+        },
+
+        run({ run, onError }) {
+          if (spent) throw new Error(`the claim for ${k} has already been run or released`);
+          spent = true;
+          // CLEANUP IS IN A `finally` AND THE RUNNER NEVER REJECTS. If cleanup sat in the
+          // happy path, a throwing job would leak its map entry — and the map has no expiry,
+          // so that collection would report "already indexing" until the process restarted,
+          // with nothing in the database to indicate a problem. The DB lock recovers on its
+          // own; the map does not. An unhandled rejection from a detached promise should be
+          // structurally impossible, not something to remember.
+          void (async () => {
+            try {
+              await run();
+            } catch (err) {
+              try { onError?.(err); } catch { /* a failing reporter must not break cleanup */ }
+            } finally {
+              free();
+            }
+          })();
+        },
+      };
+    },
+
+    start({ chainId, contract, source, run, onError }) {
+      const handle = this.claim({ chainId, contract, source });
+      if (handle === null) {
+        throw new Error(`a job for ${key(chainId, contract)} is already running in this process`);
+      }
+      handle.run({ run, ...(onError ? { onError } : {}) });
     },
 
     note({ chainId, contract, lastBlock }) {

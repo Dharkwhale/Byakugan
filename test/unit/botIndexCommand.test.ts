@@ -308,3 +308,70 @@ describe('handleIndex fix round 1', () => {
     expect(sent[0]).toContain('next: /help');
   });
 });
+
+describe('handleIndex atomic claim', () => {
+  /**
+   * An `estimate` that resolves only when the test says so, one gate per call. This is what
+   * pins the interleaving: both handlers pass `inspect` (the map is empty), both park here,
+   * and only then are they let through. The interleaving comes from an `await` in OUR OWN
+   * code, which is why a single-process test can really produce it — unlike CLAUDE.md's
+   * stale-lock race, where the interleaving needed two processes writing after both had read.
+   * This proves the property for one process's handlers only; it says nothing about two
+   * processes, which the database lock is for.
+   */
+  function gatedEstimate() {
+    const gates: Array<() => void> = [];
+    const estimate = vi.fn(() => new Promise<{ seconds: number; summary: string }>((resolve) => {
+      gates.push(() => resolve({ seconds: 30, summary: SUMMARY }));
+    }));
+    return { estimate, openAll: () => gates.forEach((g) => g()), parked: () => gates.length };
+  }
+
+  it('lets exactly one of two racing /index for the same collection start', async () => {
+    const gate = gatedEstimate();
+    // Never resolves: the winner must still be running when the loser claims, or the
+    // loser could win a freed slot and the test would prove nothing about the race.
+    const { base, sent } = deps({
+      estimate: gate.estimate,
+      runBackfill: vi.fn(() => new Promise(() => undefined)),
+    });
+    const first = handleIndex({ ...base, text: `/index ${ADDR}` });
+    const second = handleIndex({ ...base, text: `/index ${ADDR}` });
+    await flush();
+    expect(gate.parked()).toBe(2);              // both passed inspect and are parked on estimate
+    expect(base.registry.size()).toBe(0);       // and neither has claimed yet
+    gate.openAll();
+    await Promise.all([first, second]);
+    await flush();
+
+    expect(base.runBackfill).toHaveBeenCalledOnce();
+    expect(sent.filter((t) => t.includes('progress follows in this message'))).toHaveLength(1);
+    const loser = sent.filter((t) => !t.includes('progress follows in this message'));
+    expect(loser).toHaveLength(1);
+    expect(loser[0]).toContain(`Already indexing ${ADDR} on chain 1.`);
+    expect(base.registry.size()).toBe(1);
+  });
+
+  it('does not let a dry run or an unconfirmed run claim the slot', async () => {
+    const dry = deps();
+    await handleIndex({ ...dry.base, text: `/index ${ADDR} --dry-run` });
+    expect(dry.base.registry.size()).toBe(0);
+
+    const gated = deps({ estimate: vi.fn(async () => ({ seconds: 7_200, summary: SUMMARY })) });
+    await handleIndex({ ...gated.base, text: `/index ${ADDR}` });
+    expect(gated.base.registry.size()).toBe(0);
+  });
+
+  it('releases the claim when the reply fails, so the collection is not wedged', async () => {
+    const { base, replier } = deps();
+    (replier.reply as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('chat not found'));
+    await expect(handleIndex({ ...base, text: `/index ${ADDR}` })).rejects.toThrow('chat not found');
+    expect(base.registry.size()).toBe(0);
+    expect(base.runBackfill).not.toHaveBeenCalled();
+
+    // And it is genuinely free, not merely uncounted: the next /index starts.
+    await handleIndex({ ...base, text: `/index ${ADDR}` });
+    await flush();
+    expect(base.runBackfill).toHaveBeenCalledOnce();
+  });
+});

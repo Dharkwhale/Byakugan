@@ -67,6 +67,19 @@ export interface HandleIndexDeps {
   confirmThresholdSeconds: number;
 }
 
+function alreadyIndexing(
+  d: Pick<HandleIndexDeps, 'clock'>, a: { contract: string; chainId: number },
+  state: { startedAt: number; source: string; lastBlock?: number },
+): string {
+  const minutes = Math.round((d.clock.now() - state.startedAt) / 60_000);
+  return (
+    `Already indexing ${a.contract} on chain ${a.chainId}.\n` +
+    `  started ${minutes} minutes ago, via ${state.source}` +
+    (state.lastBlock === undefined ? '' : `, at block ${state.lastBlock}`) + '\n' +
+    '  Wait for it to finish — /status for detail.'
+  );
+}
+
 export async function handleIndex(d: HandleIndexDeps): Promise<void> {
   let args: ReturnType<typeof parseIndexCommand>;
   try {
@@ -83,13 +96,7 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
 
   const state = d.registry.inspect(d.db, { chainId, contract });
   if (state.kind === 'running') {
-    const minutes = Math.round((d.clock.now() - state.startedAt) / 60_000);
-    await d.replier.reply(
-      `Already indexing ${contract} on chain ${chainId}.\n` +
-      `  started ${minutes} minutes ago, via ${state.source}` +
-      (state.lastBlock === undefined ? '' : `, at block ${state.lastBlock}`) + '\n' +
-      '  Wait for it to finish — /status for detail.',
-    );
+    await d.replier.reply(alreadyIndexing(d, { contract, chainId }, state));
     return;
   }
   // An orphan whose lock has ALREADY expired falls through and starts. `inspect` reports it
@@ -154,52 +161,76 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
     return;
   }
 
-  const sent = await d.replier.reply(
-    `Indexing ${contract} on chain ${chainId} (${d.chainConfig.name}) at level ${level}.\n` +
-    `  estimated ${humanizeSeconds(seconds)}; progress follows in this message.`,
-  );
+  // CLAIM HERE: after every gate that starts nothing (dry run, confirmation), and BEFORE
+  // the reply that promises progress. `inspect` above and this claim are separated by
+  // `await d.estimate` — a window in which a second `/index` for the same collection also
+  // passed `inspect`. Gating only on `inspect` let both reach the "progress follows" reply,
+  // and the loser then hit `start`'s throw having already told its user a job was running.
+  // Claiming is synchronous insert-if-absent, so exactly one of them wins and the loser
+  // is told before it says anything it cannot honour.
+  const claim = d.registry.claim({ chainId, contract, source: d.fetchPath });
+  if (claim === null) {
+    const other = d.registry.inspect(d.db, { chainId, contract });
+    await d.replier.reply(
+      other.kind === 'running'
+        ? alreadyIndexing(d, { contract, chainId }, other)
+        : `Another job is already indexing ${contract} on chain ${chainId}.\n` +
+          '  Wait for it to finish — /status for detail.',
+    );
+    return;
+  }
 
-  const progress = createJobProgress({
-    replier: d.replier, messageId: sent.messageId, clock: d.clock,
-    header: `Indexing ${contract} on chain ${chainId} at level ${level}`,
-  });
-
-  d.registry.start({
-    chainId, contract, source: d.fetchPath,
-    onError: (err) => {
-      // Swallowed: `fail` rejects only when its final edit could not be delivered, which
-      // means the reply channel itself is failing and there is nowhere left to report to.
-      // The registry's try/catch around onError catches a SYNCHRONOUS throw only, so an
-      // unhandled rejection would otherwise escape this detached job. What is lost: the
-      // user is never told the job failed, and nothing is logged here.
-      progress.fail(describeError(err), nextCommand(err, { contract, chainId }))
-        .catch(() => undefined);
-    },
-    run: async () => {
-      let rows = 0;
-      const result = await d.runBackfill({
-        chainId, contract, level,
-        ...(toBlock === undefined ? {} : { toBlock }),
-        ...(deployBlock === undefined ? {} : { deployBlock }),
-        onProgress: (ctx) => {
-          rows += ctx.inserted;
-          d.registry.note({ chainId, contract, lastBlock: Number(ctx.toBlock) });
-          // Swallowed: the index is the valuable work and a cosmetic progress edit failing
-          // must not abort it. What is lost: a transport failure on a progress edit becomes
-          // invisible, and the message may stop updating while the job carries on.
-          progress.onChunk({
-            fromBlock: ctx.fromBlock, toBlock: ctx.toBlock, rows, source: d.fetchPath,
-          }).catch(() => undefined);
-        },
-      });
-      await progress.finish(
-        result.status === 'indexed'
-          ? `Indexed ${contract} on chain ${chainId} at level ${level}.\n` +
-            `  ERC-${result.standard}, deploy block ${result.deployBlock}\n` +
-            `  ${result.rowsInserted} rows in ${result.chunks} chunk(s), via ${result.source}\n` +
-            `  indexed through block ${result.lastIndexedBlock}`
-          : `Nothing to do for ${contract}: ${result.reason}`,
-      );
-    },
-  });
+  // A CLAIM THAT IS NEVER RUN MUST BE RELEASED. The reply below can throw (Telegram is
+  // down, the chat is gone), and the map has no expiry: a leaked slot would answer
+  // "already indexing" for this collection until the process restarted. `release` after
+  // `run` is a no-op, so the `finally` is correct on both paths.
+  try {
+    const sent = await d.replier.reply(
+      `Indexing ${contract} on chain ${chainId} (${d.chainConfig.name}) at level ${level}.\n` +
+      `  estimated ${humanizeSeconds(seconds)}; progress follows in this message.`,
+    );
+    const progress = createJobProgress({
+      replier: d.replier, messageId: sent.messageId, clock: d.clock,
+      header: `Indexing ${contract} on chain ${chainId} at level ${level}`,
+    });
+    claim.run({
+      onError: (err) => {
+        // Swallowed: `fail` rejects only when its final edit could not be delivered, which
+        // means the reply channel itself is failing and there is nowhere left to report to.
+        // The registry's try/catch around onError catches a SYNCHRONOUS throw only, so an
+        // unhandled rejection would otherwise escape this detached job. What is lost: the
+        // user is never told the job failed, and nothing is logged here.
+        progress.fail(describeError(err), nextCommand(err, { contract, chainId }))
+          .catch(() => undefined);
+      },
+      run: async () => {
+        let rows = 0;
+        const result = await d.runBackfill({
+          chainId, contract, level,
+          ...(toBlock === undefined ? {} : { toBlock }),
+          ...(deployBlock === undefined ? {} : { deployBlock }),
+          onProgress: (ctx) => {
+            rows += ctx.inserted;
+            d.registry.note({ chainId, contract, lastBlock: Number(ctx.toBlock) });
+            // Swallowed: the index is the valuable work and a cosmetic progress edit failing
+            // must not abort it. What is lost: a transport failure on a progress edit becomes
+            // invisible, and the message may stop updating while the job carries on.
+            progress.onChunk({
+              fromBlock: ctx.fromBlock, toBlock: ctx.toBlock, rows, source: d.fetchPath,
+            }).catch(() => undefined);
+          },
+        });
+        await progress.finish(
+          result.status === 'indexed'
+            ? `Indexed ${contract} on chain ${chainId} at level ${level}.\n` +
+              `  ERC-${result.standard}, deploy block ${result.deployBlock}\n` +
+              `  ${result.rowsInserted} rows in ${result.chunks} chunk(s), via ${result.source}\n` +
+              `  indexed through block ${result.lastIndexedBlock}`
+            : `Nothing to do for ${contract}: ${result.reason}`,
+        );
+      },
+    });
+  } finally {
+    claim.release();
+  }
 }
