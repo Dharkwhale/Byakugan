@@ -20,7 +20,7 @@ const STALE = 900_000;
  * that tests the defence against it, and an editor or formatter that strips it would turn
  * `RLO` into the empty string — at which point `not.toContain(RLO)` fails on every input.
  */
-const RLO = '‮';
+const RLO = '\u202e';
 
 let db: Database.Database;
 beforeEach(() => { db = openDb(':memory:'); runMigrations(db); });
