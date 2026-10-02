@@ -1,8 +1,16 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { vi, afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+/**
+ * Every test here spawns a child process through tsx, which takes seconds. Under the
+ * full suite's parallelism that lost a race with vitest's 5s default and the file failed
+ * intermittently while passing in isolation — and an intermittent failure gets re-run
+ * until green rather than read, which is how a real one would slip past.
+ */
+vi.setConfig({ testTimeout: 120_000 });
 
 /**
  * These tests spawn a CHILD process, because the failure this guard exists to

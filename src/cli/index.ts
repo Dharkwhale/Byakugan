@@ -16,6 +16,7 @@ import { getChainClient } from '../chain/client.js';
 import { resolveDeployBlock } from '../chain/deployBlock.js';
 import { makeSupportsInterface, detectStandard } from '../chain/standard.js';
 import { makeTxSource } from '../chain/tx.js';
+import { CU_COSTS, VERIFIED as CU_VERIFIED, callsPerSecond } from '../chain/cuCosts.js';
 import { systemClock } from '../clock.js';
 import { loadConfig, type ChainConfig, type Config } from '../config.js';
 import { openDb } from '../db/connection.js';
@@ -87,7 +88,7 @@ async function main(argv: string[]): Promise<number> {
   const chainClient = { chainId: args.chainId, client, limit };
 
   const safeHead = async (): Promise<bigint> => {
-    const head = await limit(() => client.getBlockNumber());
+    const head = await limit(() => client.getBlockNumber(), CU_COSTS.eth_blockNumber);
     const confirmed = head - BigInt(chain.confirmations);
     // Never index to head. A collection younger than the confirmations depth has
     // nothing safe to index yet, which is a real state rather than an error.
@@ -98,13 +99,13 @@ async function main(argv: string[]): Promise<number> {
   const getCode = async (a: { address: Address; blockNumber: bigint }): Promise<string> =>
     (await limit(() => client.getBytecode({
       address: a.address, blockNumber: a.blockNumber,
-    }))) ?? '0x';
+    }), CU_COSTS.eth_getCode)) ?? '0x';
 
   const ports: BackfillPorts = {
     fetchLogs: async ({ fromBlock, toBlock }) => {
       const logs = await limit(() => client.getLogs({
         address: args.contract, fromBlock, toBlock,
-      }));
+      }), CU_COSTS.eth_getLogs);
       return logs.map((l) => ({
         topics: l.topics as Hash[],
         data: l.data as Hash,
@@ -161,7 +162,7 @@ async function main(argv: string[]): Promise<number> {
         fromBlock: from,
         toBlock: bound,
         chunkBlocks: probed.blocks,
-        requestsPerSecond: chain.requestsPerSecond,
+        requestsPerSecond: callsPerSecond('eth_getLogs', config.computeUnitsPerSecond),
         prices,
       }),
       chunkNote: probed.note,
@@ -175,7 +176,8 @@ async function main(argv: string[]): Promise<number> {
       deployBlockValidated: resolved.validated,
       level: args.level,
       safeHead: head,
-      requestsPerSecond: chain.requestsPerSecond,
+      requestsPerSecond: callsPerSecond('eth_getLogs', config.computeUnitsPerSecond),
+      ratesVerified: CU_VERIFIED,
     }));
     return EXIT.OK;
   }

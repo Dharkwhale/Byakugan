@@ -1,11 +1,20 @@
 import { systemClock, type Clock } from '../clock.js';
+import { DEFAULT_CU } from './cuCosts.js';
 
-export type RateLimiter = <T>(fn: () => Promise<T>) => Promise<T>;
+/**
+ * `cost` is in COMPUTE UNITS, and omitting it charges `DEFAULT_CU`.
+ *
+ * Defaulting HIGH rather than to 1 is the point: a forgotten cost then makes the run
+ * slower, never faster than the provider allows. A default of 1 would let an unpriced
+ * method through at sixty times its real rate and earn a 429 — missing data must not
+ * pick the cheaper answer.
+ */
+export type RateLimiter = <T>(fn: () => Promise<T>, cost?: number) => Promise<T>;
 
 export interface RateLimiterOptions {
-  /** Maximum burst. Tokens never accumulate beyond this. */
+  /** Maximum burst, in compute units. Never accumulates beyond this. */
   capacity: number;
-  /** Tokens added per second, applied proportionally to elapsed time. */
+  /** Compute units added per second, applied proportionally to elapsed time. */
   refillPerSec: number;
   clock?: Clock;
   sleep?: (ms: number) => Promise<void>;
@@ -103,18 +112,26 @@ export function createRateLimiter(opts: RateLimiterOptions): RateLimiter {
     tokens = Math.min(capacity, tokens + (elapsedMs / 1000) * refillPerSec);
   }
 
-  async function acquire(): Promise<void> {
+  /**
+   * Waits until `cost` units are available, then spends them.
+   *
+   * A cost ABOVE capacity would otherwise wait forever: the bucket can never hold that
+   * many units at once. Clamping to capacity makes such a call simply take a full
+   * bucket, which is the closest thing to honouring it, and beats deadlocking.
+   */
+  async function acquire(cost: number): Promise<void> {
+    const want = Math.min(Math.max(cost, 0), capacity);
     refill();
-    if (tokens < 1) {
-      const waitMs = Math.ceil(((1 - tokens) / refillPerSec) * 1000);
-      await sleep(waitMs);
+    while (tokens < want) {
+      const waitMs = Math.ceil(((want - tokens) / refillPerSec) * 1000);
+      await sleep(Math.max(waitMs, 1));
       refill();
     }
-    tokens = Math.max(0, tokens - 1);
+    tokens = Math.max(0, tokens - want);
   }
 
-  return async function limited<T>(fn: () => Promise<T>): Promise<T> {
-    const mine = tail.then(() => acquire());
+  return async function limited<T>(fn: () => Promise<T>, cost = DEFAULT_CU): Promise<T> {
+    const mine = tail.then(() => acquire(cost));
     // Swallow on the chain only, so one caller's failure cannot break the queue
     // for everyone behind it. The caller still sees its own rejection below.
     tail = mine.catch(() => undefined);

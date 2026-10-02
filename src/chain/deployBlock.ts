@@ -129,7 +129,10 @@ export async function fetchCreationBlockFromExplorer(a: {
 
   let body: unknown;
   try {
-    const response = await limit(() => fetchFn(url.toString()));
+    // Charged 0: this is an Etherscan HTTP call, not an RPC method, so it does not
+    // draw on the provider's compute-unit budget at all. Still serialised through the
+    // same limiter so a burst of explorer lookups cannot run unbounded.
+    const response = await limit(() => fetchFn(url.toString()), 0);
     // response.ok is deliberately ignored: measured, failures are HTTP 200.
     body = await response.json();
   } catch (err) {

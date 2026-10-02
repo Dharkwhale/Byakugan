@@ -5,8 +5,7 @@ import type { ChainConfig, Config } from '../../src/config.js';
 
 const chain = (chainId: number, name: string): ChainConfig => ({
   chainId, name, rpcUrl: `https://${name}.example/v2/key`,
-  initialChunk: 2000, maxChunk: 10000, requestsPerSecond: 5,
-  confirmations: 12, blockFetchThreshold: 3,
+  initialChunk: 2000, maxChunk: 10000, confirmations: 12,
   archiveProbe: { address: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', block: 1 },
 });
 
@@ -15,6 +14,7 @@ const configWith = (...ids: Array<[number, string]>): Config => ({
   defaultChainId: ids[0]?.[0],
   dbPath: ':memory:',
   etherscanApiKey: undefined,
+  computeUnitsPerSecond: 300,
   secrets: ids.map(([, name]) => `https://${name}.example/v2/key`),
 });
 
@@ -92,32 +92,42 @@ describe('getChainClient — one bucket per chain', () => {
   // limiters separate token pools" — no wall clock involved there). This test
   // does not need to re-prove that property; it only needs to prove the
   // WIRING — that getChainClient hands each chain its own limiter instance
-  // rather than a shared one. So it asserts identity and that Base actually
-  // ran, and deliberately does not read Date.now(): getChainClient always
-  // builds its limiter with the real systemClock (its signature has no clock
-  // parameter to inject, and adding one would be freelancing past the
-  // brief's interface), so a timing assertion here would be a wall-clock read
-  // in a suite that otherwise injects time everywhere else.
-  it('gives eth and base independently wired limiters', async () => {
+  /**
+   * REVERSED, deliberately, and this is the second time this test's premise has changed.
+   *
+   * It first asserted that each chain got its own bucket so a slow mainnet backfill could
+   * not throttle Base. Then the comment was corrected, because the compute-unit ceiling
+   * is ACCOUNT-WIDE and that goal is not achievable — concurrent chains draw on one
+   * budget. Now the assertions match: the limiter is SHARED, because per-chain buckets
+   * could only have divided a budget they did not control while letting their sum exceed
+   * it, which is the failure mode that earns a 429.
+   *
+   * Timing is not asserted here. `getChainClient` builds its limiter with the real
+   * systemClock and has no clock parameter, so a timing assertion would be a wall-clock
+   * read in a suite that injects time everywhere else. The spend arithmetic is pinned in
+   * rateLimit.test.ts against an injected clock; this pins the WIRING.
+   */
+  it('shares ONE limiter across chains, because the budget is account-wide', () => {
+    const config = configWith([1, 'eth'], [8453, 'base']);
+    expect(getChainClient(1, config).limit).toBe(getChainClient(8453, config).limit);
+  });
+
+  it('still runs work submitted through either chain handle', async () => {
     const config = configWith([1, 'eth'], [8453, 'base']);
     const eth = getChainClient(1, config);
     const base = getChainClient(8453, config);
-
-    expect(eth.limit).not.toBe(base.limit);
-
-    // Drain mainnet's bucket entirely (capacity is requestsPerSecond = 5).
-    const started: string[] = [];
-    for (let i = 0; i < 5; i++) await eth.limit(async () => { started.push('eth'); });
-
-    // Base must still run. If the buckets were shared this would block on
-    // mainnet's exhausted tokens (proven with injected time in
-    // rateLimit.test.ts); here we just confirm it actually ran.
-    await base.limit(async () => { started.push('base'); });
-    expect(started.filter((s) => s === 'base')).toHaveLength(1);
+    const ran: string[] = [];
+    // Cheap costs, so the shared bucket is not exhausted and this does not become a
+    // wall-clock wait.
+    await eth.limit(async () => { ran.push('eth'); }, 1);
+    await base.limit(async () => { ran.push('base'); }, 1);
+    expect(ran).toEqual(['eth', 'base']);
   });
 
-  it('gives each chain a limiter sized from its own requestsPerSecond', () => {
-    const config = configWith([1, 'eth'], [8453, 'base']);
-    expect(getChainClient(1, config).limit).not.toBe(getChainClient(8453, config).limit);
+  it('builds a fresh shared limiter after a reset, so a changed ceiling takes effect', () => {
+    const first = getChainClient(1, configWith([1, 'eth'])).limit;
+    resetChainClients();
+    expect(getChainClient(1, configWith([1, 'eth'])).limit).not.toBe(first);
   });
+
 });

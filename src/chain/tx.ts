@@ -5,6 +5,7 @@ import {
   type Address, type DecodedTransfer, type EnrichmentLevel, type Hash, type TxInfo,
 } from '../types.js';
 import type { ChainClient } from './client.js';
+import { CU_COSTS } from './cuCosts.js';
 import {
   chooseFetchStrategy, measureDensity, type FetchCosts, type FetchStrategy,
 } from './fetchStrategy.js';
@@ -249,12 +250,15 @@ export function makeTxSource(chain: ChainClient): TxSource {
   const client = chain.client as PublicClient;
   return {
     async getTransaction(hash) {
-      const tx = await chain.limit(() => client.getTransaction({ hash }));
+      const tx = await chain.limit(
+        () => client.getTransaction({ hash }), CU_COSTS.eth_getTransactionByHash,
+      );
       return { from: tx.from as Address, value: tx.value };
     },
     async getBlockWithTransactions(blockNumber) {
-      const block = await chain.limit(() =>
-        client.getBlock({ blockNumber, includeTransactions: true }),
+      const block = await chain.limit(
+        () => client.getBlock({ blockNumber, includeTransactions: true }),
+        CU_COSTS.eth_getBlockByNumber,
       );
       return block.transactions.map((tx) => ({
         hash: tx.hash as Hash,

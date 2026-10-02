@@ -335,7 +335,11 @@ describe('the dry run estimate', () => {
     expect(text).toContain('rerun without --dry-run');
     // The rate is a configured assumption, and the report must say so — the same
     // defect as the chunk size, which was read from config and wrong by 2000x.
-    expect(text).toContain('an assumption and not a measurement'.replace('an assum', 'assum'));
+    // The rate's PROVENANCE must be stated. It is now derived from the compute-unit
+    // ceiling rather than from a flat configured number, and the report says which —
+    // the earlier version trusted config's 25/s and was optimistic by 5x.
+    expect(text).toContain('derived from the');
+    expect(text).toContain('compute-unit ceiling');
   });
 
   it('flags an unvalidated deploy block in the report', () => {

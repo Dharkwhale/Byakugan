@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { FREE_TIER_CU_PER_SECOND } from './chain/cuCosts.js';
 import { ConfigError } from './errors.js';
 import type { Address } from './types.js';
 
@@ -7,9 +8,7 @@ const chainSchema = z.object({
   name: z.string().min(1),
   initialChunk: z.number().int().positive(),
   maxChunk: z.number().int().positive(),
-  requestsPerSecond: z.number().positive(),
   confirmations: z.number().int().nonnegative(),
-  blockFetchThreshold: z.number().int().positive(),
   archiveProbe: z.object({
     address: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
     block: z.number().int().nonnegative(),
@@ -27,6 +26,19 @@ export interface Config {
   defaultChainId: number | undefined;
   dbPath: string;
   etherscanApiKey: string | undefined;
+  /**
+   * Throughput ceiling in compute units per second, ACCOUNT-WIDE rather than per chain.
+   *
+   * This replaced a per-chain `requestsPerSecond: 25`, which was wrong in two ways at
+   * once. It was five times too fast for `eth_getLogs` (60 CU against a 300 CU/s free
+   * tier allows 5 calls per second, not 25), so every backfill would have met 429s. And
+   * no single rate can be right for every method anyway: at the same ceiling
+   * `eth_getTransactionByHash` sustains 20 calls per second. The limit belongs in compute
+   * units, with per-method prices, and it belongs here rather than per chain because the
+   * ceiling is a property of the account — measured: concurrent work on two chains draws
+   * on one budget.
+   */
+  computeUnitsPerSecond: number;
   /** Substrings that must never appear in logs. */
   secrets: string[];
 }
@@ -89,11 +101,22 @@ export function loadConfig(
     throw new ConfigError('DEFAULT_CHAIN_ID must be an integer');
   }
 
+  const cuPerSecond = env.COMPUTE_UNITS_PER_SECOND
+    ? Number(env.COMPUTE_UNITS_PER_SECOND)
+    : FREE_TIER_CU_PER_SECOND;
+  if (!Number.isFinite(cuPerSecond) || cuPerSecond <= 0) {
+    throw new ConfigError(
+      `COMPUTE_UNITS_PER_SECOND must be a positive number, got "${env.COMPUTE_UNITS_PER_SECOND}". ` +
+      `Leave it unset for the free tier default of ${FREE_TIER_CU_PER_SECOND}.`,
+    );
+  }
+
   return {
     chains,
     defaultChainId,
     dbPath: env.DB_PATH ?? './data/byakugan.db',
     etherscanApiKey,
+    computeUnitsPerSecond: cuPerSecond,
     secrets,
   };
 }

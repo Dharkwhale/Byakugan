@@ -123,6 +123,8 @@ export function formatEstimate(a: {
   safeHead: bigint;
   /** Printed beside the time, because a rate taken on trust deserves saying so. */
   requestsPerSecond: number;
+  /** Whether the compute-unit prices the rate is derived from have been measured. */
+  ratesVerified?: boolean;
   /** How the chunk size was established. See probeEffectiveChunk. */
   chunkNote?: string;
   chunkMeasured?: boolean;
@@ -146,10 +148,12 @@ export function formatEstimate(a: {
     ...(a.chunkNote ? [`                    ${a.chunkNote}`] : []),
     `  getLogs calls     ${e.logsCalls.toLocaleString()}`,
     `  estimated time    ${humanizeSeconds(e.logsSeconds)}  for log fetching alone`,
-    `                    at the CONFIGURED ${a.requestsPerSecond}/s, which is an`,
-    '                    assumption and not a measurement — on a free tier the',
-    '                    compute-unit ceiling can make the real rate lower, and',
-    '                    then this figure is optimistic by that ratio',
+    `                    at ${a.requestsPerSecond.toFixed(1)} getLogs/s, derived from the`,
+    '                    compute-unit ceiling rather than from a flat configured rate',
+    ...(a.ratesVerified === false
+      ? ['                    (the CU prices behind it come from the published table and',
+         '                     are NOT yet confirmed against a dashboard reading)']
+      : []),
   ];
 
   if (e.logsCu !== null) {

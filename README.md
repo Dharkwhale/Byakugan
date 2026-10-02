@@ -56,14 +56,13 @@ npm run index -- --contract 0xec04bedeec2f23307bba10468822d5b76a4284f5 --chain 8
                     measured by probing: 10 blocks accepted after 2 attempts
   getLogs calls     10,074
   estimated time    6.7 minutes  for log fetching alone
-                    at the CONFIGURED 25/s, which is an assumption and not a
-                    measurement — on a free tier the compute-unit ceiling can
-                    make the real rate lower
+                    at 5.0 getLogs/s, derived from the compute-unit ceiling
+                    rather than from a flat configured rate
 ```
 
-Read that last caveat. The chunk size is measured against your endpoint, but the
-*rate* comes from `config/chains.json`, and on the free tier the compute-unit
-ceiling is the real constraint — see below.
+The chunk size is measured against your endpoint and the rate is derived from the
+compute-unit ceiling, so both figures are grounded — but the CU prices behind the
+rate are published rather than measured, and the report says so while that holds.
 
 Then index for real, bounding it while you find your feet:
 
@@ -120,18 +119,14 @@ a function of how busy the range is — a query against an address that never em
 anything caps at 10 too. It is a plan-tier limit, so `--dry-run` measures it against your
 endpoint rather than trusting a config value.
 
-**The compute-unit ceiling, not the request count, is what actually limits you.** The
+**The compute-unit ceiling is the real limit, and the rate is derived from it.** The
 free tier allows 300 CU/second and `eth_getLogs` costs 60 CU, so the sustainable rate is
-about **5 calls/second** — not the 25 that `config/chains.json` currently declares. That
-config value predates the CU measurement and is optimistic by 5× for this method, which is
-why `--dry-run` labels the rate as an assumption. Trust the calls figure; scale the time
-yourself.
+**5 calls/second**. There is no `requestsPerSecond` setting to get wrong: the limiter
+charges each call its method's compute-unit price out of one account-wide budget, so a
+cheap method runs faster than an expensive one instead of both sharing a flat guess.
+`eth_getTransactionByHash` at 15 CU sustains 20/second on the same ceiling.
 
-| span | `getLogs` calls | at 25/s (as configured) | at 5/s (CU-bound) |
-|---|---|---|---|
-| 100,000 blocks | 10,000 | ~7 minutes | ~33 minutes |
-| **1,000,000 blocks** | **100,000** | ~1.1 hours | **~5.6 hours** |
-| 38,000,000 blocks (a 2022 Base collection) | 3,800,000 | ~1.8 days | ~8.8 days |
+| 38,000,000 blocks (a 2022 Base collection) | 3,800,000 | ~8.8 days |
 
 **Enrichment is separate, and it dominates.** Measured on a real collection, fetching the
 transactions cost roughly 142× the cost of fetching the logs. That is what the levels are
@@ -258,12 +253,18 @@ Every one of these is pinned by a test, so they are choices rather than surprise
 
 **Estimation and limits**
 
-- `requestsPerSecond` in `config/chains.json` is 25 for every chain and predates the
-  compute-unit measurement. For `eth_getLogs` on the free tier the real ceiling is about
-  5/second, so `--dry-run`'s time figure is optimistic by that ratio and says so. The
-  call count is exact; the rate is not. Setting the measured CU prices
-  (`CU_PER_GETLOGS`, `CU_PER_GETTRANSACTION`, `CU_PER_GETBLOCK`) makes the cost columns
-  appear; leaving them unset prints "not computed" rather than a guess.
+- **The compute-unit prices are Alchemy's published figures and have not been confirmed
+  against a dashboard reading.** They live in one file,
+  [`src/chain/cuCosts.ts`](src/chain/cuCosts.ts), with a `VERIFIED` flag; `--dry-run`
+  prints the caveat while it is false. The only one cross-checked by arithmetic is
+  `eth_getLogs` at 60 CU, which gives the 5 calls/second this project plans around. A
+  method absent from that table is charged the most expensive known price, so a gap makes
+  a run slower rather than rate-limited.
+- Setting `CU_PER_GETLOGS`, `CU_PER_GETTRANSACTION` and `CU_PER_GETBLOCK` makes
+  `--dry-run` print cost columns; leaving them unset prints "not computed" rather than a
+  guess, and enrichment then takes the per-tx path, which cannot over-fetch.
+- `COMPUTE_UNITS_PER_SECOND` overrides the 300 CU/s free-tier ceiling if you are on a
+  paid tier.
 
 **Coverage**
 

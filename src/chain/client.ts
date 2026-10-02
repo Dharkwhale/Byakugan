@@ -6,7 +6,23 @@ import { createRateLimiter, type RateLimiter } from './rateLimit.js';
 export interface ChainClient {
   chainId: number;
   client: PublicClient;
-  /** This chain's own token bucket. Never shared with another chain. */
+  /**
+   * The ACCOUNT-WIDE compute-unit budget, shared by every chain.
+   *
+   * It used to be one bucket per chain, on the reasoning that a slow mainnet backfill
+   * should not throttle Base. That reasoning was wrong, and measurably so: the ceiling
+   * belongs to the account, so concurrent work on two chains draws on one budget and a
+   * saturating run on either necessarily slows the other. Per-chain buckets could only
+   * have divided a budget they did not control, while letting their sum exceed it — the
+   * worst of both.
+   *
+   * Per-chain FAIRNESS (stopping one chain monopolising the shared budget) is a separate
+   * mechanism and is deliberately not built: nothing indexes two chains at once yet, and
+   * a queue nobody contends for is speculative machinery.
+   *
+   * Pass the method's cost from `CU_COSTS`. Omitting it charges the most expensive known
+   * method, so a forgotten cost is slow rather than rate-limited.
+   */
   limit: RateLimiter;
 }
 
@@ -16,6 +32,26 @@ export interface ChainClient {
 // built from the first Config. Fine for a process that loads config once at
 // startup; call resetChainClients() to pick up a changed config.
 const clients = new Map<number, ChainClient>();
+
+/**
+ * One bucket for the whole process, because the ceiling is one budget for the whole
+ * account. Built on first use from the config then in hand; `resetChainClients()` clears
+ * it alongside the clients so a test can change the ceiling.
+ */
+let accountLimiter: RateLimiter | undefined;
+
+function sharedLimiter(config: Config): RateLimiter {
+  if (!accountLimiter) {
+    accountLimiter = createRateLimiter({
+      // Capacity equals one second's refill: enough to let a burst of cheap calls
+      // through together, without banking an idle minute's worth and then spending it
+      // all at once — which is exactly what earns a 429.
+      capacity: config.computeUnitsPerSecond,
+      refillPerSec: config.computeUnitsPerSecond,
+    });
+  }
+  return accountLimiter;
+}
 
 /**
  * Memoized public client plus its rate limiter, one pair per chain.
@@ -66,10 +102,7 @@ export function getChainClient(chainId: number, config: Config): ChainClient {
   const entry: ChainClient = {
     chainId,
     client,
-    limit: createRateLimiter({
-      capacity: chain.requestsPerSecond,
-      refillPerSec: chain.requestsPerSecond,
-    }),
+    limit: sharedLimiter(config),
   };
 
   // Only reached on success, so a throw above leaves nothing cached.
@@ -79,4 +112,5 @@ export function getChainClient(chainId: number, config: Config): ChainClient {
 
 export function resetChainClients(): void {
   clients.clear();
+  accountLimiter = undefined;
 }
