@@ -277,6 +277,19 @@ describe('handleIndex fix round 1', () => {
     expect(base.runBackfill).not.toHaveBeenCalled();
   });
 
+  it('still refuses an orphan at EXACTLY its expiry, where the claim would also refuse', async () => {
+    // The boundary is pinned rather than chosen, because the two predicates have to agree.
+    // claimCollection steals on `locked_at < now - staleMs` — strict — so at now == expiresAt
+    // it would refuse, and falling through here would start a job that cannot claim the lock.
+    const { base, sent, clock } = deps();
+    db.prepare('INSERT INTO collections (chain_id, contract, standard, locked_by, locked_at) VALUES (1, ?, ?, ?, ?)')
+      .run(ADDR, '721', 'dead-job', 0);
+    clock.advance(900_000);
+    await handleIndex({ ...base, text: `/index ${ADDR}` });
+    expect(sent.at(-1)).toMatch(/previous run/i);
+    expect(base.runBackfill).not.toHaveBeenCalled();
+  });
+
   it('passes deployBlock to estimate as well as to runBackfill', async () => {
     const { base } = deps();
     await handleIndex({ ...base, text: `/index ${ADDR} --deploy-block 1234` });

@@ -96,7 +96,12 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
   // as orphaned (accurately: a lock row exists), but only `claimCollection` ever steals a
   // stale lock, and that runs only inside `backfill`. Refusing here would mean backfill
   // never runs, the lock is never stolen, and the collection is wedged for good.
-  if (state.kind === 'orphaned' && d.clock.now() < state.expiresAt) {
+  //
+  // `<=`, not `<`, so the two predicates agree on the exact boundary. `claimCollection`
+  // steals only when `locked_at < now - staleMs`, which is STRICT: at `now == expiresAt`
+  // it still refuses. Falling through on that millisecond would start a job whose claim
+  // then fails, so the user gets an error where "try again after that" is the true answer.
+  if (state.kind === 'orphaned' && d.clock.now() <= state.expiresAt) {
     // NOT the same as running. A previous process died holding the lock; nothing is
     // working on this collection and the lock clears itself.
     const minutes = Math.max(0, Math.round((state.expiresAt - d.clock.now()) / 60_000));
