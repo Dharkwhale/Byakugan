@@ -712,7 +712,19 @@ const BIDI = /[‪-‮⁦-⁩]/g;
  */
 export function sanitizeOnChainText(value: string | null | undefined): string {
   if (typeof value !== 'string') return '(unnamed)';
-  const cleaned = value.replace(CONTROL, '').replace(BIDI, '').replace(/\s+/g, ' ').trim();
+  // ORDER IS LOAD-BEARING. Newlines and tabs ARE C0 control characters, so stripping
+  // controls first deletes them outright and fuses words: "Cool
+Collection" becomes
+  // "CoolCollection" rather than "Cool Collection". Collapse whitespace to a space FIRST,
+  // then strip what remains, then collapse again to absorb any gap the stripping left.
+  // (An earlier draft of this plan had the two steps the other way round and its own
+  // newline test would have failed.)
+  const cleaned = value
+    .replace(/\s+/g, ' ')
+    .replace(CONTROL, '')
+    .replace(BIDI, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (cleaned.length === 0) return '(unnamed)';
   return cleaned.length > NAME_LIMIT ? `${cleaned.slice(0, NAME_LIMIT)}…` : cleaned;
 }
