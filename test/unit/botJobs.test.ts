@@ -83,7 +83,8 @@ describe('the three states', () => {
   });
 
   it('keys on chain AND contract, so the same address on two chains cannot collide', async () => {
-    // Review Focus 2.
+    // The same contract address deployed on two chains is ordinary. A map keyed on the
+    // address alone would let one job's progress and state overwrite the other's.
     db.prepare('INSERT INTO collections (chain_id, contract, standard) VALUES (8453, ?, ?)')
       .run(CONTRACT, '721');
     const registry = createJobRegistry({ clock: manualClock(0), staleMs: STALE_MS });
@@ -136,6 +137,32 @@ describe('the detached runner', () => {
     });
     await flush();
     await flush();
+    expect(unhandled).not.toHaveBeenCalled();
+    process.off('unhandledRejection', unhandled);
+  });
+
+  it('survives an onError that itself throws, for async and synchronous runners', async () => {
+    // The inner catch around onError is part of "never rejects": without it the detached
+    // IIFE rejects when a caller's reporter throws, and nothing awaits it.
+    const unhandled = vi.fn();
+    process.once('unhandledRejection', unhandled);
+    const registry = createJobRegistry({ clock: manualClock(0), staleMs: STALE_MS });
+    const onError = vi.fn(() => { throw new Error('reporter exploded'); });
+    registry.start({
+      chainId: 1, contract: CONTRACT, source: 'getLogs',
+      run: async () => { throw new Error('async boom'); },
+      onError,
+    });
+    // A non-async function throws before returning a promise; the IIFE must absorb it too.
+    registry.start({
+      chainId: 8453, contract: CONTRACT, source: 'getLogs',
+      run: (() => { throw new Error('sync boom'); }) as () => Promise<void>,
+      onError,
+    });
+    await flush();
+    await flush();
+    expect(onError).toHaveBeenCalledTimes(2);
+    expect(registry.size()).toBe(0);
     expect(unhandled).not.toHaveBeenCalled();
     process.off('unhandledRejection', unhandled);
   });
