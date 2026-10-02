@@ -13,7 +13,13 @@ const MINTER = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const OTHER = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const ZERO = '0x0000000000000000000000000000000000000000';
 const STALE = 900_000;
-/** U+202E RIGHT-TO-LEFT OVERRIDE, written as an escape so it cannot be lost in an editor. */
+/**
+ * U+202E RIGHT-TO-LEFT OVERRIDE, written as an ESCAPE and not as the character itself.
+ *
+ * The character is invisible, so a literal here is a Trojan-source hazard in the very file
+ * that tests the defence against it, and an editor or formatter that strips it would turn
+ * `RLO` into the empty string — at which point `not.toContain(RLO)` fails on every input.
+ */
 const RLO = '‮';
 
 let db: Database.Database;
@@ -164,6 +170,61 @@ describe('handleStatus', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('Indexed collections');
     expect(sent[0]).toContain(ADDR);
+  });
+
+  it('IGNORES a typed --chain on the list, and says the list spans every chain', async () => {
+    // The whole reason the heading reads "(all chains)" is that this branch never reads the
+    // options. Without this test an implementation that filtered by `--chain` and printed
+    // "(chain 1)" would pass the suite, so the stated reason would be unasserted.
+    const { base, sent } = setup();
+    indexed();
+    db.prepare(`
+      INSERT INTO collections
+        (chain_id, contract, standard, name, deploy_block, deploy_block_source,
+         deploy_block_validated, enrichment_level, last_indexed_block)
+      VALUES (137, ?, '721', 'Polygon One', 7, 'binary_search', 1, 'full', 9)
+    `).run(OTHER);
+    await handleStatus({ ...base, text: '/status --chain 1' });
+    expect(sent[0]).toContain('(all chains)');
+    expect(sent[0]).toContain(ADDR);
+    expect(sent[0]).toContain(OTHER);
+    expect(sent[0]).toContain('chain 137');
+  });
+
+  it('SAYS SO when the list is truncated, rather than showing a subset as the whole set', async () => {
+    // A capped list under a heading that reads as everything is an undercount wearing the
+    // shape of a right answer. The total has to be visible.
+    const { base, sent } = setup();
+    for (let i = 0; i < 23; i++) {
+      const addr = `0x${i.toString(16).padStart(40, 'c')}`;
+      db.prepare(`
+        INSERT INTO collections
+          (chain_id, contract, standard, name, deploy_block, deploy_block_source,
+           deploy_block_validated, enrichment_level, last_indexed_block)
+        VALUES (1, ?, '721', 'C', 1, 'binary_search', 1, 'full', 2)
+      `).run(addr);
+    }
+    await handleStatus({ ...base, text: '/status' });
+    expect(sent[0]).toContain('most recent 20 of 23');
+    expect(sent[0]!.split('\n').filter((l) => l.startsWith('chain '))).toHaveLength(20);
+  });
+
+  it('REPORTS a running job on a collection that has not bootstrapped yet', async () => {
+    // getCollection reads not_indexed until `standard` is set, and the deploy-block search
+    // runs before that — the longest part of a first index. Reporting only "not indexed"
+    // there hides the live job and invites a second /index for work already under way.
+    const { base, sent, clock } = setup();
+    base.registry.start({
+      chainId: 1, contract: ADDR, source: 'getAssetTransfers',
+      run: () => new Promise(() => undefined),
+    });
+    clock.advance(180_000);
+    await handleStatus({ ...base, text: `/status ${ADDR}` });
+    expect(sent[0]).toMatch(/indexing now/i);
+    expect(sent[0]).toContain('3 minutes ago');
+    expect(sent[0]).toContain('via getAssetTransfers');
+    // The pointer to /index must NOT appear: following it is the one wrong move here.
+    expect(sent[0]).not.toContain(`/index ${ADDR}`);
   });
 
   it('says so when nothing has been indexed at all', async () => {

@@ -9,6 +9,9 @@ import type { JobRegistry, JobState } from '../jobs.js';
 import { sanitizeOnChainText } from '../render.js';
 import type { Replier } from '../replier.js';
 
+/** How many collections the list shows. The total is reported alongside it, always. */
+const LIST_LIMIT = 20;
+
 /**
  * Whether the user supplied an address, decided the way `parseQueryCommand` reads tokens:
  * a `--flag` consumes the token after it as its value, and anything else is an address.
@@ -24,6 +27,17 @@ function suppliedAddress(text: string): boolean {
     i++; // the flag's value
   }
   return false;
+}
+
+/**
+ * Describes a job this process is running.
+ *
+ * Shared by both branches below. It exists because a first index is live for a long time
+ * before the collection row appears, and the two places that report it must not drift.
+ */
+function runningLine(job: Extract<JobState, { kind: 'running' }>, now: number): string {
+  return `indexing now, started ${Math.round((now - job.startedAt) / 60_000)} minutes ago, ` +
+    `via ${job.source}`;
 }
 
 /**
@@ -62,14 +76,23 @@ export async function handleStatus(a: {
         FROM collections
        WHERE standard IS NOT NULL
        ORDER BY indexed_at DESC NULLS LAST
-       LIMIT 20
+       LIMIT ${LIST_LIMIT}
     `).all() as Array<{ chainId: number; contract: string; level: string; watermark: number }>;
     if (rows.length === 0) {
       await a.replier.reply('Nothing indexed yet. Start with /index 0x…');
       return;
     }
+    // The TOTAL is counted and shown, never left implied by the number of rows printed. A
+    // capped list under a heading that reads as the whole set is a subset wearing the shape
+    // of a complete answer, which is the one thing a status command must not do.
+    const total = (a.db.prepare(
+      'SELECT COUNT(*) AS n FROM collections WHERE standard IS NOT NULL',
+    ).get() as { n: number }).n;
+    const heading = total > rows.length
+      ? `Indexed collections (all chains) — most recent ${rows.length} of ${total}`
+      : `Indexed collections (all chains) — ${total}`;
     await a.replier.reply(
-      ['Indexed collections (all chains)', '', ...rows.map((r) =>
+      [heading, '', ...rows.map((r) =>
         `chain ${r.chainId}  ${r.contract}  recorded level ${r.level}  through ${r.watermark}`)]
         .join('\n'),
     );
@@ -96,6 +119,20 @@ export async function handleStatus(a: {
   const now = a.clock.now();
 
   if (state.state === 'not_indexed') {
+    // A FIRST index can be live while this still reads not_indexed: the deploy-block search
+    // runs before `standard` is set and is the longest part of a first index, so
+    // `getCollection` says not_indexed for the whole of it. Replying only that would hide a
+    // running job and invite a second `/index` for work already under way — a visibility
+    // feature concealing the one thing it exists to show.
+    if (job.kind === 'running') {
+      await a.replier.reply(
+        `${contract} on chain ${chainId} is being indexed for the first time and has not ` +
+        'finished bootstrapping yet.\n' +
+        `  ${runningLine(job, now)}\n` +
+        '  Nothing is recorded for it yet. Wait for it rather than starting another.',
+      );
+      return;
+    }
     const extra = job.kind === 'orphaned' ? `\n  ${orphanLine(job, now)}.` : '';
     await a.replier.reply(
       `${contract} on chain ${chainId} is not indexed.${extra}\n  /index ${contract} --chain ${chainId}`,
@@ -112,7 +149,7 @@ export async function handleStatus(a: {
   const level = getEnrichmentLevel(a.db, chainId, contract);
 
   const jobLine = job.kind === 'running'
-    ? `  indexing now, started ${Math.round((now - job.startedAt) / 60_000)} minutes ago, via ${job.source}`
+    ? `  ${runningLine(job, now)}`
     : job.kind === 'orphaned'
       ? `  ${orphanLine(job, now)}`
       : '  no job running';
