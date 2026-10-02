@@ -16,6 +16,10 @@ import { getChainClient } from '../chain/client.js';
 import { resolveDeployBlock } from '../chain/deployBlock.js';
 import { makeSupportsInterface, detectStandard } from '../chain/standard.js';
 import { makeTxSource } from '../chain/tx.js';
+import { makeAssetTransfersFetcher } from '../chain/assetTransfersRpc.js';
+import {
+  makeAssetTransfersSource, makeLogsSource, supportsAssetTransfers, withFallback,
+} from '../indexer/transferSource.js';
 import { CU_COSTS, VERIFIED as CU_VERIFIED, callsPerSecond } from '../chain/cuCosts.js';
 import { systemClock } from '../clock.js';
 import { loadConfig, type ChainConfig, type Config } from '../config.js';
@@ -101,18 +105,58 @@ async function main(argv: string[]): Promise<number> {
       address: a.address, blockNumber: a.blockNumber,
     }), CU_COSTS.eth_getCode)) ?? '0x';
 
+  const fetchLogs = async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+    const logs = await limit(() => client.getLogs({
+      address: args.contract, fromBlock, toBlock,
+    }), CU_COSTS.eth_getLogs);
+    return logs.map((l) => ({
+      topics: l.topics as Hash[],
+      data: l.data as Hash,
+      transactionHash: l.transactionHash as Hash,
+      blockNumber: l.blockNumber!,
+      logIndex: l.logIndex!,
+    }));
+  };
+
+  /**
+   * Whether this endpoint serves `getAssetTransfers`, decided ONCE before indexing.
+   *
+   * It is a property of the endpoint, not of the range: a non-Alchemy RPC or an unindexed
+   * chain fails every time, so probing per chunk would turn one upfront failure into
+   * thousands. The probe's standard is irrelevant — it only asks whether the method
+   * answers at all.
+   */
+  let assetSupported = false;
+  const probeFetcher = makeAssetTransfersFetcher({
+    rpcUrl: chain.rpcUrl, limit, contract: args.contract, standard: '721',
+  });
+
   const ports: BackfillPorts = {
-    fetchLogs: async ({ fromBlock, toBlock }) => {
-      const logs = await limit(() => client.getLogs({
-        address: args.contract, fromBlock, toBlock,
-      }), CU_COSTS.eth_getLogs);
-      return logs.map((l) => ({
-        topics: l.topics as Hash[],
-        data: l.data as Hash,
-        transactionHash: l.transactionHash as Hash,
-        blockNumber: l.blockNumber!,
-        logIndex: l.logIndex!,
-      }));
+    makeTransferSource: (standard) => {
+      const logsSource = makeLogsSource({
+        fetchLogs, standard,
+        initialChunk: chain.initialChunk, maxChunk: chain.maxChunk,
+      });
+      if (args.fetchPath === 'logs' || !assetSupported) return logsSource;
+      return withFallback({
+        primary: makeAssetTransfersSource({
+          standard,
+          fetch: makeAssetTransfersFetcher({
+            rpcUrl: chain.rpcUrl, limit, contract: args.contract, standard,
+          }),
+        }),
+        secondary: logsSource,
+        onFallback: (notice) => {
+          err(
+            `warning: ${notice.from} failed, continuing with ${notice.to} from block ` +
+            `${notice.resumedAt}. The two paths are verified to produce identical rows ` +
+            `(scripts/compare-fetch-paths.ts), so the index is unaffected — only slower.
+` +
+            `  reason: ${notice.reason}
+`,
+          );
+        },
+      });
     },
     txSource: makeTxSource(chainClient),
     supports,
@@ -153,8 +197,25 @@ async function main(argv: string[]): Promise<number> {
     // 20,000 on Base while the measured cap on this account is 10, which made a
     // 38-million-block span report as "76 seconds" instead of days. One extra call
     // buys an estimate that is worth believing.
+    const support = await supportsAssetTransfers(probeFetcher, head);
+    out(
+      support.supported
+        ? [
+            '',
+            '  fetch path        alchemy_getAssetTransfers — no range cap, roughly one',
+            '                    page per 1000 transfers, with eth_getLogs as fallback.',
+            '                    The getLogs figures below are therefore a CEILING.',
+            '',
+          ].join('\n')
+        : [
+            '',
+            '  fetch path        eth_getLogs only — getAssetTransfers is unavailable here',
+            `                    (${support.reason ?? 'no reason given'})`,
+            '',
+          ].join('\n'),
+    );
     const probed = await probeEffectiveChunk({
-      fetch: ports.fetchLogs, nearBlock: head, requested: chain.maxChunk,
+      fetch: fetchLogs, nearBlock: head, requested: chain.maxChunk,
     });
 
     out(formatEstimate({
@@ -189,7 +250,22 @@ async function main(argv: string[]): Promise<number> {
     const head = await safeHead();
     const bound = args.toBlock !== undefined && args.toBlock < head ? args.toBlock : head;
 
-    out(`indexing ${args.contract} on chain ${args.chainId} (${chain.name}) at level ${args.level}\n`);
+    // The capability probe, ONCE, before any indexing. `assetSupported` is read by
+    // `makeTransferSource`, which backfill calls after bootstrap — so this must run first
+    // or the cheap path is silently never used, which is exactly what happened the first
+    // time this was wired: the run completed, produced correct rows, and took 70 getLogs
+    // chunks instead of one page. Nothing looked wrong.
+    const support = args.fetchPath === 'logs'
+      ? { supported: false, reason: 'forced by --fetch-path logs' }
+      : await supportsAssetTransfers(probeFetcher, head);
+    assetSupported = support.supported;
+
+    out(
+      `indexing ${args.contract} on chain ${args.chainId} (${chain.name}) at level ${args.level}\n` +
+      (assetSupported
+        ? '  via alchemy_getAssetTransfers, falling back to eth_getLogs on failure\n'
+        : `  via eth_getLogs (${support.reason ?? 'getAssetTransfers unavailable'})\n`),
+    );
 
     const reporter = createProgressReporter({
       clock: systemClock,
@@ -210,8 +286,6 @@ async function main(argv: string[]): Promise<number> {
         contract: args.contract,
         level: args.level,
         toBlock: args.toBlock,
-        initialChunk: chain.initialChunk,
-        maxChunk: chain.maxChunk,
         // null, NOT a plausible default. Without measured prices the run takes
         // the per-tx path, which cannot over-fetch, rather than choosing on
         // invented evidence. Same reasoning as the dry run refusing to print a

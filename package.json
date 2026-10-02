@@ -14,7 +14,8 @@
     "migrate": "node --env-file-if-exists=.env --import tsx src/db/migrate.ts",
     "verify:probes": "node --env-file-if-exists=.env --import tsx scripts/verify-archive-probes.ts",
     "measure-cu": "node --env-file-if-exists=.env --import tsx scripts/measure-cu-cost.ts",
-    "build:fixtures": "forge build"
+    "build:fixtures": "forge build",
+    "compare:paths": "node --env-file-if-exists=.env --import tsx scripts/compare-fetch-paths.ts"
   },
   "keywords": [],
   "author": "",

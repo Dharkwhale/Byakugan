@@ -12,8 +12,7 @@ import { getEnrichmentLevel, setEnrichmentLevel } from '../db/repositories/enric
 import { findKnownTxs, insertTransfers } from '../db/repositories/transfers.js';
 import { CollectionLockedError, EnrichmentLevelError } from '../errors.js';
 import { classify } from './classify.js';
-import { decodeLogs } from './decode.js';
-import { iterateLogs, type LogFetcher } from './logs.js';
+import type { TransferSource } from './transferSource.js';
 import type {
   Address, DeployBlockSource, EnrichmentLevel, Standard, TransferRow,
 } from '../types.js';
@@ -24,7 +23,13 @@ import type {
  * SAME code path as production rather than a parallel one.
  */
 export interface BackfillPorts {
-  fetchLogs: LogFetcher;
+  /**
+   * Built per run, because the source needs the STANDARD and the standard is only known
+   * after bootstrap. Which implementation this returns — `getAssetTransfers` with a
+   * `getLogs` fallback, or `getLogs` alone — is the caller's decision; the orchestrator
+   * treats them identically because they are required to produce identical rows.
+   */
+  makeTransferSource(standard: Standard): TransferSource;
   txSource: TxSource;
   supports: SupportsInterface;
   /** Already wired with its own chain dependencies; called only during bootstrap. */
@@ -61,8 +66,11 @@ export interface BackfillOptions {
   level: EnrichmentLevel;
   /** Clamped to safeHead. Absent means "as far as is safe". */
   toBlock?: bigint;
-  initialChunk: number;
-  maxChunk: number;
+  /**
+   * Chunk sizing moved into the transfer source: the two implementations chunk for
+   * different reasons (a provider range cap versus a result-count page size), so a single
+   * pair of numbers here could only be right for one of them.
+   */
   /** Null when compute-unit prices are unmeasured; see enrichTxs. */
   costs: FetchCosts | null;
   staleLockMs: number;
@@ -73,6 +81,8 @@ export interface BackfillOptions {
 export type BackfillResult =
   | {
       status: 'indexed';
+      /** Which fetch path ran. Reported because a fallback is worth knowing about. */
+      source: TransferSource['name'];
       standard: Standard;
       deployBlock: number;
       fromBlock: number;
@@ -185,19 +195,14 @@ export async function backfill(
     let rowsInserted = 0;
     let reached = lastIndexed;
 
-    for await (const chunk of iterateLogs({
-      fetch: ports.fetchLogs,
-      fromBlock,
-      toBlock: bound,
-      initialChunk: o.initialChunk,
-      maxChunk: o.maxChunk,
-    })) {
+    const source = ports.makeTransferSource(standard);
+    for await (const chunk of source.iterate({ fromBlock, toBlock: bound })) {
       const ctx: ChunkContext = {
         chunkIndex: chunks, fromBlock: chunk.fromBlock, toBlock: chunk.toBlock,
       };
 
       // ---- async, BEFORE any write. A throw here leaves the database untouched.
-      const decoded = decodeLogs(chunk.logs, standard);
+      const decoded = chunk.transfers;
       const needed = selectNeeded(decoded, o.level);
       const known = findKnownTxs(db, o.chainId, needed.map((n) => n.txHash));
       const txs = await enrichTxs({
@@ -246,6 +251,7 @@ export async function backfill(
 
     return {
       status: 'indexed',
+      source: source.name,
       standard,
       deployBlock,
       fromBlock: Number(fromBlock),

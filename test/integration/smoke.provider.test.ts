@@ -42,6 +42,7 @@ import { runMigrations } from '../../src/db/migrate.js';
 import { firstMinters } from '../../src/db/repositories/analytics.js';
 import { countByKind } from '../../src/db/repositories/transfers.js';
 import { backfill, type BackfillPorts } from '../../src/indexer/backfill.js';
+import { makeLogsSource } from '../../src/indexer/transferSource.js';
 import { deriveSecretTokens } from '../../src/secrets.js';
 import type { Address, Hash } from '../../src/types.js';
 
@@ -139,8 +140,7 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
     db = openDb(join(dbDir, 'smoke.db'));
     runMigrations(db);
 
-    const ports: BackfillPorts = {
-      fetchLogs: async ({ fromBlock, toBlock }) => {
+    const fetchLogs = async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
         requested.push({ from: fromBlock, to: toBlock, width: toBlock - fromBlock + 1n });
         try {
           const logs = await limit(() => client.getLogs({
@@ -157,7 +157,17 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
           if (/429|rate limit|too many requests/i.test(String(err))) rateLimited += 1;
           throw err;
         }
-      },
+    };
+
+    const ports: BackfillPorts = {
+      // getLogs DELIBERATELY, not the cheaper path: this suite exists to exercise the
+      // provider's range cap and the chunker's response to it, and getAssetTransfers has
+      // no range cap to hit. The cheap path's equivalence is gated separately by
+      // scripts/compare-fetch-paths.ts.
+      makeTransferSource: (standard) => makeLogsSource({
+        fetchLogs, standard,
+        initialChunk: chain.initialChunk, maxChunk: chain.maxChunk,
+      }),
       txSource: makeTxSource(chainClient),
       supports,
       resolveDeployBlock: async ({ safeHead }) => ({
@@ -187,8 +197,6 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
         contract: CONTRACT,
         level: 'full',
         toBlock: TO_BLOCK,
-        initialChunk: chain.initialChunk,
-        maxChunk: chain.maxChunk,
         costs: null, // prices unmeasured; per-tx, which cannot over-fetch
         staleLockMs: 5 * 60_000,
       },
@@ -338,7 +346,10 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
           'cross-check fell back to a recorded count. Enumerable declared: ' +
           `${enumerableDeclared}.\n\n`,
         );
-        expect(kinds.mint).toBe(153);
+        // 152, not the 153 this once said. That figure came from counting raw logs whose
+        // topics[1] was zero, which also catches non-Transfer events; the fetch-path
+        // comparison indexed the range both ways and got 152 mints and no burns.
+        expect(kinds.mint).toBe(152);
         return;
       }
       expect(BigInt(kinds.mint - kinds.burn)).toBe(totalSupplyAtBound);
@@ -383,7 +394,8 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
         clock: systemClock,
         jobId: 'smoke-2',
         ports: {
-          fetchLogs: async ({ fromBlock, toBlock }) => {
+          makeTransferSource: (standard) => {
+            const inner = async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
             const logs = await limit(() => client.getLogs({
               address: CONTRACT as ViemAddress, fromBlock, toBlock,
             }));
@@ -392,7 +404,13 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
               transactionHash: l.transactionHash as Hash,
               blockNumber: l.blockNumber!, logIndex: l.logIndex!,
             }));
-          },
+          };
+          const chainCfg = config!.chains.get(CHAIN_ID)!;
+          return makeLogsSource({
+            fetchLogs: inner, standard,
+            initialChunk: chainCfg.initialChunk, maxChunk: chainCfg.maxChunk,
+          });
+        },
           txSource: makeTxSource({ chainId: CHAIN_ID, client, limit }),
           supports: makeSupportsInterface(client, CONTRACT),
           resolveDeployBlock: async () => {
@@ -403,7 +421,6 @@ describe.skipIf(skipReason !== undefined)('the real provider, bounded', () => {
         },
         options: {
           chainId: CHAIN_ID, contract: CONTRACT, level: 'full', toBlock: TO_BLOCK,
-          initialChunk: chain.initialChunk, maxChunk: chain.maxChunk,
           costs: null, staleLockMs: 5 * 60_000,
         },
       });

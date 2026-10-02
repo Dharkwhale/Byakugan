@@ -29,6 +29,7 @@ import { runMigrations } from '../../src/db/migrate.js';
 import { firstMinters, firstRecipients } from '../../src/db/repositories/analytics.js';
 import { countByKind } from '../../src/db/repositories/transfers.js';
 import { backfill, type BackfillPorts } from '../../src/indexer/backfill.js';
+import { makeLogsSource } from '../../src/indexer/transferSource.js';
 import type { Address, Hash } from '../../src/types.js';
 import type Database from 'better-sqlite3';
 
@@ -128,8 +129,7 @@ describe.skipIf(!availability.ok)('the whole pipeline on anvil', () => {
       limit: <T>(fn: () => Promise<T>) => fn(),
     };
 
-    ports = {
-      fetchLogs: async ({ fromBlock, toBlock }) => {
+    const fetchLogs = async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
         const logs = await client.getLogs({
           address: contract as ViemAddress, fromBlock, toBlock,
         });
@@ -140,7 +140,15 @@ describe.skipIf(!availability.ok)('the whole pipeline on anvil', () => {
           blockNumber: l.blockNumber!,
           logIndex: l.logIndex!,
         }));
-      },
+    };
+
+    ports = {
+      // The anvil chain has no range cap, so the logs source is configured with a modest
+      // chunk purely to make the walk multi-chunk and exercise the orchestrator's
+      // per-chunk commit.
+      makeTransferSource: (standard) => makeLogsSource({
+        fetchLogs, standard, initialChunk: 4, maxChunk: 4,
+      }),
       txSource: makeTxSource(chainClient),
       supports: makeSupportsInterface(client, contract),
       resolveDeployBlock: async ({ safeHead }) => ({
@@ -171,8 +179,7 @@ describe.skipIf(!availability.ok)('the whole pipeline on anvil', () => {
     const result = await backfill(db, {
       clock, jobId: 'e2e-1', ports,
       options: {
-        chainId: CHAIN_ID, contract, level: 'full', toBlock: bound,
-        initialChunk: 4, maxChunk: 4, costs: COSTS, staleLockMs: 60_000,
+        chainId: CHAIN_ID, contract, level: 'full', toBlock: bound, costs: COSTS, staleLockMs: 60_000,
       },
     });
     expect(result.status).toBe('indexed');
@@ -212,8 +219,7 @@ describe.skipIf(!availability.ok)('the whole pipeline on anvil', () => {
     const result = await backfill(db, {
       clock, jobId: 'e2e-2', ports,
       options: {
-        chainId: CHAIN_ID, contract, level: 'full',
-        initialChunk: 4, maxChunk: 4, costs: COSTS, staleLockMs: 60_000,
+        chainId: CHAIN_ID, contract, level: 'full', costs: COSTS, staleLockMs: 60_000,
       },
     });
     expect(result.status).toBe('indexed');
@@ -255,8 +261,7 @@ describe.skipIf(!availability.ok)('the whole pipeline on anvil', () => {
     const result = await backfill(db, {
       clock, jobId: 'e2e-3', ports,
       options: {
-        chainId: CHAIN_ID, contract, level: 'full',
-        initialChunk: 4, maxChunk: 4, costs: COSTS, staleLockMs: 60_000,
+        chainId: CHAIN_ID, contract, level: 'full', costs: COSTS, staleLockMs: 60_000,
       },
     });
     expect(result.status).toBe('up_to_date');

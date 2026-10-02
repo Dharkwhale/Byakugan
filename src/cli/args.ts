@@ -12,6 +12,16 @@ export interface ParsedArgs {
   deployBlock?: number;
   /** Minimum gap between progress lines. */
   progressMs: number;
+  /**
+   * Which fetch path to use. `auto` prefers getAssetTransfers where the endpoint serves
+   * it; `logs` forces eth_getLogs.
+   *
+   * `logs` exists so the two paths can be compared end to end on a real collection —
+   * index the same range both ways and diff the databases — and so a suspected divergence
+   * can be investigated without editing code. It is not a tuning knob: `auto` is correct,
+   * and the paths are required to produce identical rows.
+   */
+  fetchPath: 'auto' | 'logs';
 }
 
 const LEVELS: EnrichmentLevel[] = ['logs_only', 'mints_only', 'full'];
@@ -25,7 +35,7 @@ const LEVELS: EnrichmentLevel[] = ['logs_only', 'mints_only', 'full'];
  */
 const KNOWN_OPTIONS = new Set([
   'contract', 'chain', 'level', 'to-block', 'deploy-block',
-  'dry-run', 'progress-ms', 'verbose', 'help',
+  'dry-run', 'progress-ms', 'verbose', 'help', 'fetch-path',
 ]);
 
 /** Cheap edit-distance-1 suggestion, so a typo is named rather than merely refused. */
@@ -50,6 +60,9 @@ Options
   --deploy-block <n>  supply the deploy block instead of resolving it
   --dry-run           resolve, report the span and cost, index nothing
   --progress-ms <n>   minimum gap between progress lines   (default: 2000)
+  --fetch-path <p>    auto | logs                           (default: auto)
+                      auto uses alchemy_getAssetTransfers where available, which
+                      is dramatically cheaper, falling back to eth_getLogs.
   --verbose           include a stack trace on failure
   --help              this text
 
@@ -154,11 +167,21 @@ export function parseArgs(argv: string[], defaultChainId: number | undefined): P
     toBlock: parseOptionalBigint(value('to-block'), 'to-block'),
     deployBlock: parseOptionalInt(value('deploy-block'), 'deploy-block'),
     progressMs: parseOptionalInt(value('progress-ms'), 'progress-ms') ?? 2_000,
+    fetchPath: parseFetchPath(value('fetch-path')),
   };
 }
 
 export function wantsHelp(argv: string[]): boolean {
   return argv.length === 0 || argv.includes('--help') || argv.includes('-h');
+}
+
+function parseFetchPath(raw: string | undefined): 'auto' | 'logs' {
+  if (raw === undefined || raw === 'auto') return 'auto';
+  if (raw === 'logs') return 'logs';
+  throw new UsageError(
+    `--fetch-path "${raw}" is not recognised. Use "auto" (prefer getAssetTransfers, ` +
+    'which is far cheaper) or "logs" (force eth_getLogs).',
+  );
 }
 
 function parseOptionalBigint(raw: string | undefined, name: string): bigint | undefined {

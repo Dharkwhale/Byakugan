@@ -160,6 +160,17 @@ describe('argument parsing rejects rather than guesses', () => {
     expect(() => parseArgs([ADDR], 1)).toThrow(/unexpected argument/);
   });
 
+  it('defaults the fetch path to auto, preferring the cheap source', () => {
+    expect(parseArgs(['--contract', ADDR], 1).fetchPath).toBe('auto');
+    expect(parseArgs(['--contract', ADDR, '--fetch-path', 'logs'], 1).fetchPath).toBe('logs');
+    expect(parseArgs(['--contract', ADDR, '--fetch-path', 'auto'], 1).fetchPath).toBe('auto');
+  });
+
+  it('rejects an unknown fetch path rather than silently choosing one', () => {
+    expect(() => parseArgs(['--contract', ADDR, '--fetch-path', 'assets'], 1))
+      .toThrow(/not recognised/);
+  });
+
   it('recognises flags and defaults', () => {
     const a = parseArgs(['--contract', ADDR, '--dry-run', '--verbose'], 1);
     expect(a).toMatchObject({ dryRun: true, verbose: true, level: 'full', progressMs: 2000 });

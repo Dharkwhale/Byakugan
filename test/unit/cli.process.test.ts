@@ -10,9 +10,17 @@
  * leaked an API key in this project was Node's own uncaught-exception printer, which no
  * in-process assertion can reach.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { execFileSync, type SpawnSyncReturns } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+/**
+ * Every test here spawns the CLI through tsx, which takes seconds. Set at file level
+ * rather than per test: the per-test timeouts added earlier were applied by a regex that
+ * silently missed two of them, and each surfaced later as an intermittent failure under
+ * full-suite parallelism. One declaration cannot be missed.
+ */
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 180_000 });
 
 const CLI = fileURLToPath(new URL('../../src/cli/index.ts', import.meta.url));
 const REPO = fileURLToPath(new URL('../..', import.meta.url));

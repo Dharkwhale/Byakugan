@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import { backfill, type BackfillPorts, type BackfillOptions } from '../../src/indexer/backfill.js';
+import { makeLogsSource } from '../../src/indexer/transferSource.js';
 import { upgradeEnrichment } from '../../src/indexer/upgrade.js';
 import type { FetchCosts } from '../../src/chain/fetchStrategy.js';
 import type { TxSource } from '../../src/chain/tx.js';
@@ -76,13 +77,16 @@ function makePorts(over: Partial<BackfillPorts> = {}) {
       .filter((l) => l.blockNumber === blockNumber)
       .map((l) => ({ hash: l.transactionHash, from: MINTER, value: 0n })));
   const txSource: TxSource = { getTransaction, getBlockWithTransactions };
+  const makeTransferSource = (standard: '721' | '1155') => makeLogsSource({
+    fetchLogs, standard, initialChunk: 10, maxChunk: 10,
+  });
   const supports = vi.fn(async (id: `0x${string}`) => id === INTERFACE_IDS.erc721);
   const resolveDeployBlock = vi.fn(async () => ({
     block: DEPLOY_BLOCK, source: 'binary_search' as const, validated: true,
   }));
   const safeHead = vi.fn(async () => 100n);
   const ports: BackfillPorts = {
-    fetchLogs, txSource, supports, resolveDeployBlock, safeHead, ...over,
+    makeTransferSource, txSource, supports, resolveDeployBlock, safeHead, ...over,
   };
   return { ports, fetchLogs, getTransaction, getBlockWithTransactions, supports,
            resolveDeployBlock, safeHead };
@@ -91,8 +95,7 @@ function makePorts(over: Partial<BackfillPorts> = {}) {
 function options(over: Partial<BackfillOptions> = {}): BackfillOptions {
   return {
     chainId: 1, contract: CONTRACT, level: 'full',
-    toBlock: TARGET_BLOCK, initialChunk: 10, maxChunk: 10,
-    costs: COSTS, staleLockMs: 60_000, ...over,
+    toBlock: TARGET_BLOCK, costs: COSTS, staleLockMs: 60_000, ...over,
   };
 }
 

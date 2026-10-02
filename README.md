@@ -112,30 +112,54 @@ fetches only the transactions that are missing, not the logs again.
 
 ## What a run actually costs
 
-Worth knowing before you point this at a large collection.
+There are two fetch paths, and which one you get changes the answer by orders of
+magnitude.
 
-**`eth_getLogs` is capped at 10 blocks on Alchemy's free tier.** Measured, flat, and not
-a function of how busy the range is — a query against an address that never emitted
+**`alchemy_getAssetTransfers` is the default where the endpoint serves it.** It has no
+block-range cap and returns up to 1000 transfers per page, so one call can cover a span
+that `eth_getLogs` needs thousands for. Measured over one real collection's entire
+history: **70 `getLogs` calls (4,200 CU) against 1 page (120 CU)**.
+
+**`eth_getLogs` is the fallback, and it is capped at 10 blocks on the free tier.**
+Measured, flat, not density-derived — a query against an address that never emitted
 anything caps at 10 too. It is a plan-tier limit, so `--dry-run` measures it against your
 endpoint rather than trusting a config value.
 
-**The compute-unit ceiling is the real limit, and the rate is derived from it.** The
-free tier allows 300 CU/second and `eth_getLogs` costs 60 CU, so the sustainable rate is
-**5 calls/second**. There is no `requestsPerSecond` setting to get wrong: the limiter
-charges each call its method's compute-unit price out of one account-wide budget, so a
-cheap method runs faster than an expensive one instead of both sharing a flat guess.
-`eth_getTransactionByHash` at 15 CU sustains 20/second on the same ceiling.
+| span | via `getLogs` | time | via `getAssetTransfers` |
+|---|---|---|---|
+| 100,000 blocks | 10,000 calls | ~33 min | a handful of pages |
+| 1,000,000 blocks | 100,000 calls | ~5.6 hours | pages scale with TRANSFERS, not blocks |
 
-| 38,000,000 blocks (a 2022 Base collection) | 3,800,000 | ~8.8 days |
+The rate comes from the compute-unit ceiling rather than a request count: the free tier
+allows 300 CU/second, `eth_getLogs` costs 60, so 5 calls/second is the real allowance.
+There is no `requestsPerSecond` setting to get wrong — the limiter charges each call its
+method's price out of one account-wide budget, so cheap methods run faster than expensive
+ones instead of sharing a flat guess.
 
-**Enrichment is separate, and it dominates.** Measured on a real collection, fetching the
-transactions cost roughly 142× the cost of fetching the logs. That is what the levels are
-for: `logs_only` fetches no transactions at all, and `mints_only` fetches only the mints'.
+**The two paths are required to produce identical rows**, and that is enforced rather than
+assumed:
 
-Two consequences worth planning around: use `--to-block` to index a window rather than a
-whole history, and pick the cheapest level that answers your question.
+```bash
+npm run compare:paths -- --chain 8453 --contract 0x… --standard 721 --from N --to M
+```
 
----
+It runs both over the same range and asserts the row sets match exactly — count, every
+`(tx_hash, log_index, batch_index)` tuple, token ids, amounts, addresses, and order —
+exiting non-zero on any divergence. Two things it is really checking, because both would
+be silent if wrong: `log_index` exists only inside `uniqueId`, and `firstMinters` orders by
+it; and for ERC-1155 `batch_index` comes from the position in `erc1155Metadata`, which is
+only valid because that array's order was measured to match the log's `ids[]`.
+
+If the response ever lacks a parseable log index, the code **refuses and falls back to
+`eth_getLogs`** rather than synthesising an order. A fabricated ordering would land
+directly on the product's headline query and look exactly like a real answer.
+
+Force a path with `--fetch-path logs` — useful for indexing a range both ways and diffing
+the databases, which is how the equivalence above was confirmed end to end.
+
+**Enrichment is separate from all of this, and it dominates.** Measured on a real
+collection, fetching the transactions cost roughly 142× the cost of fetching the logs.
+That is what the enrichment levels are for.
 
 ## Querying, today
 
