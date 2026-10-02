@@ -273,6 +273,12 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
             });
           },
         });
+        // A FAILED DELIVERY IS NOT A FAILED JOB, and the two must not share a log line.
+        // `finish` rejects when its final edit could not be delivered — by which point the
+        // rows are committed and the watermark is advanced. Letting that reject `run` sends
+        // it to `onError`, which would report "could not deliver the job failure report"
+        // for a collection that is fully indexed, and an operator reading logs would go
+        // looking for a failure that never happened. Caught here and named for what it is.
         await progress.finish(
           result.status === 'indexed'
             ? `Indexed ${contract} on chain ${chainId} at level ${level}.\n` +
@@ -280,7 +286,12 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
               `  ${result.rowsInserted} rows in ${result.chunks} chunk(s), via ${result.source}\n` +
               `  indexed through block ${result.lastIndexedBlock}`
             : `Nothing to do for ${contract}: ${result.reason}`,
-        );
+        ).catch((deliverErr: unknown) => {
+          d.logger.error(
+            { err: deliverErr, chainId, contract, status: result.status },
+            'the index COMPLETED but its result message could not be delivered',
+          );
+        });
       },
     });
   } finally {

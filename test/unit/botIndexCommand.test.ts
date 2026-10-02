@@ -449,6 +449,32 @@ describe('handleIndex progress-edit failures never abort the backfill', () => {
     expect(logs.some((l) => l.msg.includes('could not deliver the job failure report'))).toBe(false);
   });
 
+  it('a SUCCEEDED job whose result message cannot be delivered is not logged as a failure', async () => {
+    // The two are different events and must not share a log line. `finish` rejects after
+    // the rows are committed and the watermark advanced, so routing it to `onError` would
+    // report a failure for a collection that is fully indexed — and an operator reading
+    // logs would go hunting for something that never happened.
+    let call = 0;
+    const { clock, base, logs } = deps({}, async () => {
+      call += 1;
+      // Every progress tick lands; only the FINAL edit fails, and transiently, so the
+      // reporter never goes quiet and the job itself never fails.
+      if (call > 1) throw new Error('socket hang up');
+    });
+    const { runBackfill, state } = ticking(clock, 2);
+    await handleIndex({ ...base, runBackfill, text: `/index ${ADDR}` });
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(state.completed).toBe(true);
+    expect(base.registry.size()).toBe(0);
+    const delivered = logs.filter((l) => l.msg.includes('COMPLETED but its result message'));
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.err?.message).toContain('socket hang up');
+    // The job did NOT fail, so neither failure line may appear.
+    expect(logs.some((l) => l.msg.includes('could not deliver the job failure report')))
+      .toBe(false);
+  });
+
   it('on a TRANSIENT failure: keeps trying each tick, and logs each failed tick', async () => {
     const calls: string[] = [];
     const { clock, base, logs } = deps({}, async (_id, t) => {

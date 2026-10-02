@@ -381,6 +381,15 @@ lands on them. Add the guard first.
 
 - Write tests alongside the code. `npm test` and `npm run typecheck` must
   pass before a milestone is called done.
+- **Routine test runs go through `BYAKUGAN_NO_DOTENV=1`.** `test/setup.ts` loads
+  `.env` on purpose, so a plain `npx vitest run` executes the real-provider smoke
+  suite against the owner's live endpoint and spends their compute units. Run the
+  credentialed suite deliberately, not incidentally.
+- **Every placeholder carries the marker `@@UNWIRED@@`**, and
+  `test/unit/noPlaceholders.test.ts` fails the suite while one remains in `src/`.
+  A stub that throws is still a placeholder. The marker is what makes a forgotten
+  one a red suite instead of a runtime surprise, so it is not optional and an
+  unmarked stub defeats the guard entirely.
 - Stop at the end of each milestone, summarise what was built, the test
   results, and known limitations. Wait for confirmation.
 - RPC calls retry with exponential backoff and a capped attempt count. No
