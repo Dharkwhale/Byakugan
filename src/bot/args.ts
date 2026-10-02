@@ -31,16 +31,34 @@ export function parseIndexCommand(
 
   const argv: string[] = ['--contract', address];
   let confirmed = false;
+  // Every way the user asked for a level, so contradictory input is refused rather than
+  // resolved by token order. A collection's level is fixed at its FIRST index, so a silent
+  // pick here is expensive and hard to undo.
+  const levelFlags: string[] = [];
   for (let i = 1; i < parts.length; i++) {
     const token = parts[i]!;
-    if (token === '--mints-only') { argv.push('--level', 'mints_only'); continue; }
-    if (token === '--logs-only') { argv.push('--level', 'logs_only'); continue; }
+    if (token === '--mints-only') { levelFlags.push(token); argv.push('--level', 'mints_only'); continue; }
+    if (token === '--logs-only') { levelFlags.push(token); argv.push('--level', 'logs_only'); continue; }
     if (token === '--yes') { confirmed = true; continue; }
+    if (token === '--level') levelFlags.push(token);
+    if (token === '--contract') {
+      // The CLI parser keeps the last --contract, which would silently discard the
+      // address the user typed first.
+      throw new UsageError('Give the address once, right after /index. Do not also pass --contract.');
+    }
+    if (token === '--help') {
+      throw new UsageError('Send /help to see the bot commands.');
+    }
     argv.push(token);
     const next = parts[i + 1];
     if (next !== undefined && !next.startsWith('--')) { argv.push(next); i++; }
   }
-  if (!argv.includes('--level')) argv.push('--level', 'full');
+  if (levelFlags.length > 1) {
+    throw new UsageError(
+      `Conflicting level options (${levelFlags.join(', ')}). Pick one of --level, --mints-only or --logs-only.`,
+    );
+  }
+  if (levelFlags.length === 0) argv.push('--level', 'full');
 
   return { ...parseArgs(argv, defaultChainId), confirmed };
 }
@@ -64,6 +82,7 @@ export function parseQueryCommand(
   const parts = tokens(text);
   const contracts: Address[] = [];
   let chainId = defaultChainId;
+  let chainRaw: string | undefined;
   let limit = 20;
   let min = 2;
 
@@ -81,15 +100,18 @@ export function parseQueryCommand(
     }
     const value = parts[++i];
     if (value === undefined) throw new UsageError(`${token} needs a value.`);
-    if (token === '--chain') chainId = Number(value);
+    if (token === '--chain') { chainRaw = value; chainId = Number(value); }
     else if (token === '--limit') limit = Number(value);
     else if (token === '--min') min = Number(value);
     else throw new UsageError(`unknown option ${token}.`);
   }
 
   if (contracts.length === 0) throw new UsageError('Send at least one address.');
-  if (chainId === undefined || !Number.isInteger(chainId) || chainId <= 0) {
+  if (chainId === undefined) {
     throw new UsageError('No chain specified and no default is configured. Use --chain N.');
+  }
+  if (!Number.isInteger(chainId) || chainId <= 0) {
+    throw new UsageError(`--chain "${chainRaw}" is not a chain id.`);
   }
   for (const [name, value] of [['--limit', limit], ['--min', min]] as const) {
     if (!Number.isInteger(value) || value < 1) {

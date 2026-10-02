@@ -38,7 +38,26 @@ describe('parseIndexCommand', () => {
   });
 
   it('rejects an unknown flag rather than ignoring it', () => {
-    expect(() => parseIndexCommand(`/index ${ADDR} --turbo`, 1)).toThrow(UsageError);
+    expect(() => parseIndexCommand(`/index ${ADDR} --turbo`, 1)).toThrow(/unknown option --turbo/);
+  });
+
+  it('rejects contradictory level options instead of letting token order decide', () => {
+    expect(() => parseIndexCommand(`/index ${ADDR} --level full --mints-only`, 1))
+      .toThrow(/Conflicting level options/);
+    expect(() => parseIndexCommand(`/index ${ADDR} --mints-only --logs-only`, 1))
+      .toThrow(/Conflicting level options/);
+    expect(() => parseIndexCommand(`/index ${ADDR} --logs-only --level full`, 1))
+      .toThrow(/Conflicting level options/);
+  });
+
+  it('rejects a --contract flag after the positional address', () => {
+    expect(() => parseIndexCommand(`/index ${ADDR} --contract ${ADDR2}`, 1))
+      .toThrow(/once/);
+  });
+
+  it('rejects --help with a pointer to /help rather than ignoring it', () => {
+    expect(() => parseIndexCommand('/index --help', 1)).toThrow(UsageError);
+    expect(() => parseIndexCommand(`/index ${ADDR} --help`, 1)).toThrow(/\/help/);
   });
 
   it('tolerates the @botname suffix Telegram adds in groups', () => {
@@ -62,6 +81,19 @@ describe('parseQueryCommand', () => {
     // touched it looks like an overlap.
     expect(parseQueryCommand(`/overlap ${ADDR} ${ADDR} ${ADDR2}`, 1).contracts)
       .toEqual([ADDR, ADDR2]);
+  });
+
+  it('DEDUPES the same address written checksummed and lowercase', () => {
+    // A checksummed paste from Etherscan next to a lowercase one is the realistic
+    // duplicate; deduping on the raw token would count one collection twice.
+    const mixed = '0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D';
+    expect(parseQueryCommand(`/overlap ${mixed} ${ADDR}`, 1).contracts).toEqual([ADDR]);
+    expect(parseQueryCommand(`/overlap ${ADDR} ${mixed}`, 1).contracts).toEqual([ADDR]);
+  });
+
+  it('names an invalid chain as invalid, not as missing', () => {
+    expect(() => parseQueryCommand(`/overlap ${ADDR} --chain x`, 1)).toThrow(/"x" is not a chain id/);
+    expect(() => parseQueryCommand(`/overlap ${ADDR}`, undefined)).toThrow(/No chain specified/);
   });
 
   it('requires at least one address', () => {
