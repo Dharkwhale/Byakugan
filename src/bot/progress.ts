@@ -1,6 +1,6 @@
 import type { Clock } from '../clock.js';
 import type { Reported } from '../report.js';
-import { isUnchangedEdit, retryAfterSeconds } from '../telegram/failures.js';
+import { isPermanentEditFailure, isUnchangedEdit, retryAfterSeconds } from '../telegram/failures.js';
 import type { Replier } from './replier.js';
 
 export interface JobProgress {
@@ -33,6 +33,16 @@ const MAX_FINAL_RETRY_WAIT_S = 30;
  * unchanged-text skip could never fire; it would be dead code that still looked like a
  * guard. The text changes only when the job's numbers do.
  *
+ * A PERMANENT failure silences the reporter for good. A 403 (the user blocked the bot) or a
+ * deleted progress message means no later edit can land, so every further attempt would
+ * fail the same way and, for a job of tens of thousands of chunks, spend a request per tick
+ * to learn nothing. After one, `onChunk`, `finish` and `fail` become no-ops and NEVER throw:
+ * the edit is cosmetic and the backfill it describes is not, so a message Telegram will not
+ * take must not be able to fail the job. `onPermanentFailure` is how that stays visible — it
+ * is called once, at the moment the reporter goes quiet. Transient failures are different and
+ * unchanged: a transport error still propagates from a tick (the caller logs it) and the
+ * next tick tries again.
+ *
  * `sleep` is injectable so the final-edit retry can be tested without waiting out a real
  * `retry_after`.
  */
@@ -43,6 +53,8 @@ export function createJobProgress(a: {
   intervalMs?: number;
   header: string;
   sleep?: (ms: number) => Promise<void>;
+  /** Called once, when an edit fails in a way no retry can fix and the reporter goes quiet. */
+  onPermanentFailure?: (err: unknown) => void;
 }): JobProgress {
   const intervalMs = a.intervalMs ?? 4_000;
   const sleep = a.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -50,8 +62,18 @@ export function createJobProgress(a: {
   let lastText: string | null = null;
   let mutedUntil = 0;
   let finished = false;
+  // Set once an edit has failed permanently. Never cleared: nothing the job does later can
+  // make a blocked bot or a deleted message editable again.
+  let quiet = false;
   // The send currently on the wire, or null. Settles when the send settles and never rejects.
   let inFlight: Promise<void> | null = null;
+
+  /** Goes quiet and says so, exactly once. */
+  const goQuiet = (err: unknown): void => {
+    if (quiet) return;
+    quiet = true;
+    try { a.onPermanentFailure?.(err); } catch { /* reporting must not undo the point of going quiet */ }
+  };
 
   const send = async (text: string): Promise<void> => {
     if (text === lastText) return;         // unchanged edits throw; skip before sending
@@ -61,6 +83,7 @@ export function createJobProgress(a: {
       lastSentAt = a.clock.now();
     } catch (err) {
       if (isUnchangedEdit(err)) { lastText = text; return; }
+      if (isPermanentEditFailure(err)) { goQuiet(err); return; }
       const wait = retryAfterSeconds(err);
       if (wait !== undefined) { mutedUntil = a.clock.now() + wait * 1_000; return; }
       throw err;                            // a transport failure is not ours to hide
@@ -73,18 +96,26 @@ export function createJobProgress(a: {
    *
    * Once, not repeatedly: the point is that the last line lands, and a job that cannot post
    * its result after two attempts has a problem that more attempts will not fix. The second
-   * attempt's failure is not caught, so it propagates to the caller.
+   * attempt's failure propagates to the caller, unless it is permanent: that silences the
+   * reporter like any other permanent failure.
    */
   const forceSend = async (text: string): Promise<void> => {
+    if (quiet) return;
     try {
       await a.replier.edit(a.messageId, text);
       return;
     } catch (err) {
       if (isUnchangedEdit(err)) return;
+      if (isPermanentEditFailure(err)) { goQuiet(err); return; }
       const wait = retryAfterSeconds(err);
       if (wait === undefined) throw err;
       await sleep(Math.min(wait, MAX_FINAL_RETRY_WAIT_S) * 1_000);
-      await a.replier.edit(a.messageId, text);
+      try {
+        await a.replier.edit(a.messageId, text);
+      } catch (retryErr) {
+        if (isPermanentEditFailure(retryErr)) { goQuiet(retryErr); return; }
+        throw retryErr;
+      }
     }
   };
 
@@ -94,7 +125,7 @@ export function createJobProgress(a: {
       // a tick already in flight is awaited by finish/fail before they write the result.
       // A tick arriving while another is in flight is dropped too, so two ticks never race
       // and a stale progress line is never queued behind a slow edit.
-      if (finished) return;
+      if (finished || quiet) return;
       if (inFlight !== null) return;
       const now = a.clock.now();
       if (now < mutedUntil) return;

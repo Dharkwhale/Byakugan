@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import type { Logger } from 'pino';
 import type { Clock } from '../../clock.js';
 import {
   CollectionLockedError, DeployBlockUnavailableError, EnrichmentLevelError, UsageError,
@@ -38,6 +39,13 @@ export interface HandleIndexDeps {
   db: Database.Database;
   clock: Clock;
   registry: JobRegistry;
+  /**
+   * Where a swallowed progress failure goes. Passed in rather than formatted here: the
+   * project scrubs secrets at serialization, inside the logger, so an error object handed to
+   * it is scrubbed however deeply the secret is nested, where a string built at this call
+   * site would have to remember to be.
+   */
+  logger: Logger;
   defaultChainId: number | undefined;
   chainConfig: { name: string };
   /**
@@ -192,16 +200,28 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
     const progress = createJobProgress({
       replier: d.replier, messageId: sent.messageId, clock: d.clock,
       header: `Indexing ${contract} on chain ${chainId} at level ${level}`,
+      onPermanentFailure: (err) => {
+        d.logger.warn(
+          { err, chainId, contract },
+          'progress edits can no longer be delivered; the job continues without them',
+        );
+      },
     });
     claim.run({
       onError: (err) => {
-        // Swallowed: `fail` rejects only when its final edit could not be delivered, which
-        // means the reply channel itself is failing and there is nowhere left to report to.
-        // The registry's try/catch around onError catches a SYNCHRONOUS throw only, so an
-        // unhandled rejection would otherwise escape this detached job. What is lost: the
-        // user is never told the job failed, and nothing is logged here.
+        // Swallowed, but LOGGED: `fail` rejects only when its final edit could not be
+        // delivered (a permanent failure never rejects; it silences the reporter instead),
+        // which means the reply channel itself is failing and there is nowhere left to report
+        // to. The registry's try/catch around onError catches a SYNCHRONOUS throw only, so an
+        // unhandled rejection would otherwise escape this detached job. The user is never
+        // told the job failed, so the log is the only record that they were not.
         progress.fail(describeError(err), nextCommand(err, { contract, chainId }))
-          .catch(() => undefined);
+          .catch((failErr: unknown) => {
+            d.logger.error(
+              { err: failErr, chainId, contract },
+              'could not deliver the job failure report',
+            );
+          });
       },
       run: async () => {
         let rows = 0;
@@ -212,12 +232,18 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
           onProgress: (ctx) => {
             rows += ctx.inserted;
             d.registry.note({ chainId, contract, lastBlock: Number(ctx.toBlock) });
-            // Swallowed: the index is the valuable work and a cosmetic progress edit failing
-            // must not abort it. What is lost: a transport failure on a progress edit becomes
-            // invisible, and the message may stop updating while the job carries on.
+            // Swallowed, but LOGGED: the index is the valuable work and a cosmetic progress
+            // edit failing must not abort it. A permanent failure never reaches here (the
+            // reporter goes quiet and logs it once); what does is a transient one, and the
+            // next tick tries again, so this logs at warn rather than error.
             progress.onChunk({
               fromBlock: ctx.fromBlock, toBlock: ctx.toBlock, rows, source: d.fetchPath,
-            }).catch(() => undefined);
+            }).catch((editErr: unknown) => {
+              d.logger.warn(
+                { err: editErr, chainId, contract },
+                'progress edit failed; the job continues',
+              );
+            });
           },
         });
         await progress.finish(

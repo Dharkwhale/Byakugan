@@ -9,6 +9,8 @@ import {
   DeployBlockUnavailableError, EnrichmentLevelError, UsageError,
 } from '../../src/errors.js';
 import type { Replier } from '../../src/bot/replier.js';
+import { createLogger } from '../../src/logger.js';
+import { Writable } from 'node:stream';
 
 const ADDR = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
 const SUMMARY = 'DRY RUN REPORT: 4200 blocks, 12 chunks, about 30s';
@@ -32,10 +34,19 @@ function deps(over: Record<string, unknown> = {}, editImpl?: (id: number, t: str
     sendDocument: vi.fn(),
   } as unknown as Replier;
   const clock = manualClock(0);
+  // A REAL logger over a capturing stream, so a test reads what would have been written
+  // (scrubbed, serialized) rather than that a mock was called.
+  const logs: Array<{ level: number; msg: string; err?: { message?: string } }> = [];
+  const logger = createLogger([], new Writable({
+    write(chunk, _enc, cb) {
+      for (const l of String(chunk).split('\n')) if (l) logs.push(JSON.parse(l));
+      cb();
+    },
+  }));
   return {
-    sent, edits, replier, clock,
+    sent, edits, replier, clock, logs,
     base: {
-      replier, db, clock,
+      replier, db, clock, logger,
       registry: createJobRegistry({ clock, staleMs: 900_000 }),
       defaultChainId: 1,
       chainConfig: { name: 'ethereum' },
@@ -373,5 +384,74 @@ describe('handleIndex atomic claim', () => {
     await handleIndex({ ...base, text: `/index ${ADDR}` });
     await flush();
     expect(base.runBackfill).toHaveBeenCalledOnce();
+  });
+});
+
+describe('handleIndex progress-edit failures never abort the backfill', () => {
+  /** A backfill that reports N chunks, each past the throttle, and records that it finished. */
+  function ticking(clock: { advance(ms: number): void }, ticks: number) {
+    const state = { completed: false };
+    const runBackfill = vi.fn(async (a: { onProgress(c: { fromBlock: bigint; toBlock: bigint; inserted: number }): void }) => {
+      for (let i = 1; i <= ticks; i++) {
+        a.onProgress({ fromBlock: BigInt(i), toBlock: BigInt(i + 9), inserted: 1 });
+        clock.advance(5_000);   // past the 4s interval: only the reporter's own state can stop a tick
+        await flush();
+      }
+      state.completed = true;
+      return indexedResult;
+    });
+    return { runBackfill, state };
+  }
+
+  it('on a 403 on every edit: the job completes, ONE edit is attempted, and it is logged', async () => {
+    const calls: string[] = [];
+    const { clock, base, logs } = deps({}, async (_id, t) => {
+      calls.push(t);
+      throw Object.assign(new Error('Forbidden: bot was blocked by the user'), {
+        error_code: 403, description: 'Forbidden: bot was blocked by the user',
+      });
+    });
+    const { runBackfill, state } = ticking(clock, 6);
+    await handleIndex({ ...base, runBackfill, text: `/index ${ADDR}` });
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(state.completed).toBe(true);                 // ran to the end, past the first failure
+    expect(base.registry.size()).toBe(0);               // and finished cleanly
+    expect(calls).toHaveLength(1);                      // one attempt, not one per tick (6 + final)
+    const quiet = logs.filter((l) => l.msg.includes('can no longer be delivered'));
+    expect(quiet).toHaveLength(1);
+    expect(quiet[0]?.err?.message).toContain('Forbidden: bot was blocked by the user');
+    expect(logs.some((l) => l.msg.includes('could not deliver the job failure report'))).toBe(false);
+  });
+
+  it('on a TRANSIENT failure: keeps trying each tick, and logs each failed tick', async () => {
+    const calls: string[] = [];
+    const { clock, base, logs } = deps({}, async (_id, t) => {
+      calls.push(t);
+      if (t.startsWith('Indexed')) return;    // the final result lands
+      throw new Error('socket hang up');
+    });
+    const { runBackfill, state } = ticking(clock, 4);
+    await handleIndex({ ...base, runBackfill, text: `/index ${ADDR}` });
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(state.completed).toBe(true);
+    expect(calls.filter((t) => t.includes('blocks'))).toHaveLength(4);   // every tick tried
+    expect(calls.at(-1)).toContain('Indexed');
+    const failed = logs.filter((l) => l.msg.includes('progress edit failed'));
+    expect(failed).toHaveLength(4);
+    expect(failed[0]?.err?.message).toBe('socket hang up');
+    expect(base.registry.size()).toBe(0);
+  });
+
+  it('logs a failure report that could not be delivered, rather than swallowing it silently', async () => {
+    const { base, logs } = deps({
+      runBackfill: vi.fn(async () => { throw new Error('backfill exploded'); }),
+    }, async () => { throw new Error('socket hang up'); });
+    await handleIndex({ ...base, text: `/index ${ADDR}` });
+    for (let i = 0; i < 5; i++) await flush();
+    const lost = logs.filter((l) => l.msg.includes('could not deliver the job failure report'));
+    expect(lost).toHaveLength(1);
+    expect(lost[0]?.err?.message).toBe('socket hang up');
   });
 });

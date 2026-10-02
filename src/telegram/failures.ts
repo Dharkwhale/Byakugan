@@ -59,6 +59,31 @@ export function isUnchangedEdit(err: unknown): boolean {
 }
 
 /**
+ * An edit that can NEVER succeed, so the caller should stop trying.
+ *
+ * THESE TWO SHAPES COME FROM THE PUBLISHED BOT API REFERENCE, NOT FROM MEASUREMENT. Every
+ * other predicate in this file was written against output from a live bot; these were not,
+ * because provoking them needs a user who has blocked the bot and a message that has been
+ * deleted, and neither was arranged. They are what the documentation and common Bot API
+ * behaviour say, and nothing in this repo has observed them. If a real one ever differs,
+ * this returns false, the reporter treats it as a transient failure and keeps retrying —
+ * noisy rather than silent, the same direction as `isUnchangedEdit` fails.
+ *
+ *   403 — the user blocked the bot, or the chat is otherwise closed to it. No description
+ *         is matched: every 403 on an edit means the bot may not write to this chat.
+ *   400 — "Bad Request: message to edit not found": the progress message was deleted.
+ *
+ * Matched structurally on `error_code` and `description`, as the rest of this file is, and
+ * the code is checked with the text so a 500 echoing the phrase is not mistaken for it.
+ */
+export function isPermanentEditFailure(err: unknown): boolean {
+  const api = asApiError(err);
+  if (api === undefined) return false;
+  if (api.error_code === 403) return true;
+  return api.error_code === 400 && /message to edit not found/i.test(api.description);
+}
+
+/**
  * How long Telegram asked us to wait, when it asked.
  *
  * A budget entirely separate from Alchemy's compute units: a bot can be well inside its RPC

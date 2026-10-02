@@ -3,7 +3,10 @@ import { createJobProgress } from '../../src/bot/progress.js';
 import { manualClock } from '../../src/clock.js';
 import type { Replier } from '../../src/bot/replier.js';
 
-function setup(over: { edit?: Replier['edit']; sleep?: (ms: number) => Promise<void> } = {}) {
+function setup(over: {
+  edit?: Replier['edit']; sleep?: (ms: number) => Promise<void>;
+  onPermanentFailure?: (err: unknown) => void;
+} = {}) {
   const clock = manualClock(0);
   const edits: string[] = [];
   const edit = over.edit ?? vi.fn(async (_id: number, text: string) => { edits.push(text); });
@@ -11,6 +14,7 @@ function setup(over: { edit?: Replier['edit']; sleep?: (ms: number) => Promise<v
   const progress = createJobProgress({
     replier, messageId: 42, clock, intervalMs: 4_000, header: 'indexing 0xaaa on chain 1',
     ...(over.sleep ? { sleep: over.sleep } : {}),
+    ...(over.onPermanentFailure ? { onPermanentFailure: over.onPermanentFailure } : {}),
   });
   return { clock, edits, edit, progress };
 }
@@ -238,5 +242,96 @@ describe('finish and fail always land', () => {
     await progress.finish('done');
     expect(sleep).toHaveBeenCalledExactlyOnceWith(30_000);
     expect(edit).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('a permanently undeliverable edit silences the reporter', () => {
+  const blocked = () => Object.assign(new Error('Forbidden: bot was blocked by the user'), {
+    error_code: 403, description: 'Forbidden: bot was blocked by the user',
+  });
+  const deleted = () => Object.assign(new Error('Bad Request: message to edit not found'), {
+    error_code: 400, description: 'Bad Request: message to edit not found',
+  });
+
+  it.each([['403 (blocked)', blocked], ['400 message not found', deleted]])(
+    'after a %s, makes ONE attempt across many ticks, then finish and fail, and never throws',
+    async (_name, make) => {
+      const edit = vi.fn(async () => { throw make(); });
+      const seen: unknown[] = [];
+      const { progress, clock } = setup({ edit, onPermanentFailure: (e) => seen.push(e) });
+      await expect(progress.onChunk(chunk(10, 1))).resolves.toBeUndefined();
+      // Every later tick is past the interval, so only the quiet flag can stop it.
+      for (let i = 0; i < 10; i++) {
+        clock.advance(5_000);
+        await progress.onChunk(chunk(20 + i * 10, i + 2));
+      }
+      await expect(progress.finish('done')).resolves.toBeUndefined();
+      await expect(progress.fail(
+        { exitCode: 2, headline: 'h', detail: 'd' }, '/help',
+      )).resolves.toBeUndefined();
+      expect(edit).toHaveBeenCalledOnce();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ error_code: expect.any(Number) });
+    },
+  );
+
+  it('goes quiet when the FINAL edit is the one that fails permanently, without throwing', async () => {
+    const edit = vi.fn(async () => { throw blocked(); });
+    const seen: unknown[] = [];
+    const { progress } = setup({ edit, onPermanentFailure: (e) => seen.push(e) });
+    await expect(progress.finish('done')).resolves.toBeUndefined();
+    await expect(progress.fail({ exitCode: 2, headline: 'h', detail: 'd' })).resolves.toBeUndefined();
+    expect(edit).toHaveBeenCalledOnce();
+    expect(seen).toHaveLength(1);
+  });
+
+  it('goes quiet when the RETRY of a rate-limited final edit fails permanently', async () => {
+    let call = 0;
+    const edit = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        throw Object.assign(new Error('x'), {
+          error_code: 429, description: 'Too Many Requests: retry after 1',
+          parameters: { retry_after: 1 },
+        });
+      }
+      throw blocked();
+    });
+    const seen: unknown[] = [];
+    const { progress } = setup({ edit, sleep: async () => {}, onPermanentFailure: (e) => seen.push(e) });
+    await expect(progress.finish('done')).resolves.toBeUndefined();
+    expect(edit).toHaveBeenCalledTimes(2);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('a TRANSIENT failure does not silence it: the next tick tries again', async () => {
+    const edit = vi.fn(async () => { throw new Error('socket hang up'); });
+    const seen: unknown[] = [];
+    const { progress, clock } = setup({ edit, onPermanentFailure: (e) => seen.push(e) });
+    await expect(progress.onChunk(chunk(10, 1))).rejects.toThrow('socket hang up');
+    clock.advance(5_000);
+    await expect(progress.onChunk(chunk(20, 2))).rejects.toThrow('socket hang up');
+    expect(edit).toHaveBeenCalledTimes(2);
+    expect(seen).toHaveLength(0);
+  });
+
+  it('a 400 that is not "message to edit not found" is transient, not permanent', async () => {
+    const edit = vi.fn(async () => {
+      throw Object.assign(new Error('x'), { error_code: 400, description: 'Bad Request: chat not found' });
+    });
+    const { progress, clock } = setup({ edit });
+    await expect(progress.onChunk(chunk(10, 1))).rejects.toThrow();
+    clock.advance(5_000);
+    await expect(progress.onChunk(chunk(20, 2))).rejects.toThrow();
+    expect(edit).toHaveBeenCalledTimes(2);
+  });
+
+  it('a callback that throws does not break the silence', async () => {
+    const edit = vi.fn(async () => { throw blocked(); });
+    const { progress, clock } = setup({ edit, onPermanentFailure: () => { throw new Error('logger down'); } });
+    await expect(progress.onChunk(chunk(10, 1))).resolves.toBeUndefined();
+    clock.advance(5_000);
+    await progress.onChunk(chunk(20, 2));
+    expect(edit).toHaveBeenCalledOnce();
   });
 });

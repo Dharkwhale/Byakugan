@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  isConflict, isUnauthorized, isUnchangedEdit, retryAfterSeconds,
+  isConflict, isPermanentEditFailure, isUnauthorized, isUnchangedEdit, retryAfterSeconds,
 } from '../../src/telegram/failures.js';
 
 /**
@@ -131,5 +131,37 @@ describe('isConflict and isUnauthorized', () => {
   it('is false for non-API errors', () => {
     expect(isConflict(new Error('x'))).toBe(false);
     expect(isUnauthorized(new Error('x'))).toBe(false);
+  });
+});
+
+describe('isPermanentEditFailure', () => {
+  // UNLIKE every fixture above, these descriptions are taken from the PUBLISHED Bot API
+  // reference and common Bot API behaviour, NOT from the live probe: provoking them needs a
+  // blocked bot and a deleted message, which were not arranged. They pin the predicate to
+  // what the documentation says, and are only as good as that.
+  it('is true for a 403 (the user blocked the bot)', () => {
+    expect(isPermanentEditFailure(
+      apiError({ code: 403, description: 'Forbidden: bot was blocked by the user' }),
+    )).toBe(true);
+  });
+
+  it('is true for the 400 whose description says the message to edit was not found', () => {
+    expect(isPermanentEditFailure(
+      apiError({ code: 400, description: 'Bad Request: message to edit not found' }),
+    )).toBe(true);
+  });
+
+  it('is false for failures a later attempt can survive or that mean something else', () => {
+    expect(isPermanentEditFailure(apiError({ code: 400, description: UNCHANGED_EDIT }))).toBe(false);
+    expect(isPermanentEditFailure(apiError({ code: 400, description: 'Bad Request: chat not found' }))).toBe(false);
+    expect(isPermanentEditFailure(
+      apiError({ code: 429, description: 'Too Many Requests: retry after 5', parameters: { retry_after: 5 } }),
+    )).toBe(false);
+    expect(isPermanentEditFailure(apiError({ code: 409, description: CONFLICT }))).toBe(false);
+    // The code is checked with the text: a 500 echoing the phrase is not this condition.
+    expect(isPermanentEditFailure(
+      apiError({ code: 500, description: 'Internal: message to edit not found' }),
+    )).toBe(false);
+    expect(isPermanentEditFailure(new Error('socket hang up'))).toBe(false);
   });
 });
