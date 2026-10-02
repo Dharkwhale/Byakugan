@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import {
-  handleFirstMinters, handleFirstRecipients, handleOverlap,
+  handleFirstMinters, handleFirstRecipients, handleOverlap, leastIndexedThrough,
 } from '../../src/bot/commands/queries.js';
 import { manualClock } from '../../src/clock.js';
 import { openDb } from '../../src/db/connection.js';
@@ -378,6 +378,17 @@ describe('handleOverlap', () => {
     await handleOverlap({ ...base, text: `/overlap ${A} ${B}` });
     expect(docs).toHaveLength(1);
     expect(docs[0]!.filename).toBe(`overlap-1-2-${CLOCK_MS}.csv`);
+  });
+
+  it('treats an UNKNOWN watermark as unknown, not as the smallest readable one', () => {
+    // Tested directly: every handler pre-checks notIndexed and returns early, so this
+    // branch is unreachable through the bot and a mutant that ignored the unknown survived
+    // the entire suite. Returning 77 here would overstate the answer's reach using exactly
+    // the collection we know least about.
+    collection(A, 4321);
+    expect(leastIndexedThrough(db, 1, [A])).toBe(4321);
+    expect(leastIndexedThrough(db, 1, [A, B])).toBe('unknown');
+    expect(leastIndexedThrough(db, 1, [])).toBe('unknown');
   });
 
   it('states the LEAST-indexed block, since that is the limit on the whole answer', async () => {

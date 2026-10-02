@@ -80,9 +80,16 @@ function indexedThrough(db: Database.Database, chainId: number, contract: string
  *
  * Returns 'unknown' if any collection's watermark is unavailable, because the minimum of a
  * set containing an unknown is unknown — not the smallest of the ones that happened to be
- * readable.
+ * readable. Returning the smallest readable one would overstate the answer's reach using
+ * precisely the collection we know least about.
+ *
+ * EXPORTED to be tested directly. Every caller pre-checks `notIndexed` and returns early,
+ * so the unknown branch cannot be reached through a handler — a mutant that ignored an
+ * unknown survived the whole bot suite. The rule is worth pinning anyway: it holds the
+ * moment someone drops that pre-check, and a surviving mutant on a stated rule is what this
+ * project treats as a test that advertises a guarantee it does not have.
  */
-function leastIndexedThrough(
+export function leastIndexedThrough(
   db: Database.Database,
   chainId: number,
   contracts: readonly string[],
