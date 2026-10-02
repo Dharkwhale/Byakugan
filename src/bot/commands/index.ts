@@ -62,7 +62,7 @@ export interface HandleIndexDeps {
    * `summary` is built by the caller from the CLI's `formatEstimate`, so the bot reports a
    * dry run in the same format the CLI does rather than growing a thinner one of its own.
    */
-  estimate(a: { chainId: number; contract: string; toBlock?: bigint }):
+  estimate(a: { chainId: number; contract: string; toBlock?: bigint; deployBlock?: number }):
     Promise<{ seconds: number; summary: string }>;
   confirmThresholdSeconds: number;
 }
@@ -73,7 +73,9 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
     args = parseIndexCommand(d.text, d.defaultChainId);
   } catch (err) {
     const reported = describeError(err);
-    await d.replier.reply(`${reported.headline}\n\n  ${reported.detail}`);
+    // `nextCommand` needs a contract and chain, which a failed parse does not have, so the
+    // pointer out of a first mistake is written here.
+    await d.replier.reply(`${reported.headline}\n\n  ${reported.detail}\n\n  next: /help`);
     return;
   }
 
@@ -90,7 +92,11 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
     );
     return;
   }
-  if (state.kind === 'orphaned') {
+  // An orphan whose lock has ALREADY expired falls through and starts. `inspect` reports it
+  // as orphaned (accurately: a lock row exists), but only `claimCollection` ever steals a
+  // stale lock, and that runs only inside `backfill`. Refusing here would mean backfill
+  // never runs, the lock is never stolen, and the collection is wedged for good.
+  if (state.kind === 'orphaned' && d.clock.now() < state.expiresAt) {
     // NOT the same as running. A previous process died holding the lock; nothing is
     // working on this collection and the lock clears itself.
     const minutes = Math.max(0, Math.round((state.expiresAt - d.clock.now()) / 60_000));
@@ -102,9 +108,26 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
     return;
   }
 
-  const { seconds, summary } = await d.estimate({
-    chainId, contract, ...(toBlock === undefined ? {} : { toBlock }),
-  });
+  let estimated: { seconds: number; summary: string };
+  try {
+    estimated = await d.estimate({
+      chainId, contract,
+      ...(toBlock === undefined ? {} : { toBlock }),
+      ...(deployBlock === undefined ? {} : { deployBlock }),
+    });
+  } catch (err) {
+    // The likeliest failure of the command: an unresolvable deploy block is raised here, not
+    // in the job. It must reply with its next action rather than reject into silence.
+    const reported = describeError(err);
+    const next = nextCommand(err, { contract, chainId });
+    await d.replier.reply(
+      `${reported.headline}\n\n  ${reported.detail}` +
+      (reported.hint ? `\n\n  ${reported.hint}` : '') +
+      (next ? `\n\n  next: ${next}` : ''),
+    );
+    return;
+  }
+  const { seconds, summary } = estimated;
 
   // A DRY RUN ENDS HERE, before the confirmation gate and before anything that starts a
   // job. It sits ahead of the gate so a dry run on a long collection shows the estimate

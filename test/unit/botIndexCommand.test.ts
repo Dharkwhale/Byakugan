@@ -40,7 +40,7 @@ function deps(over: Record<string, unknown> = {}, editImpl?: (id: number, t: str
       defaultChainId: 1,
       chainConfig: { name: 'ethereum' },
       runBackfill: vi.fn(async (_a: unknown) => indexedResult),
-      estimate: vi.fn(async () => ({ seconds: 30, summary: SUMMARY })),
+      estimate: vi.fn(async (_a: unknown) => ({ seconds: 30, summary: SUMMARY })),
       confirmThresholdSeconds: 300,
       fetchPath: 'getAssetTransfers',
       ...over,
@@ -238,5 +238,60 @@ describe('handleIndex detached-job rejections', () => {
     } finally {
       process.off('unhandledRejection', unhandled);
     }
+  });
+});
+
+describe('handleIndex fix round 1', () => {
+  it('replies with the next action when estimate rejects, and starts nothing', async () => {
+    const { base, sent } = deps({
+      estimate: vi.fn(async () => { throw new DeployBlockUnavailableError('cannot resolve deploy block'); }),
+    });
+    await handleIndex({ ...base, text: `/index ${ADDR}` });
+    await flush();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('--deploy-block');
+    expect(sent[0]).toContain(`/index ${ADDR} --chain 1`);
+    expect(base.runBackfill).not.toHaveBeenCalled();
+    expect(base.registry.size()).toBe(0);
+  });
+
+  it('starts over an orphaned lock that has ALREADY expired, so backfill can steal it', async () => {
+    // The refusal is only right while the lock is live: only claimCollection (inside
+    // backfill) steals a stale lock, so refusing an expired one wedges the collection.
+    const { base, clock } = deps();
+    db.prepare('INSERT INTO collections (chain_id, contract, standard, locked_by, locked_at) VALUES (1, ?, ?, ?, ?)')
+      .run(ADDR, '721', 'dead-job', 0);
+    clock.advance(900_001);
+    await handleIndex({ ...base, text: `/index ${ADDR}` });
+    await flush();
+    expect(base.runBackfill).toHaveBeenCalledOnce();
+  });
+
+  it('still refuses an orphan one millisecond before it expires', async () => {
+    const { base, sent, clock } = deps();
+    db.prepare('INSERT INTO collections (chain_id, contract, standard, locked_by, locked_at) VALUES (1, ?, ?, ?, ?)')
+      .run(ADDR, '721', 'dead-job', 0);
+    clock.advance(899_999);
+    await handleIndex({ ...base, text: `/index ${ADDR}` });
+    expect(sent.at(-1)).toMatch(/previous run/i);
+    expect(base.runBackfill).not.toHaveBeenCalled();
+  });
+
+  it('passes deployBlock to estimate as well as to runBackfill', async () => {
+    const { base } = deps();
+    await handleIndex({ ...base, text: `/index ${ADDR} --deploy-block 1234` });
+    await flush();
+    expect(base.estimate).toHaveBeenCalledWith(expect.objectContaining({ deployBlock: 1234 }));
+
+    const other = deps();
+    await handleIndex({ ...other.base, text: `/index ${ADDR}` });
+    await flush();
+    expect(other.base.estimate.mock.calls[0]?.[0]).not.toHaveProperty('deployBlock');
+  });
+
+  it('points a parse error at /help', async () => {
+    const { base, sent } = deps();
+    await handleIndex({ ...base, text: '/index' });
+    expect(sent[0]).toContain('next: /help');
   });
 });
