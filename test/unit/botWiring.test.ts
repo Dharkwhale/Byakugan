@@ -160,16 +160,18 @@ describe('/index names the chain it parsed', () => {
 
 describe('chat output is scrubbed through the wiring', () => {
   it('an /index failure whose error carries an RPC URL replies WITHOUT the key', async () => {
-    const FAKE_URL = 'https://eth-mainnet.example.invalid/v2/FAKEKEY0123456789abcdefFAKEKEY';
+    // Plain string: no generic URL/key fallback pass can catch it, so only the configured tokens can.
+    const FAKE_KEY = 'zz-fake-secret-ZXCV0987654321';
+    const FAKE_URL = `see ${FAKE_KEY} here`;
     const { bot, calls } = setup({
-      secrets: [FAKE_URL],
+      secrets: [FAKE_KEY],
       estimate: async () => { throw new Error(`request to ${FAKE_URL} failed`); },
     });
     await bot.handleUpdate(command(ALLOWED, `/index ${ADDR}`));
     await flush();
     const text = calls.map((c) => c.text ?? '').join('\n');
     expect(text).toContain('failed');
-    expect(text).not.toContain('FAKEKEY0123456789abcdefFAKEKEY');
+    expect(text).not.toContain(FAKE_KEY);
   });
 });
 

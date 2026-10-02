@@ -7,9 +7,11 @@ import { writeDropLog, writeHandlerError } from '../../src/bot/app.js';
 /**
  * An obviously FAKE credential. Never a real one, and never read from .env.
  */
-const FAKE_URL = 'https://eth-mainnet.example.invalid/v2/FAKEKEY0123456789abcdefFAKEKEY';
-const FAKE_KEY = 'FAKEKEY0123456789abcdefFAKEKEY';
-const tokens = deriveSecretTokens([FAKE_URL]);
+// A plain string that NO generic URL/key pattern would catch, so these tests prove the
+// configured tokens are applied rather than a fallback pass that scrubs on its own.
+const FAKE_KEY = 'zz-fake-secret-ZXCV0987654321';
+const FAKE_URL = `see ${FAKE_KEY} here`;
+const tokens = deriveSecretTokens([FAKE_KEY]);
 
 function fakeCtx() {
   const sendMessage = vi.fn(async (_c: number, _t: string) => ({ message_id: 1 }));
