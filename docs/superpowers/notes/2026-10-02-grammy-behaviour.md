@@ -172,21 +172,81 @@ which narrows one path by which a token-bearing URL could reach output. Two thin
 
 ---
 
-## OUTSTANDING — needs a live bot token
+## MEASURED against a live bot — 2026-10-02
 
-These are Telegram **server** behaviours. grammY's source cannot answer them and neither
-can recollection, so `src/telegram/failures.ts` must be checked against the real output
-before its tests count as pinning anything.
+Run with `npm run probe:telegram`. Preconditions checked first, not assumed:
+`npm run verify:scrub -- TELEGRAM_BOT_TOKEN` confirmed the token is in `config.secrets` and
+redacted across seven leak paths including an unhandled rejection and an uncaught throw. No
+poller was started — `bot.api` issues one-off calls and `bot.start()` was never called — so
+nothing was left behind to steal the real bot's updates, and no offset was passed, so no
+update was marked confirmed.
 
-| question | why it matters | status |
-|---|---|---|
-| What does editing a message to its existing text return? | The editor skips unchanged renders. If the real error differs from `400 / "message is not modified"`, `isUnchangedEdit` returns false, redundant edits are attempted, and progress updates start failing visibly. | **not yet measured** |
-| What exactly does a second long-polling instance return? | Task 12 exits on 409. The code path is confirmed (Q3), but the `description` text is not. | **not yet measured** |
+### An unchanged edit THROWS
 
-Run `npm run probe:telegram -- --chat <numeric chat id>` with `TELEGRAM_BOT_TOKEN` set and
-paste the output here. The probe imports the scrub guard first, so the token is redacted at
-the boundary even in an unhandled dump.
+```json
+{
+    "class": "GrammyError",
+    "error_code": 400,
+    "description": "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+    "parameters": {},
+    "method": "editMessageText"
+}
+```
 
-Until then, the fixtures in `test/unit/telegramFailures.test.ts` are shaped from the Bot API
-documentation rather than from observation, and that distinction is recorded here rather
-than assumed away.
+**Confirms the design.** `isUnchangedEdit` matching `error_code === 400` plus
+`/message is not modified/` on the description is correct. Two details worth having:
+
+- `parameters` is `{}` — an empty object, not `undefined` — so `parameters?.retry_after`
+  is safe to read on any `GrammyError`, not only a 429.
+- The text dependence is real and unavoidable: 400 covers many conditions and there is no
+  code that means only this. If Telegram rewords the description, `isUnchangedEdit` returns
+  false, the editor stops skipping identical renders, and progress edits begin failing
+  visibly rather than silently — the right direction for a guess about someone else's
+  wording.
+
+### The 409 goes to the INCUMBENT, not the newcomer
+
+This is the finding that changes the design, and it is the opposite of what was assumed.
+
+Two concurrent `getUpdates` were issued. The **second** call succeeded. The **first** —
+already in flight — was rejected:
+
+```
+GrammyError: Call to 'getUpdates' failed!
+(409: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running)
+```
+
+Read the description literally: *terminated by other getUpdates request.* Telegram does not
+refuse the newcomer. It **kills the existing request** and serves the new one.
+
+So when a second bot instance starts:
+
+| instance | what happens |
+|---|---|
+| the new one | polls successfully and begins receiving updates |
+| the one already running | its `getUpdates` is terminated with 409, grammY rethrows it (Q3), `bot.start()` rejects, and it exits |
+
+**Starting a second instance is therefore a handover, not a standoff.** There is no
+split-brain — only one poller ever receives updates — but the protection runs the opposite
+way from the plan: exiting on 409 does not defend the incumbent, because the incumbent is
+the one receiving the 409.
+
+Two consequences for Task 12:
+
+1. **Exiting on 409 is still right**, for a different reason than planned. A displaced
+   instance cannot poll at all; its request has been terminated. Exiting is the only honest
+   response.
+2. **The message was wrong.** "Another instance is already polling, stop it and start this
+   one" is advice to the displaced process, and following it produces a flip-flop: restart
+   this one and it displaces the other, which then exits and gets restarted in turn. The
+   message must say that this instance has been **displaced**, and that restarting it
+   without finding the other one will just trade places.
+
+### Incidental: a probe flaw worth not repeating
+
+The probe attached its rejection handler to the first request only after awaiting the
+second, so the 409 was briefly unhandled and the scrub guard's `unhandledRejection` handler
+printed it. Harmless here — the output was redacted and carried no token — but it is the
+same ordering mistake that makes an unhandled rejection reach output in the first place.
+Attach the handler at creation.
+

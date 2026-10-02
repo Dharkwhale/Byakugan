@@ -313,11 +313,15 @@ than only a description.
 
 The entry point exits rather than retrying on two conditions:
 
-- **409 Conflict** from `getUpdates` means another instance is already polling. Long polling
-  does not error under contention — updates are delivered to one poller at random, so a
-  second instance makes messages *disappear intermittently*, which is the worst shape to
-  debug. The bot catches the 409, prints that another instance is running, and exits
-  `EXIT.BUSY`. It does **not** retry into split-brain.
+- **409 Conflict** from `getUpdates` means another instance has **displaced this one**.
+  Measured against a live bot (see the Task 1 notes), and the opposite of what this spec
+  first assumed: two concurrent `getUpdates` and the SECOND succeeds while the FIRST is
+  rejected with *"terminated by other getUpdates request"*. Telegram does not refuse the
+  newcomer; it kills the request already in flight. So there is no split-brain — only one
+  poller ever receives updates — but the process that sees a 409 is the one being replaced,
+  and it cannot poll at all. It exits `EXIT.BUSY`, and its message says it was displaced and
+  that restarting it blindly would displace the other in turn and trade places. It does
+  **not** retry.
 - **401 Unauthorized** means the token is wrong; exits `EXIT.USAGE`.
 
 **Mutation target:** retrying on 409 instead of exiting must fail a test.

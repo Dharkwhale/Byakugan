@@ -84,6 +84,12 @@ after a resume proves nothing — the assertion has to be that the intermediate
 state was genuinely intermediate, and something has to defend the fixture shape
 that makes it so.
 
+**Recorded gap (argued, not tested):** the `description` type check in
+`asApiError` (src/telegram/failures.ts). Mutation-tested; the mutant survived with 14
+passed, 0 failed, because every consumer tolerates a missing description through
+regex coercion. Kept because that tolerance is accidental, and the declared type
+would otherwise be a lie the next consumer could act on.
+
 **Recorded gap (argued, not tested):** the `AND tx_from IS NULL` on
 `applyEnrichment`'s UPDATE. Mutation-tested; the mutant survived with 88 passed,
 0 failed, because the SELECT already excludes enriched rows. Kept as defence in

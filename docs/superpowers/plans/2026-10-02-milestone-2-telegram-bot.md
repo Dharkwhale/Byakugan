@@ -2763,13 +2763,19 @@ describe('classifyStartupFailure', () => {
   const api = (code: number, description: string) =>
     Object.assign(new Error(description), { error_code: code, description });
 
-  it('maps a 409 to BUSY, and does NOT suggest retrying', () => {
-    // Long polling does not error under contention: updates go to one poller at random,
-    // so a second instance makes messages disappear intermittently. Retrying here would
-    // produce exactly that split-brain.
-    const result = classifyStartupFailure(api(409, 'Conflict: terminated by other getUpdates request'));
+  it('maps a 409 to BUSY and says this instance was DISPLACED', () => {
+    // MEASURED, and the opposite of what was first assumed. Telegram terminates the
+    // request already in flight — "terminated by other getUpdates request" — so the 409
+    // goes to the INCUMBENT, not the newcomer. A process seeing this has been displaced
+    // and cannot poll at all.
+    const result = classifyStartupFailure(
+      api(409, 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running'),
+    );
     expect(result?.exitCode).toBe(EXIT.BUSY);
-    expect(result?.message).toMatch(/another instance/i);
+    expect(result?.message).toMatch(/displaced|taken over/i);
+    // It must NOT tell the operator to restart this one, which would just displace the
+    // other instance in turn and trade places forever.
+    expect(result?.message).toMatch(/flip-flop|trade places|find and stop/i);
     expect(result?.message).not.toMatch(/retry/i);
   });
 
@@ -2853,10 +2859,18 @@ export function requireBotConfig(
 /**
  * The two startup failures worth exiting on rather than retrying.
  *
- * A 409 means another instance is already polling. Long polling does NOT error under
- * contention — Telegram hands each update to one poller at random — so a second instance
- * makes messages disappear intermittently, which is the worst possible shape to debug.
- * Retrying here would create exactly that split-brain, so the bot exits.
+ * THE 409 GOES TO THE INCUMBENT, which is the opposite of what this was first designed
+ * around. Measured against a live bot: two concurrent `getUpdates` and the SECOND
+ * succeeded while the FIRST was rejected with "terminated by other getUpdates request".
+ * Telegram does not refuse a newcomer; it kills the existing request and serves the new
+ * one. So a process receiving a 409 has been DISPLACED and cannot poll at all — exiting is
+ * the only honest response, and there is no split-brain to prevent because only one poller
+ * ever receives updates.
+ *
+ * What this changes is the advice. Telling the displaced process's operator to "stop the
+ * other instance and start this one" produces a flip-flop: restarting it displaces the
+ * other, which exits and gets restarted in turn. The message has to say it was displaced
+ * and that restarting blindly trades places.
  */
 export function classifyStartupFailure(
   err: unknown,
@@ -2865,9 +2879,11 @@ export function classifyStartupFailure(
     return {
       exitCode: EXIT.BUSY,
       message:
-        'Another instance of this bot is already polling Telegram. Only one may run at a ' +
-        'time: updates are delivered to one poller at random, so two instances make ' +
-        'messages vanish intermittently. Stop the other instance, then start this one.',
+        'Another instance of this bot has taken over polling, and this one has been ' +
+        'displaced — Telegram terminates the existing getUpdates request when a new one ' +
+        'arrives, so this process can no longer receive updates. Do NOT simply restart it: ' +
+        'that would displace the other instance in turn and the two would trade places. ' +
+        'Find and stop the other instance first.',
     };
   }
   if (isUnauthorized(err)) {

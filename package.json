@@ -15,7 +15,9 @@
     "verify:probes": "node --env-file-if-exists=.env --import tsx scripts/verify-archive-probes.ts",
     "measure-cu": "node --env-file-if-exists=.env --import tsx scripts/measure-cu-cost.ts",
     "build:fixtures": "forge build",
-    "compare:paths": "node --env-file-if-exists=.env --import tsx scripts/compare-fetch-paths.ts"
+    "compare:paths": "node --env-file-if-exists=.env --import tsx scripts/compare-fetch-paths.ts",
+    "verify:scrub": "node --env-file-if-exists=.env --import tsx scripts/verify-secret-scrub.ts",
+    "probe:telegram": "node --env-file-if-exists=.env --import tsx scripts/probe-telegram.ts"
   },
   "keywords": [],
   "author": "",

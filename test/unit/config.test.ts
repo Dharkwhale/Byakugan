@@ -80,3 +80,48 @@ describe('loadConfig', () => {
     expect(Object.keys(cfg)).not.toContain('privateKey');
   });
 });
+
+describe('Telegram configuration', () => {
+  const env = {
+    RPC_URL_1: 'https://eth.example/v2/abcdefghijklmnop',
+    DEFAULT_CHAIN_ID: '1',
+  };
+
+  it('parses the token and the allowlist', () => {
+    const cfg = loadConfig({
+      ...env,
+      TELEGRAM_BOT_TOKEN: '123456:AAbbccddeeffgghh',
+      TELEGRAM_ALLOWED_USER_IDS: '111, 222 ,333',
+    }, CHAINS);
+    expect(cfg.telegramBotToken).toBe('123456:AAbbccddeeffgghh');
+    expect(cfg.telegramAllowedUserIds).toEqual([111, 222, 333]);
+  });
+
+  it('puts the BOT TOKEN in secrets, so the output scrubber covers it', () => {
+    // grammY builds every request URL as api.telegram.org/bot<TOKEN>/… and those URLs
+    // appear in error dumps. That is the same shape that put an Alchemy key into a
+    // transcript and cost a rotation; the stream scrub only covers the token once it is
+    // in `secrets`.
+    const cfg = loadConfig({ ...env, TELEGRAM_BOT_TOKEN: '123456:AAbbccddeeffgghh' }, CHAINS);
+    expect(cfg.secrets).toContain('123456:AAbbccddeeffgghh');
+  });
+
+  it('tolerates both fields being absent, because the CLI needs neither', () => {
+    const cfg = loadConfig(env, CHAINS);
+    expect(cfg.telegramBotToken).toBeUndefined();
+    expect(cfg.telegramAllowedUserIds).toEqual([]);
+  });
+
+  it('rejects an allowlist entry that is not a numeric user id', () => {
+    expect(() => loadConfig(
+      { ...env, TELEGRAM_ALLOWED_USER_IDS: '111,@alice' }, CHAINS,
+    )).toThrow(/TELEGRAM_ALLOWED_USER_IDS/);
+  });
+
+  it('ignores stray commas and whitespace rather than producing NaN ids', () => {
+    const cfg = loadConfig(
+      { ...env, TELEGRAM_ALLOWED_USER_IDS: ' 111 , , 222, ' }, CHAINS,
+    );
+    expect(cfg.telegramAllowedUserIds).toEqual([111, 222]);
+  });
+});

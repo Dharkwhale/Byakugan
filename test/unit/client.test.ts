@@ -15,6 +15,8 @@ const configWith = (...ids: Array<[number, string]>): Config => ({
   dbPath: ':memory:',
   etherscanApiKey: undefined,
   computeUnitsPerSecond: 300,
+  telegramBotToken: undefined,
+  telegramAllowedUserIds: [],
   secrets: ids.map(([, name]) => `https://${name}.example/v2/key`),
 });
 

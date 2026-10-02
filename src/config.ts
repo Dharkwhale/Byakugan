@@ -39,6 +39,18 @@ export interface Config {
    * on one budget.
    */
   computeUnitsPerSecond: number;
+  /**
+   * Absent unless the bot is being run. The CLI needs neither Telegram field, so both are
+   * optional here and `requireBotConfig` in src/bot/index.ts is the single place that
+   * demands them.
+   */
+  telegramBotToken: string | undefined;
+  /**
+   * Telegram user ids permitted to use the bot. Numeric ids rather than @usernames,
+   * because a username can be changed by its owner and an allowlist that can be
+   * reassigned is not an allowlist.
+   */
+  telegramAllowedUserIds: number[];
   /** Substrings that must never appear in logs. */
   secrets: string[];
 }
@@ -111,12 +123,38 @@ export function loadConfig(
     );
   }
 
+  const telegramBotToken = env.TELEGRAM_BOT_TOKEN || undefined;
+  // THE TOKEN IS A SECRET, for the same reason an RPC URL is: grammY builds every request
+  // as api.telegram.org/bot<TOKEN>/<method> and that URL appears in error dumps. A probe
+  // that hit an error printed such a URL once in this project and an API key reached a
+  // transcript in plain text, which cost a key rotation. Pushing it here is what makes the
+  // stream scrub in outputScrubbing.ts cover it.
+  if (telegramBotToken) secrets.push(telegramBotToken);
+
+  const telegramAllowedUserIds = (env.TELEGRAM_ALLOWED_USER_IDS ?? '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .map((part) => {
+      if (!/^\d+$/.test(part)) {
+        throw new ConfigError(
+          `TELEGRAM_ALLOWED_USER_IDS contains "${part}", which is not a numeric Telegram ` +
+          'user id. Use numeric ids, comma separated — an @username is not accepted ' +
+          'because its owner can change it, and an allowlist that can be reassigned to ' +
+          'someone else is not an allowlist.',
+        );
+      }
+      return Number(part);
+    });
+
   return {
     chains,
     defaultChainId,
     dbPath: env.DB_PATH ?? './data/byakugan.db',
     etherscanApiKey,
     computeUnitsPerSecond: cuPerSecond,
+    telegramBotToken,
+    telegramAllowedUserIds,
     secrets,
   };
 }
