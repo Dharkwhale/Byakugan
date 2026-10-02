@@ -2,6 +2,8 @@ import type Database from 'better-sqlite3';
 import type { Clock } from '../../clock.js';
 import { firstMinters, firstRecipients, overlap } from '../../db/repositories/analytics.js';
 import { getCollection } from '../../db/repositories/collections.js';
+import { countUnclassified } from '../../db/repositories/enrichment.js';
+import { EnrichmentLevelError } from '../../errors.js';
 import { describeError } from '../../report.js';
 import { parseQueryCommand, type QueryArgs } from '../args.js';
 import { respond } from '../render.js';
@@ -44,13 +46,28 @@ async function parseOrReply(d: QueryDeps, usage: string): Promise<QueryArgs | un
 /** The one failure reply: prose from `describeError`, plus the tappable next action. */
 async function replyError(
   d: QueryDeps, err: unknown, a: { contract: string; chainId: number },
+  /** Replaces the single command `nextCommand` would offer, for a multi-collection query. */
+  nextOverride?: string,
 ): Promise<void> {
   const r = describeError(err);
-  const next = nextCommand(err, a);
+  const next = nextOverride ?? nextCommand(err, a);
   await d.replier.reply(
     `${r.headline}\n\n  ${r.detail}` +
     (r.hint ? `\n\n  ${r.hint}` : '') + (next ? `\n\n  next: ${next}` : ''),
   );
+}
+
+/**
+ * The extent of the snapshot a reply was answered from.
+ *
+ * "Complete" has no fixed meaning against a live chain: every index trails the head by the
+ * configured confirmations, and one may trail further. So each reply states the block it was
+ * answered THROUGH instead of implying it covers everything. Callers have already checked the
+ * collection is indexed; the fallback says "unknown" rather than printing an invented block.
+ */
+function indexedThrough(db: Database.Database, chainId: number, contract: string): number | string {
+  const c = getCollection(db, chainId, contract);
+  return c.state === 'indexed' ? c.lastIndexedBlock : 'unknown';
 }
 
 /**
@@ -89,7 +106,8 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
   try {
     const rows = firstMinters(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
-      title: `First minters of ${contract} (chain ${parsed.chainId})`,
+      title: `First minters of ${contract} (chain ${parsed.chainId}), ` +
+        `indexed through block ${indexedThrough(d.db, parsed.chainId, contract)}`,
       // `first recipient` is shown so a mint sent to someone other than its acting wallet is
       // visible as such, and to whom; a yes/no column would only say that it happened.
       headers: ['minter', 'first recipient', 'minted', 'recipients', 'to others', 'block', 'log'],
@@ -130,7 +148,8 @@ export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
   try {
     const rows = firstRecipients(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
-      title: `First mint recipients of ${contract} (chain ${parsed.chainId})`,
+      title: `First mint recipients of ${contract} (chain ${parsed.chainId}), ` +
+        `indexed through block ${indexedThrough(d.db, parsed.chainId, contract)}`,
       headers: ['recipient', 'minter', 'received', 'block', 'log'],
       rows: rows.map((r) => [
         r.recipient,
@@ -172,13 +191,24 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
     });
     await respond(d.replier, {
       title: `Wallets in ${parsed.min}+ of ${parsed.contracts.length} collections ` +
-        `(chain ${parsed.chainId})`,
+        `(chain ${parsed.chainId})\n` +
+        'indexed through block: ' +
+        parsed.contracts
+          .map((c) => `${c} ${indexedThrough(d.db, parsed.chainId, c)}`).join(', '),
       headers: ['wallet', 'collections'],
       rows: rows.map((r) => [r.address, String(r.collections)]),
       filename: `overlap-${parsed.chainId}-${parsed.contracts.length}-${d.clock.now()}.csv`,
     });
   } catch (err) {
-    // The re-index command is for the first collection; the error text names every offender.
-    await replyError(d, err, { contract: first, chainId: parsed.chainId });
+    // One re-index per collection that is actually short of data, recomputed from the rows.
+    // Offering the first requested collection would be a tappable action that re-indexes a
+    // collection that was never the problem.
+    const offenders = err instanceof EnrichmentLevelError
+      ? parsed.contracts.filter((c) => countUnclassified(d.db, parsed.chainId, c) > 0)
+      : [];
+    const next = offenders.length > 0
+      ? offenders.map((c) => `/index ${c} --chain ${parsed.chainId}`).join('  ')
+      : undefined;
+    await replyError(d, err, { contract: first, chainId: parsed.chainId }, next);
   }
 }
