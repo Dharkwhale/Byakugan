@@ -11,6 +11,9 @@ function fakeReplier() {
   return { replier: { reply, edit, sendDocument } as Replier, reply, edit, sendDocument };
 }
 
+// String.prototype.isWellFormed is Node 20+ but absent from this project's TS lib target.
+const wellFormed = (s: string): boolean => (s as unknown as { isWellFormed(): boolean }).isWellFormed();
+
 describe('sanitizeOnChainText', () => {
   // name() is attacker-controlled. Dropping parse_mode handles Markdown; none of these
   // involve Markdown at all.
@@ -39,13 +42,17 @@ describe('sanitizeOnChainText', () => {
   });
 
   it('does not split a surrogate pair at the truncation boundary', () => {
+    // isWellFormed() rather than a surrogate regex: that regex was twice written to disk as
+    // literal U+FFFD characters by mistake, which can never match and made the check vacuous.
     // 63 x's, then an emoji whose high surrogate sits at UTF-16 index 63.
-    const out = sanitizeOnChainText('x'.repeat(63) + '\u{1f600}yyy');
-    expect(out).not.toMatch(/[�-�]/);
-    expect(out).toBe('x'.repeat(63) + '\u{1f600}…');
-    // And past the cut: 64 x's then an emoji, which must be dropped whole.
-    const out2 = sanitizeOnChainText('x'.repeat(64) + '\u{1f600}');
-    expect(out2).not.toMatch(/[�-�]/);
+    const out = sanitizeOnChainText('x'.repeat(63) + '😀yyy');
+    expect(wellFormed(out)).toBe(true);
+    expect(out).toBe('x'.repeat(63) + '😀…');
+    // A cut that lands on code-unit 64 but code point 62: slice() would keep only two of the
+    // three emoji, so the exact string is what pins this case.
+    const out2 = sanitizeOnChainText('x'.repeat(60) + '😀😀😀yyyy');
+    expect(wellFormed(out2)).toBe(true);
+    expect(out2).toBe('x'.repeat(60) + '😀😀😀y…');
   });
 
   it('turns an all-invisible name into the placeholder', () => {

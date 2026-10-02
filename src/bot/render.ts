@@ -22,7 +22,9 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
  *
  * Stripping all of Cf also removes ZWJ, so an emoji family sequence may render as
  * separate people. That is a deliberate trade for a security boundary on
- * attacker-controlled text.
+ * attacker-controlled text. It likewise removes ZWNJ (U+200C), which is orthographically
+ * meaningful in Persian, Urdu and Kurdish, so names in those scripts lose a character that
+ * changes how they read; still the right call for a 64-character display label.
  */
 const FORMAT = /\p{Cf}/gu;
 
