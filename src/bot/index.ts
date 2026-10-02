@@ -18,7 +18,7 @@ import { createLogger } from '../logger.js';
 import { EXIT, formatError, describeError } from '../report.js';
 import {
   CONFIRM_THRESHOLD_SECONDS, STALE_LOCK_MS, buildBot, classifyStartupFailure,
-  requireBotConfig, task13Placeholders,
+  requireBotConfig, task13Placeholders, writeDropLog, writeHandlerError,
 } from './app.js';
 import { createJobRegistry } from './jobs.js';
 
@@ -35,7 +35,7 @@ async function main(): Promise<number> {
   runMigrations(db);
 
   const bot = buildBot({
-    token, allowedUserIds, db,
+    token, allowedUserIds, db, secrets: config.secrets,
     clock: systemClock,
     registry: createJobRegistry({ clock: systemClock, staleMs: STALE_LOCK_MS }),
     // To stderr, scrubbed at serialization by the logger as well as by the stream guard.
@@ -44,8 +44,8 @@ async function main(): Promise<number> {
     chainName: (chainId) => config.chains.get(chainId)?.name ?? `chain ${chainId}`,
     staleMs: STALE_LOCK_MS,
     confirmThresholdSeconds: CONFIRM_THRESHOLD_SECONDS,
-    logDrop: (message) => { process.stderr.write(`${message}\n`); },
-    onHandlerError: (err) => { process.stderr.write(formatError(describeError(err))); },
+    logDrop: writeDropLog,
+    onHandlerError: writeHandlerError,
     // Task 13 replaces these. They throw until then; see `task13Placeholders`.
     ...task13Placeholders(),
   });

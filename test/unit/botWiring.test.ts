@@ -42,6 +42,7 @@ function setup(over: Partial<BotDeps> = {}) {
   const deps: BotDeps = {
     token: '123456:TEST-TOKEN-NOT-REAL',
     allowedUserIds: new Set([ALLOWED]),
+    secrets: [],
     db, clock,
     registry: createJobRegistry({ clock, staleMs: 900_000 }),
     logger: createLogger([], new Writable({ write(_c, _e, cb) { cb(); } })),
@@ -157,6 +158,21 @@ describe('/index names the chain it parsed', () => {
   });
 });
 
+describe('chat output is scrubbed through the wiring', () => {
+  it('an /index failure whose error carries an RPC URL replies WITHOUT the key', async () => {
+    const FAKE_URL = 'https://eth-mainnet.example.invalid/v2/FAKEKEY0123456789abcdefFAKEKEY';
+    const { bot, calls } = setup({
+      secrets: [FAKE_URL],
+      estimate: async () => { throw new Error(`request to ${FAKE_URL} failed`); },
+    });
+    await bot.handleUpdate(command(ALLOWED, `/index ${ADDR}`));
+    await flush();
+    const text = calls.map((c) => c.text ?? '').join('\n');
+    expect(text).toContain('failed');
+    expect(text).not.toContain('FAKEKEY0123456789abcdefFAKEKEY');
+  });
+});
+
 describe('Task 13 placeholders fail loudly', () => {
   it('each one throws and names Task 13, rather than returning a value', async () => {
     const p = task13Placeholders();
@@ -177,7 +193,8 @@ describe('Task 13 placeholders fail loudly', () => {
     expect(deps.registry.inspect(db, { chainId: 1, contract: ADDR }).kind).toBe('idle');
     for (const c of calls) {
       expect(c.text ?? '').not.toMatch(/^Indexing /);
-      expect(c.text ?? '').not.toBe('');
+      // The reply must SAY the command is not wired, not merely be non-empty.
+      expect(c.text ?? '').toMatch(/not wired|Task 13/);
     }
   });
 });

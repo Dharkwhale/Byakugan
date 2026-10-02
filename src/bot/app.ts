@@ -11,11 +11,12 @@ import type { Logger } from 'pino';
 import type { Clock } from '../clock.js';
 import type { Config } from '../config.js';
 import { ConfigError } from '../errors.js';
-import { EXIT, describeError, type ExitCode } from '../report.js';
+import { EXIT, describeError, formatError, type ExitCode } from '../report.js';
 import { isConflict, isUnauthorized } from '../telegram/failures.js';
 import { allowOnly } from './auth.js';
 import type { JobRegistry } from './jobs.js';
-import { makeReplier } from './replier.js';
+import { deriveSecretTokens } from '../secrets.js';
+import { makeReplier as makeScrubbedReplier } from './replier.js';
 import { handleIndex, type HandleIndexDeps } from './commands/index.js';
 import { handleStatus } from './commands/status.js';
 import { handleFirstMinters, handleFirstRecipients, handleOverlap } from './commands/queries.js';
@@ -114,9 +115,21 @@ export function task13Placeholders(): Pick<BotDeps, 'estimate' | 'runBackfill' |
   };
 }
 
+/** What `main` passes as `logDrop`: to stderr, where the stream scrub covers it. */
+export function writeDropLog(message: string): void {
+  process.stderr.write(`${message}\n`);
+}
+
+/** What `main` passes as `onHandlerError`: a failing handler must leave a record. */
+export function writeHandlerError(err: unknown): void {
+  process.stderr.write(formatError(describeError(err)));
+}
+
 export interface BotDeps {
   token: string;
   allowedUserIds: ReadonlySet<number>;
+  /** Raw secrets (`config.secrets`); the replier scrubs every outbound chat string with them. */
+  secrets: string[];
   db: Database.Database;
   clock: Clock;
   registry: JobRegistry;
@@ -150,6 +163,9 @@ export interface BotDeps {
  */
 export function buildBot(d: BotDeps): Bot {
   const bot = new Bot(d.token, d.botConfig);
+  // Derived ONCE; every outbound chat string is scrubbed with these inside the replier.
+  const tokens = deriveSecretTokens(d.secrets);
+  const makeReplier = (ctx: Context) => makeScrubbedReplier(ctx, tokens);
 
   // FIRST, before any handler.
   bot.use(allowOnly(d.allowedUserIds, d.logDrop));
