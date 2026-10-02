@@ -71,6 +71,32 @@ function indexedThrough(db: Database.Database, chainId: number, contract: string
 }
 
 /**
+ * The extent of the WEAKEST collection in a multi-collection answer.
+ *
+ * `overlap` counts a wallet once per collection it acquired in, so a wallet whose purchase
+ * sits above one collection's watermark is undercounted — and the lowest watermark is
+ * therefore the limit on the whole answer, not an average of them. Reporting the minimum
+ * states that limit; reporting each one leaves the reader to find it.
+ *
+ * Returns 'unknown' if any collection's watermark is unavailable, because the minimum of a
+ * set containing an unknown is unknown — not the smallest of the ones that happened to be
+ * readable.
+ */
+function leastIndexedThrough(
+  db: Database.Database,
+  chainId: number,
+  contracts: readonly string[],
+): number | string {
+  let least = Number.POSITIVE_INFINITY;
+  for (const contract of contracts) {
+    const through = indexedThrough(db, chainId, contract);
+    if (typeof through !== 'number') return 'unknown';
+    least = Math.min(least, through);
+  }
+  return Number.isFinite(least) ? least : 'unknown';
+}
+
+/**
  * Collections in the request that have never been indexed.
  *
  * Reported BY NAME rather than folded into an empty result. `firstMinters` on an unknown
@@ -190,11 +216,22 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
       chainId: parsed.chainId, contracts: parsed.contracts, minCollections: parsed.min,
     });
     await respond(d.replier, {
+      // The LEAST-indexed collection, not a list of all of them. Two reasons, and the
+      // second is why the list was wrong rather than merely long.
+      //
+      // It is the honest number: an overlap answer is only as complete as its weakest
+      // member, because a wallet missing from one collection's range is missing from the
+      // count. The minimum names the binding constraint; a list makes the reader find it.
+      //
+      // And it is BOUNDED BY CONSTRUCTION. The title becomes the document caption in
+      // `respond`, and a per-collection list grew about 52 characters per collection — so a
+      // wide `/overlap` would have built a caption Telegram rejects, turning a long answer
+      // into no answer. Per-collection watermarks live in `/status`, which reports one
+      // collection at a time and has room for them.
       title: `Wallets in ${parsed.min}+ of ${parsed.contracts.length} collections ` +
-        `(chain ${parsed.chainId})\n` +
-        'indexed through block: ' +
-        parsed.contracts
-          .map((c) => `${c} ${indexedThrough(d.db, parsed.chainId, c)}`).join(', '),
+        `(chain ${parsed.chainId}), indexed through block ` +
+        `${leastIndexedThrough(d.db, parsed.chainId, parsed.contracts)} at the least ` +
+        '(/status for each)',
       headers: ['wallet', 'collections'],
       rows: rows.map((r) => [r.address, String(r.collections)]),
       filename: `overlap-${parsed.chainId}-${parsed.contracts.length}-${d.clock.now()}.csv`,

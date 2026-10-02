@@ -380,12 +380,32 @@ describe('handleOverlap', () => {
     expect(docs[0]!.filename).toBe(`overlap-1-2-${CLOCK_MS}.csv`);
   });
 
-  it('states the block each collection was answered through', async () => {
+  it('states the LEAST-indexed block, since that is the limit on the whole answer', async () => {
+    // Not the highest and not a list. A wallet whose acquisition sits above the lowest
+    // watermark is undercounted, so the minimum is the binding constraint on an overlap
+    // answer. 4321 appearing instead would overstate how complete the answer is.
     const { base, sent } = setup();
     collection(A, 4321); collection(B, 77);
     insertTransfers(db, [mint(A, WALLET, 1, 10), mint(B, WALLET, 2, 11)]);
     await handleOverlap({ ...base, text: `/overlap ${A} ${B}` });
-    expect(sent[0]).toContain(`indexed through block: ${A} 4321, ${B} 77`);
+    expect(sent[0]).toContain('indexed through block 77 at the least');
+    expect(sent[0]).not.toContain('4321');
+  });
+
+  it('keeps the title BOUNDED as collections are added, because it becomes the caption', async () => {
+    // The title is the document caption, and Telegram rejects an over-long one — so an
+    // answer too big for a message would have become no answer at all. A per-collection
+    // watermark list grew with the input; the minimum does not. 30 collections here: well
+    // past where a list would have blown the caption limit.
+    const { base, sent } = setup();
+    const many = Array.from({ length: 30 }, (_, i) => `0x${String(i + 1).padStart(40, 'd')}`);
+    for (const c of many) collection(c, 500 + many.indexOf(c));
+    insertTransfers(db, many.map((c, i) => mint(c, WALLET, i + 1, 10 + i)));
+    await handleOverlap({ ...base, text: `/overlap ${many.join(' ')}` });
+    const title = sent[0]!.split('\n')[0]!;
+    expect(title.length).toBeLessThan(200);
+    expect(title).toContain('30 collections');
+    expect(title).toContain('indexed through block 500 at the least');
   });
 
   it('says so when two fully indexed collections share no wallet', async () => {

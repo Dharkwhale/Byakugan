@@ -115,6 +115,33 @@ export async function respond(
   await replier.sendDocument({
     filename: a.filename,
     contents: toCsv(a),
-    caption: `${a.title} — ${a.rows.length} rows, too long for a message.`,
+    caption: boundCaption(`${a.title} — ${a.rows.length} rows, too long for a message.`),
   });
+}
+
+/**
+ * Telegram's documented limit on a document caption. NOT measured here, unlike the error
+ * shapes in `src/telegram/failures.ts` — it comes from the published Bot API reference, so
+ * treat the exact number as unverified. The guard below does not depend on it being exact:
+ * any bound that is comfortably under the real one prevents the failure.
+ */
+const CAPTION_LIMIT = 1024;
+
+/**
+ * Keeps a caption short enough to send.
+ *
+ * A title is composed by the caller and can grow with its input — a `/overlap` across many
+ * collections once built one about 52 characters per collection. Over the limit Telegram
+ * REJECTS the whole `sendDocument`, so an answer too long for a message becomes no answer
+ * at all: the failure lands precisely on the large results the document path exists for.
+ *
+ * Truncation is visible rather than silent. The caption is a label — the rows are in the
+ * file and are never abridged — so losing the tail of a label is the cheap half of this
+ * trade, and saying it was cut is what stops a reader trusting a sentence that stops
+ * mid-clause.
+ */
+function boundCaption(caption: string): string {
+  if (caption.length <= CAPTION_LIMIT) return caption;
+  const marker = '… (caption truncated; the full result is in the file)';
+  return `${Array.from(caption).slice(0, CAPTION_LIMIT - marker.length).join('')}${marker}`;
 }

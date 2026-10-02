@@ -96,6 +96,28 @@ describe('respond', () => {
     expect(doc.caption).toContain('500');
   });
 
+  it('BOUNDS an over-long caption, because Telegram rejects the whole send', async () => {
+    // A caller composes the title and it can grow with its input. Over Telegram's limit the
+    // sendDocument is REJECTED, so an answer too long for a message becomes no answer at
+    // all — the failure lands exactly on the large results this path exists for. The rows
+    // are never abridged; only the label is, and it says so.
+    const { replier, sendDocument } = fakeReplier();
+    const rows = Array.from({ length: 500 }, (_, i) => [`0x${String(i).padStart(40, '0')}`, '1']);
+    await respond(replier, { ...small, title: 'T'.repeat(5_000), rows });
+    const { caption } = sendDocument.mock.calls[0]![0];
+    expect(caption.length).toBeLessThanOrEqual(1024);
+    expect(caption).toContain('caption truncated');
+    // The file itself is untouched by the truncation.
+    expect(sendDocument.mock.calls[0]![0].contents.split('\n')).toHaveLength(501);
+  });
+
+  it('leaves a caption that already fits completely alone', async () => {
+    const { replier, sendDocument } = fakeReplier();
+    const rows = Array.from({ length: 500 }, (_, i) => [`0x${String(i).padStart(40, '0')}`, '1']);
+    await respond(replier, { ...small, rows });
+    expect(sendDocument.mock.calls[0]![0].caption).not.toContain('truncated');
+  });
+
   it('switches on the rendered LENGTH, not on a row count', async () => {
     // One rule for every command, and the real limit is characters.
     const { replier, sendDocument } = fakeReplier();
