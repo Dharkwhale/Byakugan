@@ -8,6 +8,7 @@ import { describeError } from '../../report.js';
 import { parseQueryCommand, type QueryArgs } from '../args.js';
 import { respond } from '../render.js';
 import type { Replier } from '../replier.js';
+import type { JobRegistry } from '../jobs.js';
 import { nextCommand } from './index.js';
 import type { Address } from '../../types.js';
 
@@ -18,6 +19,11 @@ export interface QueryDeps {
   /** Stamps the CSV filename. Injected so output is deterministic under test. */
   clock: Clock;
   defaultChainId: number | undefined;
+  /**
+   * Which collections have a job running in THIS process. A query answered while one is
+   * running is answered from a partial index, and has to say so.
+   */
+  registry: JobRegistry;
 }
 
 const USAGE = {
@@ -114,7 +120,78 @@ function notIndexed(db: Database.Database, chainId: number, contracts: Address[]
   return contracts.filter((c) => getCollection(db, chainId, c).state === 'not_indexed');
 }
 
-function notIndexedReply(contract: string, chainId: number, what: string): string {
+/**
+ * The jobs running right now for the given collections, with what the registry knows of them.
+ *
+ * The registry is asked rather than the lock table, because a lock row can outlive its
+ * process: an ORPHANED lock means nothing is indexing, and a notice claiming otherwise would
+ * be false in the other direction. Only a job in this process's map counts as running.
+ */
+function runningJobs(
+  d: QueryDeps, chainId: number, contracts: readonly string[],
+): Array<{ contract: string; source: string; lastBlock?: number }> {
+  const out: Array<{ contract: string; source: string; lastBlock?: number }> = [];
+  for (const contract of contracts) {
+    const state = d.registry.inspect(d.db, { chainId, contract });
+    if (state.kind === 'running') {
+      out.push({
+        contract, source: state.source,
+        ...(state.lastBlock === undefined ? {} : { lastBlock: state.lastBlock }),
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * The line that accompanies an answer given from a partial index.
+ *
+ * It ACCOMPANIES the answer and never replaces it: partial data labelled as partial is more
+ * use than a refusal, and the same honesty as the least-indexed-block title. What it must not
+ * do is let the rows pass for complete. `through` is the watermark — the block the committed
+ * rows actually reach — not the registry's `lastBlock`, which is progress and only
+ * describes the job. It is bounded in length by construction (counts, not a list of
+ * collections), because the title becomes a document caption.
+ */
+function inProgressNotice(
+  jobs: ReadonlyArray<{ source: string; lastBlock?: number }>,
+  total: number,
+  through: number | string,
+): string {
+  const head = total === 1
+    ? 'INDEXING IN PROGRESS'
+    : `INDEXING IN PROGRESS on ${jobs.length} of ${total} collections`;
+  // One collection has one job to describe. With several, naming one job's source would
+  // misdescribe the others.
+  const job = total === 1 ? jobs[0] : undefined;
+  const detail = job === undefined
+    ? ''
+    : ` (via ${job.source}${job.lastBlock === undefined ? '' : `, now at block ${job.lastBlock}`})`;
+  return `${head}${detail}: this answer covers blocks up to ${through} only and may change.`;
+}
+
+/** The notice on its own line, or nothing when no job is running. */
+function noticeLine(
+  jobs: ReadonlyArray<{ source: string; lastBlock?: number }>,
+  total: number,
+  through: number | string,
+): string {
+  return jobs.length === 0 ? '' : `\n${inProgressNotice(jobs, total, through)}`;
+}
+
+function notIndexedReply(
+  contract: string, chainId: number, what: string, indexing: boolean,
+): string {
+  // A job is running but has committed nothing yet (still resolving the deploy block), so
+  // there is no watermark to answer from. That is a different fact from "never indexed" and
+  // tapping /index would only be refused as a duplicate.
+  if (indexing) {
+    return (
+      `${contract} on chain ${chainId} is being indexed, but no blocks are indexed yet, so ` +
+      `there is nothing to report. This is different from having no ${what}. ` +
+      'Try again shortly.'
+    );
+  }
   return (
     `${contract} on chain ${chainId} is not indexed, so there is nothing to report. ` +
     `This is different from having no ${what}.\n  /index ${contract} --chain ${chainId}`
@@ -131,16 +208,18 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
     await d.replier.reply(`Send an address: ${USAGE.firstminters}`);
     return;
   }
+  const jobs = runningJobs(d, parsed.chainId, [contract]);
   if (notIndexed(d.db, parsed.chainId, [contract]).length > 0) {
-    await d.replier.reply(notIndexedReply(contract, parsed.chainId, 'minters'));
+    await d.replier.reply(notIndexedReply(contract, parsed.chainId, 'minters', jobs.length > 0));
     return;
   }
 
+  const through = indexedThrough(d.db, parsed.chainId, contract);
   try {
     const rows = firstMinters(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
       title: `First minters of ${contract} (chain ${parsed.chainId}), ` +
-        `indexed through block ${indexedThrough(d.db, parsed.chainId, contract)}`,
+        `indexed through block ${through}` + noticeLine(jobs, 1, through),
       // `first recipient` is shown so a mint sent to someone other than its acting wallet is
       // visible as such, and to whom; a yes/no column would only say that it happened.
       headers: ['minter', 'first recipient', 'minted', 'recipients', 'to others', 'block', 'log'],
@@ -173,16 +252,18 @@ export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
     await d.replier.reply(`Send an address: ${USAGE.firstrecipients}`);
     return;
   }
+  const jobs = runningJobs(d, parsed.chainId, [contract]);
   if (notIndexed(d.db, parsed.chainId, [contract]).length > 0) {
-    await d.replier.reply(notIndexedReply(contract, parsed.chainId, 'recipients'));
+    await d.replier.reply(notIndexedReply(contract, parsed.chainId, 'recipients', jobs.length > 0));
     return;
   }
 
+  const through = indexedThrough(d.db, parsed.chainId, contract);
   try {
     const rows = firstRecipients(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
       title: `First mint recipients of ${contract} (chain ${parsed.chainId}), ` +
-        `indexed through block ${indexedThrough(d.db, parsed.chainId, contract)}`,
+        `indexed through block ${through}` + noticeLine(jobs, 1, through),
       headers: ['recipient', 'minter', 'received', 'block', 'log'],
       rows: rows.map((r) => [
         r.recipient,
@@ -206,16 +287,23 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
     return;
   }
 
+  const jobs = runningJobs(d, parsed.chainId, parsed.contracts);
+  const indexing = new Set(jobs.map((j) => j.contract));
   const missing = notIndexed(d.db, parsed.chainId, parsed.contracts);
   if (missing.length > 0) {
+    const toIndex = missing.filter((c) => !indexing.has(c));
     await d.replier.reply(
       'These are not indexed, so they cannot be counted:\n' +
-      missing.map((c) => `  ${c} — not indexed`).join('\n') +
-      `\n\nIndex them first: ${missing.map((c) => `/index ${c} --chain ${parsed.chainId}`).join('  ')}`,
+      missing.map((c) => `  ${c} — ${indexing.has(c) ? 'indexing, no blocks indexed yet' : 'not indexed'}`)
+        .join('\n') +
+      (toIndex.length > 0
+        ? `\n\nIndex them first: ${toIndex.map((c) => `/index ${c} --chain ${parsed.chainId}`).join('  ')}`
+        : '\n\nTry again shortly.'),
     );
     return;
   }
 
+  const through = leastIndexedThrough(d.db, parsed.chainId, parsed.contracts);
   try {
     // Throws EnrichmentLevelError on an index that cannot tell a buy from a transfer. It is
     // surfaced below rather than caught here: an empty table would be a wrong answer.
@@ -237,8 +325,10 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
       // collection at a time and has room for them.
       title: `Wallets in ${parsed.min}+ of ${parsed.contracts.length} collections ` +
         `(chain ${parsed.chainId}), indexed through block ` +
-        `${leastIndexedThrough(d.db, parsed.chainId, parsed.contracts)} at the least ` +
-        '(/status for each)',
+        `${through} at the least (/status for each)` +
+        // ANY named collection with a running job makes the whole answer partial: a wallet
+        // missing from one collection's range is missing from the count.
+        noticeLine(jobs, parsed.contracts.length, through),
       headers: ['wallet', 'collections'],
       rows: rows.map((r) => [r.address, String(r.collections)]),
       filename: `overlap-${parsed.chainId}-${parsed.contracts.length}-${d.clock.now()}.csv`,

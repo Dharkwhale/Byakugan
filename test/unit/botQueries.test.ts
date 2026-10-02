@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 import {
   handleFirstMinters, handleFirstRecipients, handleOverlap, leastIndexedThrough,
 } from '../../src/bot/commands/queries.js';
+import { createJobRegistry } from '../../src/bot/jobs.js';
 import { manualClock } from '../../src/clock.js';
 import { openDb } from '../../src/db/connection.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -39,9 +40,11 @@ function setup() {
       docs.push(d);
     }),
   } as unknown as Replier;
+  const clock = manualClock(CLOCK_MS);
+  const registry = createJobRegistry({ clock, staleMs: 900_000 });
   return {
-    sent, docs,
-    base: { replier, db, clock: manualClock(CLOCK_MS), defaultChainId: 1 },
+    sent, docs, registry,
+    base: { replier, db, clock, defaultChainId: 1, registry },
   };
 }
 
@@ -427,5 +430,124 @@ describe('handleOverlap', () => {
     expect(sent[0]).toContain('(no rows)');
     expect(sent[0]).not.toMatch(/not indexed/i);
     expect(sent[0]).not.toContain('wallet:');
+  });
+});
+
+describe('a query answered mid-backfill says so, and still answers', () => {
+  // Three numbers that can only come from where they are claimed to: the WATERMARK (the
+  // collection row) is what the answer covers; the registry's `lastBlock` is job progress
+  // and the registry's `source` names the fetch path. They are all different, so a notice
+  // that read the wrong one fails on the value, not merely on the word "indexing".
+  const WATERMARK_A = 7_777;
+  const WATERMARK_B = 5_555;
+  const JOB_BLOCK = 9_001;
+
+  function running(registry: ReturnType<typeof setup>['registry'], contract: string, lastBlock = JOB_BLOCK) {
+    const handle = registry.claim({ chainId: 1, contract, source: 'getAssetTransfers' });
+    registry.note({ chainId: 1, contract, lastBlock });
+    return handle;
+  }
+
+  it('/firstminters: the notice AND the populated rows', async () => {
+    const { base, sent, registry } = setup();
+    collection(A, WATERMARK_A);
+    insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: BOT }]);
+    running(registry, A);
+    await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(
+      'INDEXING IN PROGRESS (via getAssetTransfers, now at block 9001): ' +
+      'this answer covers blocks up to 7777 only and may change.',
+    );
+    expect(sent[0]).toContain(`indexed through block ${WATERMARK_A}`);   // the existing watermark kept
+    expect(sent[0]).toContain(`minter: ${BOT}`);                          // and the answer is given
+    expect(sent[0]).not.toContain('(no rows)');
+  });
+
+  it('/firstrecipients: the notice AND the populated rows', async () => {
+    const { base, sent, registry } = setup();
+    collection(A, WATERMARK_A);
+    insertTransfers(db, [mint(A, WALLET, 1, 10)]);
+    running(registry, A);
+    await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(
+      'INDEXING IN PROGRESS (via getAssetTransfers, now at block 9001): ' +
+      'this answer covers blocks up to 7777 only and may change.',
+    );
+    expect(sent[0]).toContain(`indexed through block ${WATERMARK_A}`);
+    expect(sent[0]).toContain(`recipient: ${WALLET}`);
+  });
+
+  it('/overlap: one running collection of two counts, and the notice names the LEAST block', async () => {
+    const { base, sent, registry } = setup();
+    collection(A, WATERMARK_A); collection(B, WATERMARK_B);
+    insertTransfers(db, [mint(A, WALLET, 1, 10), mint(B, WALLET, 2, 11)]);
+    running(registry, A);      // A is running; B (the least-indexed) is not
+    await handleOverlap({ ...base, text: `/overlap ${A} ${B}` });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(
+      'INDEXING IN PROGRESS on 1 of 2 collections: ' +
+      'this answer covers blocks up to 5555 only and may change.',
+    );
+    expect(sent[0]).toContain('indexed through block 5555 at the least');
+    expect(sent[0]).toContain(line([['wallet', WALLET], ['collections', '2']]));
+  });
+
+  it('/overlap: a job on the OTHER collection counts too, and on both says 2 of 2', async () => {
+    const other = setup();
+    collection(A, WATERMARK_A); collection(B, WATERMARK_B);
+    insertTransfers(db, [mint(A, WALLET, 1, 10), mint(B, WALLET, 2, 11)]);
+    running(other.registry, B);
+    await handleOverlap({ ...other.base, text: `/overlap ${A} ${B}` });
+    expect(other.sent[0]).toContain('INDEXING IN PROGRESS on 1 of 2 collections');
+
+    const both = setup();
+    running(both.registry, A); running(both.registry, B);
+    await handleOverlap({ ...both.base, text: `/overlap ${A} ${B}` });
+    expect(both.sent[0]).toContain('INDEXING IN PROGRESS on 2 of 2 collections');
+    expect(both.sent[0]).toContain(line([['wallet', WALLET], ['collections', '2']]));
+  });
+
+  it('says nothing about indexing when no job is running, including over an orphaned lock', async () => {
+    const { base, sent } = setup();
+    collection(A, WATERMARK_A);
+    // A lock row with no job in this process: nothing is indexing, so a notice would be false.
+    db.prepare('UPDATE collections SET locked_by = ?, locked_at = ? WHERE contract = ?')
+      .run('dead-job', 1, A);
+    insertTransfers(db, [mint(A, WALLET, 1, 10)]);
+    await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
+    expect(sent[0]).toContain(`recipient: ${WALLET}`);
+    expect(sent[0]).not.toMatch(/INDEXING IN PROGRESS/i);
+  });
+
+  it('a running job with no committed blocks yet says so, rather than "not indexed"', async () => {
+    // Bootstrap is still resolving the deploy block: no watermark exists, so there is nothing
+    // to answer from. That is not "never indexed", and /index would be refused as a duplicate.
+    const { base, sent, registry } = setup();
+    registry.claim({ chainId: 1, contract: A, source: 'getLogs' });
+    await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
+    expect(sent[0]).toMatch(/is being indexed, but no blocks are indexed yet/);
+    expect(sent[0]).not.toContain(`/index ${A}`);
+
+    const overlapped = setup();
+    overlapped.registry.claim({ chainId: 1, contract: A, source: 'getLogs' });
+    collection(B);
+    await handleOverlap({ ...overlapped.base, text: `/overlap ${A} ${B}` });
+    expect(overlapped.sent[0]).toContain(`${A} — indexing, no blocks indexed yet`);
+    expect(overlapped.sent[0]).not.toContain(`/index ${A}`);
+  });
+
+  it('keeps the notice inside the caption bound on a wide /overlap that goes to a document', async () => {
+    const { base, docs, registry } = setup();
+    const many = Array.from({ length: 30 }, (_, i) => addr('1', String(i).padStart(2, '0')));
+    many.forEach((c) => collection(c, 100));
+    insertTransfers(db, many.flatMap((c, i) => [
+      mint(c, WALLET, 1000 + i, 10), ...Array.from({ length: 20 }, (_, k) => mint(c, addr('2', `${i}${k}`), k, 11)),
+    ]));
+    running(registry, many[0]!);
+    await handleOverlap({ ...base, text: `/overlap ${many.join(' ')} --min 1` });
+    expect(docs).toHaveLength(1);
+    expect(docs[0]!.caption.length).toBeLessThanOrEqual(1024);
   });
 });
