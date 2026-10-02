@@ -108,7 +108,7 @@ describe('the progress label names the path the run actually used', () => {
     await flush();
 
     // One command, one build: a second probe is the defect, whatever it answered.
-    expect(endpoint.builds()).toBe(1);
+    expect.soft(endpoint.builds()).toBe(1);
 
     // The run was handed build #1's ports, which run getAssetTransfers. Every place the
     // path is NAMED must say the same thing: the first progress line, and the
