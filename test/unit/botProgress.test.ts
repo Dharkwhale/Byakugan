@@ -87,6 +87,37 @@ describe('Telegram-specific behaviour', () => {
     expect(edit).toHaveBeenCalledTimes(2);
   });
 
+  it('re-sends the SAME render after a 429, because that edit never applied', async () => {
+    let call = 0;
+    const edit = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        throw Object.assign(new Error('x'), {
+          error_code: 429, description: 'Too Many Requests: retry after 5',
+          parameters: { retry_after: 5 },
+        });
+      }
+    });
+    const { progress, clock } = setup({ edit });
+    await progress.onChunk(chunk(10, 1));
+    clock.advance(6_000);                              // mute expired
+    await progress.onChunk(chunk(10, 1));              // identical render
+    expect(edit).toHaveBeenCalledTimes(2);
+  });
+
+  it('skips locally the identical render after the server said "not modified"', async () => {
+    const edit = vi.fn(async () => {
+      throw Object.assign(new Error('x'), {
+        error_code: 400, description: 'Bad Request: message is not modified',
+      });
+    });
+    const { progress, clock } = setup({ edit });
+    await progress.onChunk(chunk(10, 1));
+    clock.advance(10_000);
+    await progress.onChunk(chunk(10, 1));              // identical: must not cost another 400
+    expect(edit).toHaveBeenCalledOnce();
+  });
+
   it('lets a transport error propagate rather than hiding a real failure', async () => {
     const edit = vi.fn(async () => { throw new Error('socket hang up'); });
     const { progress } = setup({ edit });
@@ -103,13 +134,69 @@ describe('finish and fail always land', () => {
   });
 
   it('a late chunk cannot overwrite the final message', async () => {
-    // finish/fail write the result, and a throttled tick can still be in flight when they
-    // do. If a late tick wins, the user is left reading progress for a job that already ended.
+    // A tick that STARTS after finish is dropped by the `finished` guard. (A tick already
+    // in flight when finish is called is a different case, pinned below.) If a late tick
+    // won, the user would be left reading progress for a job that already ended.
     const { progress, edits, clock } = setup();
     await progress.finish('done: 152 rows');
     clock.advance(60_000);
     await progress.onChunk(chunk(999, 99));
     expect(edits.at(-1)).toContain('done: 152 rows');
+  });
+
+  /** An edit whose completion order the test controls: the first call waits on a gate. */
+  function gatedFirstEdit() {
+    const done: string[] = [];
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let reached!: () => void;
+    const firstEditStarted = new Promise<void>((r) => { reached = r; });
+    const edit = vi.fn(async (_id: number, text: string) => {
+      calls += 1;
+      if (calls === 1) { reached(); await gate; }
+      done.push(text);   // pushed AFTER the await: this records completion, not call order
+    });
+    return { done, edit, release, firstEditStarted };
+  }
+
+  it('finish waits for a tick already in flight, so the result is written last', async () => {
+    const { done, edit, release, firstEditStarted } = gatedFirstEdit();
+    const { progress } = setup({ edit });
+    const tick = progress.onChunk(chunk(10, 140));   // not awaited: the real wiring is fire-and-forget
+    await firstEditStarted;
+    const fin = progress.finish('done: 152 rows');
+    release();
+    await Promise.all([tick, fin]);
+    expect(done).toHaveLength(2);
+    expect(done[0]).toContain('rows 140');
+    expect(done.at(-1)).toBe('done: 152 rows');
+  });
+
+  it('drops a tick that arrives while another is in flight, rather than queueing it', async () => {
+    const { done, edit, release, firstEditStarted } = gatedFirstEdit();
+    const { progress, clock } = setup({ edit });
+    const first = progress.onChunk(chunk(10, 1));
+    await firstEditStarted;
+    clock.advance(60_000);                            // past the throttle: only in-flight can stop it
+    await progress.onChunk(chunk(20, 2));             // a different render, so no text-skip either
+    expect(edit).toHaveBeenCalledOnce();
+    release();
+    await first;
+    expect(done).toHaveLength(1);
+    expect(done[0]).toContain('rows 1');
+  });
+
+  it('finish tolerates an unchanged-edit error (called twice, or same text as shown)', async () => {
+    const edit = vi.fn(async () => {
+      throw Object.assign(new Error('x'), {
+        error_code: 400, description: 'Bad Request: message is not modified',
+      });
+    });
+    const { progress } = setup({ edit });
+    await expect(progress.finish('done')).resolves.toBeUndefined();
+    await expect(progress.finish('done')).resolves.toBeUndefined();
+    expect(edit).toHaveBeenCalledTimes(2);
   });
 
   it('fail reports the error and its next command', async () => {

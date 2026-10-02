@@ -50,6 +50,8 @@ export function createJobProgress(a: {
   let lastText: string | null = null;
   let mutedUntil = 0;
   let finished = false;
+  // The send currently on the wire, or null. Settles when the send settles and never rejects.
+  let inFlight: Promise<void> | null = null;
 
   const send = async (text: string): Promise<void> => {
     if (text === lastText) return;         // unchanged edits throw; skip before sending
@@ -76,40 +78,51 @@ export function createJobProgress(a: {
   const forceSend = async (text: string): Promise<void> => {
     try {
       await a.replier.edit(a.messageId, text);
-      lastText = text;
       return;
     } catch (err) {
-      if (isUnchangedEdit(err)) { lastText = text; return; }
+      if (isUnchangedEdit(err)) return;
       const wait = retryAfterSeconds(err);
       if (wait === undefined) throw err;
       await sleep(Math.min(wait, MAX_FINAL_RETRY_WAIT_S) * 1_000);
       await a.replier.edit(a.messageId, text);
-      lastText = text;
     }
   };
 
   return {
     async onChunk({ fromBlock, toBlock, rows, source }) {
-      // The final message is the result; a tick still in flight must not clobber it.
+      // The final message is the result. A tick arriving after finish/fail is dropped here;
+      // a tick already in flight is awaited by finish/fail before they write the result.
+      // A tick arriving while another is in flight is dropped too, so two ticks never race
+      // and a stale progress line is never queued behind a slow edit.
       if (finished) return;
+      if (inFlight !== null) return;
       const now = a.clock.now();
       if (now < mutedUntil) return;
       if (lastSentAt !== null && now - lastSentAt < intervalMs) return;
-      await send(
-        `${a.header}\n` +
-        `  via ${source}\n` +
-        `  blocks ${fromBlock}-${toBlock}\n` +
-        `  rows ${rows}`,
-      );
+      let release!: () => void;
+      inFlight = new Promise<void>((r) => { release = r; });
+      try {
+        await send(
+          `${a.header}\n` +
+          `  via ${source}\n` +
+          `  blocks ${fromBlock}-${toBlock}\n` +
+          `  rows ${rows}`,
+        );
+      } finally {
+        inFlight = null;
+        release();
+      }
     },
 
     async finish(text) {
       finished = true;
+      await inFlight;   // let a tick already on the wire land first, so the result is written last
       await forceSend(text);
     },
 
     async fail(reported, nextCommand) {
       finished = true;
+      await inFlight;
       const lines = [a.header, '', `failed: ${reported.headline}`, '', `  ${reported.detail}`];
       if (reported.hint) lines.push('', `  ${reported.hint}`);
       if (nextCommand) lines.push('', `  next: ${nextCommand}`);
