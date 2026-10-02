@@ -22,6 +22,11 @@
 - Any test pinning a concurrency, security, idempotency or atomicity property is **mutation-verified** before it counts as done, with both results reported. Mutation work goes on a branch or a stash, never an in-place edit.
 - Assert behaviour, not configuration. Derive expectations from the spec, not from the fixture.
 - Messages are sent with **no `parse_mode`**.
+- **Do not enable grammY's `sensitiveLogs`.** It defaults to false, which keeps the
+  underlying error message out of an `HttpError`; enabling it widens the path by which a
+  token-bearing URL reaches output. The scrub guard is the guarantee, not this default.
+- **Do not add a poll-loop retry.** grammY already retries `getUpdates` on everything
+  except 401 and 409, and a second layer would fight it.
 - `npm test` and `npm run typecheck` pass before the milestone is called done.
 - Never `git push` without asking.
 
@@ -95,7 +100,24 @@ grep -rn "retry\|backoff" node_modules/grammy/out/core/client.js | head -20
 grep -rn "autoRetry\|throttle" node_modules/grammy/out/ | head
 ```
 
-Four questions the notes must answer with a quotation from the source, not a recollection:
+**Already done — see `docs/superpowers/notes/2026-10-02-grammy-behaviour.md`.** The four
+source-readable questions are answered there with quotations. Summary, because two of them
+change whether later tasks work at all:
+
+1. `GrammyError` carries typed readonly `error_code`, `description` and `parameters`;
+   `HttpError` is the separate transport-failure class.
+2. `retry_after` IS typed, as `parameters.retry_after?: number`. Optional, hence the
+   description fallback.
+3. grammY retries `getUpdates` in the poll loop but **rethrows 401 and 409** — so Task 12's
+   exit genuinely fires. `withRetries` wraps only `getMe` and `deleteWebhook` at startup.
+   **Ordinary API calls are NOT retried**, so Task 8's 429 branch is reachable; had the
+   client retried internally that branch and its test would have been vacuous.
+4. `@grammyjs/auto-retry` and `@grammyjs/transformer-throttler` are separate packages and
+   are not installed. Our throttle is the only one.
+
+Plus an incidental finding: `sensitiveLogs` defaults to false and must stay that way.
+
+The four questions, for the record:
 
 1. What class is thrown for a Bot API error, and does it expose `error_code` and `description` as typed properties?
 2. Is `retry_after` reachable as a typed property (for example `err.parameters.retry_after`), or only inside `description` as text? **If it is only in text, every retry decision depends on string parsing and that must be stated.**
