@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type Database from 'better-sqlite3';
-import { handleIndex, nextCommand } from '../../src/bot/commands/index.js';
+import {
+  handleIndex as handleIndexWithPrepare, nextCommand, type HandleIndexDeps, type IndexRun,
+} from '../../src/bot/commands/index.js';
 import { createJobRegistry } from '../../src/bot/jobs.js';
 import { manualClock } from '../../src/clock.js';
 import { openDb } from '../../src/db/connection.js';
@@ -15,6 +17,22 @@ import { Writable } from 'node:stream';
 const ADDR = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
 const SUMMARY = 'DRY RUN REPORT: 4200 blocks, 12 chunks, about 30s';
 const flush = () => new Promise<void>((r) => setImmediate(r));
+
+/**
+ * The handler takes ONE `prepare` (the label, estimate and run come from a single build),
+ * but most of these tests are about what the handler does with an estimate or a run. This
+ * adapter lets each test keep supplying them separately: it builds the `IndexRun` from the
+ * three loose fields, so `prepare` is still the only path the handler can take them by.
+ * The one test that is about `prepare` itself (the label) lives in botIndexRun.test.ts.
+ */
+type LooseDeps = Omit<HandleIndexDeps, 'prepare'> & Pick<IndexRun, 'fetchPath' | 'estimate' | 'runBackfill'>;
+function handleIndex(d: LooseDeps): Promise<void> {
+  const { fetchPath, estimate, runBackfill, ...rest } = d;
+  return handleIndexWithPrepare({
+    ...rest,
+    prepare: async () => ({ fetchPath, estimate, runBackfill }),
+  });
+}
 
 let db: Database.Database;
 beforeEach(() => { db = openDb(':memory:'); runMigrations(db); });

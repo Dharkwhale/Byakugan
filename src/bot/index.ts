@@ -18,8 +18,9 @@ import { createLogger } from '../logger.js';
 import { EXIT, formatError, describeError } from '../report.js';
 import {
   CONFIRM_THRESHOLD_SECONDS, STALE_LOCK_MS, buildBot, classifyStartupFailure,
-  requireBotConfig, task13Placeholders, writeDropLog, writeHandlerError,
+  requireBotConfig, writeDropLog, writeHandlerError,
 } from './app.js';
+import { makePrepare } from './indexRun.js';
 import { createJobRegistry } from './jobs.js';
 
 async function main(): Promise<number> {
@@ -46,8 +47,8 @@ async function main(): Promise<number> {
     confirmThresholdSeconds: CONFIRM_THRESHOLD_SECONDS,
     logDrop: writeDropLog,
     onHandlerError: writeHandlerError,
-    // Task 13 replaces these. They throw until then; see `task13Placeholders`.
-    ...task13Placeholders(),
+    // One chain-facing build per /index command; the label, estimate and run share it.
+    prepare: makePrepare({ config, db, clock: systemClock, staleLockMs: STALE_LOCK_MS }),
   });
 
   try {

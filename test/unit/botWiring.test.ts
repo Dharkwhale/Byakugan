@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import type { Update } from 'grammy/types';
-import { buildBot, task13Placeholders, type BotDeps } from '../../src/bot/app.js';
+import { buildBot, type BotDeps } from '../../src/bot/app.js';
+import type { IndexRun } from '../../src/bot/commands/index.js';
 import { createJobRegistry } from '../../src/bot/jobs.js';
 import { manualClock } from '../../src/clock.js';
 import { openDb } from '../../src/db/connection.js';
@@ -48,9 +49,11 @@ function setup(over: Partial<BotDeps> = {}) {
     logger: createLogger([], new Writable({ write(_c, _e, cb) { cb(); } })),
     defaultChainId: 1,
     chainName: (id) => (id === 8453 ? 'base' : id === 1 ? 'ethereum' : `chain ${id}`),
-    fetchPath: () => 'getAssetTransfers',
-    estimate: estimate as BotDeps['estimate'],
-    runBackfill: runBackfill as unknown as BotDeps['runBackfill'],
+    prepare: async () => ({
+      fetchPath: 'getAssetTransfers',
+      estimate: estimate as unknown as IndexRun['estimate'],
+      runBackfill: runBackfill as unknown as IndexRun['runBackfill'],
+    }),
     staleMs: 900_000,
     confirmThresholdSeconds: 300,
     logDrop: (m) => { drops.push(m); },
@@ -165,7 +168,11 @@ describe('chat output is scrubbed through the wiring', () => {
     const FAKE_URL = `see ${FAKE_KEY} here`;
     const { bot, calls } = setup({
       secrets: [FAKE_KEY],
-      estimate: async () => { throw new Error(`request to ${FAKE_URL} failed`); },
+      prepare: async () => ({
+        fetchPath: 'getLogs',
+        estimate: async () => { throw new Error(`request to ${FAKE_URL} failed`); },
+        runBackfill: async () => { throw new Error('unreachable'); },
+      }),
     });
     await bot.handleUpdate(command(ALLOWED, `/index ${ADDR}`));
     await flush();
@@ -232,28 +239,21 @@ describe('chat output is scrubbed through the wiring', () => {
   });
 });
 
-describe('Task 13 placeholders fail loudly', () => {
-  it('each one throws and names Task 13, rather than returning a value', async () => {
-    const p = task13Placeholders();
-    await expect(p.estimate({ chainId: 1, contract: ADDR })).rejects.toThrow(/Task 13/);
-    await expect(p.runBackfill({
-      chainId: 1, contract: ADDR, level: 'full', onProgress: () => undefined,
-    })).rejects.toThrow(/Task 13/);
-    expect(() => p.fetchPath()).toThrow(/Task 13/);
-  });
-
-  it('an unwired /index starts NO job and tells the user it failed, never "Indexing"', async () => {
-    const { bot, calls, deps } = setup({ ...task13Placeholders() });
-    // `--yes` and a long run would pass an inert gate; a dry run would reply with nothing.
+describe('a failing prepare', () => {
+  it('starts NO job and tells the user, never "Indexing"', async () => {
+    const { bot, calls, deps } = setup({
+      prepare: async () => { throw new Error('the chain is unreachable'); },
+    });
+    // `--yes` and a dry run both go through prepare; neither may start anything.
     for (const text of [`/index ${ADDR}`, `/index ${ADDR} --yes`, `/index ${ADDR} --dry-run`]) {
       await bot.handleUpdate(command(ALLOWED, text));
     }
     await flush();
     expect(deps.registry.inspect(db, { chainId: 1, contract: ADDR }).kind).toBe('idle');
+    expect(calls.length).toBeGreaterThan(0);
     for (const c of calls) {
       expect(c.text ?? '').not.toMatch(/^Indexing /);
-      // The reply must SAY the command is not wired, not merely be non-empty.
-      expect(c.text ?? '').toMatch(/not wired|Task 13/);
+      expect(c.text ?? '').toMatch(/unreachable/);
     }
   });
 });

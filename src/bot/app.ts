@@ -95,26 +95,6 @@ export function classifyStartupFailure(
   return undefined;
 }
 
-/**
- * Stand-ins for the dependencies Task 13 supplies (the chain-facing half of `/index`).
- *
- * EVERY ONE THROWS. A placeholder that returned a plausible value would be a silent
- * defect, not a stub: `estimate` returning `{ seconds: 0, summary: '' }` makes the
- * confirmation gate inert (nothing ever exceeds the threshold) and `--dry-run` reply with
- * an empty report, and that is exactly the shape of the dry-run-only capability probe this
- * project has already shipped — correct code, correctly wired, quietly doing nothing.
- */
-export function task13Placeholders(): Pick<BotDeps, 'estimate' | 'runBackfill' | 'fetchPath'> {
-  const notWired = (what: string): never => {
-    throw new Error(`${what} is not wired yet: it is supplied by Task 13.`);
-  };
-  return {
-    estimate: async () => notWired('/index estimate'),
-    runBackfill: async () => notWired('/index runBackfill'),
-    fetchPath: () => notWired('/index fetchPath'),
-  };
-}
-
 /** What `main` passes as `logDrop`: to stderr, where the stream scrub covers it. */
 export function writeDropLog(message: string): void {
   process.stderr.write(`${message}\n`);
@@ -137,10 +117,11 @@ export interface BotDeps {
   defaultChainId: number | undefined;
   /** Looked up per command with the PARSED chain id; see `HandleIndexDeps.chainName`. */
   chainName(chainId: number): string;
-  /** A function so a placeholder can throw when asked rather than at construction. */
-  fetchPath(): string;
-  estimate: HandleIndexDeps['estimate'];
-  runBackfill: HandleIndexDeps['runBackfill'];
+  /**
+   * ONE chain-facing build per /index command: the progress label, the estimate and the run
+   * all come from what this returns. See `HandleIndexDeps.prepare`.
+   */
+  prepare: HandleIndexDeps['prepare'];
   staleMs: number;
   confirmThresholdSeconds: number;
   /** Where "dropped an update from user N" goes. Never a chat. */
@@ -213,25 +194,12 @@ export function buildBot(d: BotDeps): Bot {
 
   bot.command('index', async (ctx) => {
     const replier = makeReplier(ctx);
-    let fetchPath: string;
-    try {
-      fetchPath = d.fetchPath();
-    } catch (err) {
-      // Before the job exists, so the user is told rather than left with silence.
-      const reported = describeError(err);
-      await replier.reply(`${reported.headline}
-
-  ${reported.detail}`);
-      return;
-    }
     await handleIndex({
       text: ctx.message?.text ?? '', replier, db: d.db, clock: d.clock,
       registry: d.registry, logger: d.logger, defaultChainId: d.defaultChainId,
       chainName: d.chainName,
-      fetchPath,
       confirmThresholdSeconds: d.confirmThresholdSeconds,
-      estimate: d.estimate,
-      runBackfill: d.runBackfill,
+      prepare: d.prepare,
     });
   });
 

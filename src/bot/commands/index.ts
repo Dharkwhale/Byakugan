@@ -33,6 +33,28 @@ export function nextCommand(
   return undefined;
 }
 
+export interface IndexRun {
+  /**
+   * Which source the run will use, for the registry and the progress line. Named from the
+   * first edit, so it is known before the job ends rather than read off the result.
+   */
+  fetchPath: string;
+  runBackfill(a: {
+    chainId: number; contract: string; level: ParsedArgs['level'];
+    toBlock?: bigint; deployBlock?: number;
+    onProgress(ctx: { fromBlock: bigint; toBlock: bigint; inserted: number }): void;
+  }): Promise<BackfillResult>;
+  /**
+   * Expected duration, plus the full dry-run report for `--dry-run`. `summary` is built
+   * from the CLI's `formatEstimate`, so the bot reports a dry run in the same format.
+   */
+  estimate(a: {
+    chainId: number; contract: string; level: ParsedArgs['level'];
+    toBlock?: bigint; deployBlock?: number;
+  }):
+    Promise<{ seconds: number; summary: string }>;
+}
+
 export interface HandleIndexDeps {
   text: string;
   replier: Replier;
@@ -57,29 +79,21 @@ export interface HandleIndexDeps {
    */
   chainName(chainId: number): string;
   /**
-   * Which source the run will use, for the registry and the progress line.
+   * Builds everything chain-facing for ONE command, once, and returns the label, the
+   * estimate and the run from that single build.
    *
-   * Passed in rather than read off the result, because the result only exists when the
-   * job ENDS and the progress line has to name it from the first edit. Naming it is the
-   * whole point: a capability probe wired into the dry-run path only meant every real CLI
-   * run silently used getLogs, finishing correctly in seventy chunks where one page would
-   * have done, and nothing in the output said so.
-   */
-  fetchPath: string;
-  runBackfill(a: {
-    chainId: number; contract: string; level: ParsedArgs['level'];
-    toBlock?: bigint; deployBlock?: number;
-    onProgress(ctx: { fromBlock: bigint; toBlock: bigint; inserted: number }): void;
-  }): Promise<BackfillResult>;
-  /**
-   * Expected duration, plus the full dry-run report for `--dry-run`. Injected so the
-   * handler needs no chain.
+   * This is one call rather than three separate dependencies because the real fetch path is
+   * only knowable after probing a SPECIFIC contract on a specific chain, and the command's
+   * chain and contract are not known until it has been parsed. A label supplied separately
+   * from the run can come from a different probe than the one the run uses, and then the
+   * progress line names a path the run did not take: the dry-run-only capability probe
+   * defect, shipped once already, wearing a new hat. Nothing here can read the label from
+   * anywhere but the same `IndexRun` that runs the job.
    *
-   * `summary` is built by the caller from the CLI's `formatEstimate`, so the bot reports a
-   * dry run in the same format the CLI does rather than growing a thinner one of its own.
+   * A throw is reported to the user with its next action, like an estimate failure.
    */
-  estimate(a: { chainId: number; contract: string; toBlock?: bigint; deployBlock?: number }):
-    Promise<{ seconds: number; summary: string }>;
+  prepare(a: { chainId: number; contract: string; deployBlock?: number }):
+    Promise<IndexRun>;
   confirmThresholdSeconds: number;
 }
 
@@ -136,10 +150,15 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
     return;
   }
 
+  let run: IndexRun;
   let estimated: { seconds: number; summary: string };
   try {
-    estimated = await d.estimate({
+    run = await d.prepare({
       chainId, contract,
+      ...(deployBlock === undefined ? {} : { deployBlock }),
+    });
+    estimated = await run.estimate({
+      chainId, contract, level,
       ...(toBlock === undefined ? {} : { toBlock }),
       ...(deployBlock === undefined ? {} : { deployBlock }),
     });
@@ -179,12 +198,12 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
 
   // CLAIM HERE: after every gate that starts nothing (dry run, confirmation), and BEFORE
   // the reply that promises progress. `inspect` above and this claim are separated by
-  // `await d.estimate` — a window in which a second `/index` for the same collection also
+  // `await run.estimate` — a window in which a second `/index` for the same collection also
   // passed `inspect`. Gating only on `inspect` let both reach the "progress follows" reply,
   // and the loser then hit `start`'s throw having already told its user a job was running.
   // Claiming is synchronous insert-if-absent, so exactly one of them wins and the loser
   // is told before it says anything it cannot honour.
-  const claim = d.registry.claim({ chainId, contract, source: d.fetchPath });
+  const claim = d.registry.claim({ chainId, contract, source: run.fetchPath });
   if (claim === null) {
     const other = d.registry.inspect(d.db, { chainId, contract });
     await d.replier.reply(
@@ -233,7 +252,7 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
       },
       run: async () => {
         let rows = 0;
-        const result = await d.runBackfill({
+        const result = await run.runBackfill({
           chainId, contract, level,
           ...(toBlock === undefined ? {} : { toBlock }),
           ...(deployBlock === undefined ? {} : { deployBlock }),
@@ -245,7 +264,7 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
             // reporter goes quiet and logs it once); what does is a transient one, and the
             // next tick tries again, so this logs at warn rather than error.
             progress.onChunk({
-              fromBlock: ctx.fromBlock, toBlock: ctx.toBlock, rows, source: d.fetchPath,
+              fromBlock: ctx.fromBlock, toBlock: ctx.toBlock, rows, source: run.fetchPath,
             }).catch((editErr: unknown) => {
               d.logger.warn(
                 { err: editErr, chainId, contract },

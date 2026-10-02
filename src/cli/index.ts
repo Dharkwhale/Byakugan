@@ -12,24 +12,17 @@
  */
 import '../outputScrubbing.js';
 
-import { getChainClient } from '../chain/client.js';
-import { resolveDeployBlock } from '../chain/deployBlock.js';
-import { makeSupportsInterface, detectStandard } from '../chain/standard.js';
-import { makeTxSource } from '../chain/tx.js';
-import { makeAssetTransfersFetcher } from '../chain/assetTransfersRpc.js';
-import {
-  makeAssetTransfersSource, makeLogsSource, supportsAssetTransfers, withFallback,
-} from '../indexer/transferSource.js';
-import { CU_COSTS, VERIFIED as CU_VERIFIED, callsPerSecond } from '../chain/cuCosts.js';
+import { detectStandard } from '../chain/standard.js';
+import { makeBackfillPorts } from '../chain/ports.js';
+import { VERIFIED as CU_VERIFIED, callsPerSecond } from '../chain/cuCosts.js';
 import { systemClock } from '../clock.js';
 import { loadConfig, type ChainConfig, type Config } from '../config.js';
 import { openDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrate.js';
-import { backfill, type BackfillPorts } from '../indexer/backfill.js';
+import { backfill } from '../indexer/backfill.js';
 import { probeEffectiveChunk } from '../indexer/logs.js';
 import { newJobId } from '../jobId.js';
 import { ConfigError } from '../errors.js';
-import type { Address, Hash } from '../types.js';
 import { parseArgs, USAGE, wantsHelp, type ParsedArgs } from './args.js';
 import { estimateBackfill, formatEstimate, type CuPrices } from './estimate.js';
 import { EXIT, formatError, describeError } from '../report.js';
@@ -88,91 +81,29 @@ async function main(argv: string[]): Promise<number> {
   const chain = requireChain(config, args.chainId);
   const prices = readCuPrices(process.env);
 
-  const { client, limit } = getChainClient(args.chainId, config);
-  const chainClient = { chainId: args.chainId, client, limit };
-
-  const safeHead = async (): Promise<bigint> => {
-    const head = await limit(() => client.getBlockNumber(), CU_COSTS.eth_blockNumber);
-    const confirmed = head - BigInt(chain.confirmations);
-    // Never index to head. A collection younger than the confirmations depth has
-    // nothing safe to index yet, which is a real state rather than an error.
-    return confirmed < 0n ? 0n : confirmed;
-  };
-
-  const supports = makeSupportsInterface(client, args.contract);
-  const getCode = async (a: { address: Address; blockNumber: bigint }): Promise<string> =>
-    (await limit(() => client.getBytecode({
-      address: a.address, blockNumber: a.blockNumber,
-    }), CU_COSTS.eth_getCode)) ?? '0x';
-
-  const fetchLogs = async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
-    const logs = await limit(() => client.getLogs({
-      address: args.contract, fromBlock, toBlock,
-    }), CU_COSTS.eth_getLogs);
-    return logs.map((l) => ({
-      topics: l.topics as Hash[],
-      data: l.data as Hash,
-      transactionHash: l.transactionHash as Hash,
-      blockNumber: l.blockNumber!,
-      logIndex: l.logIndex!,
-    }));
-  };
-
-  /**
-   * Whether this endpoint serves `getAssetTransfers`, decided ONCE before indexing.
-   *
-   * It is a property of the endpoint, not of the range: a non-Alchemy RPC or an unindexed
-   * chain fails every time, so probing per chunk would turn one upfront failure into
-   * thousands. The probe's standard is irrelevant — it only asks whether the method
-   * answers at all.
-   */
-  let assetSupported = false;
-  const probeFetcher = makeAssetTransfersFetcher({
-    rpcUrl: chain.rpcUrl, limit, contract: args.contract, standard: '721',
-  });
-
-  const ports: BackfillPorts = {
-    makeTransferSource: (standard) => {
-      const logsSource = makeLogsSource({
-        fetchLogs, standard,
-        initialChunk: chain.initialChunk, maxChunk: chain.maxChunk,
-      });
-      if (args.fetchPath === 'logs' || !assetSupported) return logsSource;
-      return withFallback({
-        primary: makeAssetTransfersSource({
-          standard,
-          fetch: makeAssetTransfersFetcher({
-            rpcUrl: chain.rpcUrl, limit, contract: args.contract, standard,
-          }),
-        }),
-        secondary: logsSource,
-        onFallback: (notice) => {
-          err(
-            `warning: ${notice.from} failed, continuing with ${notice.to} from block ` +
-            `${notice.resumedAt}. The two paths are verified to produce identical rows ` +
-            `(scripts/compare-fetch-paths.ts), so the index is unaffected — only slower.
+  // ONE build: the ports, the capability probe and the label all come from it. The probe
+  // runs inside `makeBackfillPorts`, before any indexing, which is what the real run needs
+  // (the cheap path is silently never used otherwise) and what the dry run reports.
+  const built = await makeBackfillPorts({
+    config, chainId: args.chainId, contract: args.contract, fetchPath: args.fetchPath,
+    ...(args.deployBlock === undefined ? {} : { deployBlockOverride: args.deployBlock }),
+    onWarn: (message) => err(`warning: ${message}
+`),
+    onFallback: (notice) => {
+      err(
+        `warning: ${notice.from} failed, continuing with ${notice.to} from block ` +
+        `${notice.resumedAt}. The two paths are verified to produce identical rows ` +
+        `(scripts/compare-fetch-paths.ts), so the index is unaffected — only slower.
 ` +
-            `  reason: ${notice.reason}
+        `  reason: ${notice.reason}
 `,
-          );
-        },
-      });
+      );
     },
-    txSource: makeTxSource(chainClient),
-    supports,
-    resolveDeployBlock: async ({ safeHead: head }) => resolveDeployBlock({
-      getCode,
-      chainId: args.chainId,
-      address: args.contract,
-      safeHead: head,
-      archiveProbe: chain.archiveProbe,
-      override: args.deployBlock,
-      etherscanApiKey: config.etherscanApiKey,
-      explorerLimit: limit,
-      onWarn: (message) => err(`warning: ${message}\n`),
-    }),
-    safeHead,
-  };
+  });
+  const { ports, fetchLogs } = built;
+  const supports = ports.supports;
+  const assetSupported = built.fetchPath === 'getAssetTransfers';
+  const safeHead = ports.safeHead;
 
   // ---------------------------------------------------------------- dry run
   if (args.dryRun) {
@@ -197,9 +128,8 @@ async function main(argv: string[]): Promise<number> {
     // 20,000 on Base while the measured cap on this account is 10, which made a
     // 38-million-block span report as "76 seconds" instead of days. One extra call
     // buys an estimate that is worth believing.
-    const support = await supportsAssetTransfers(probeFetcher, head);
     out(
-      support.supported
+      assetSupported
         ? [
             '',
             '  fetch path        alchemy_getAssetTransfers — no range cap, roughly one',
@@ -210,7 +140,7 @@ async function main(argv: string[]): Promise<number> {
         : [
             '',
             '  fetch path        eth_getLogs only — getAssetTransfers is unavailable here',
-            `                    (${support.reason ?? 'no reason given'})`,
+            `                    (${built.fetchPathReason ?? 'no reason given'})`,
             '',
           ].join('\n'),
     );
@@ -250,21 +180,11 @@ async function main(argv: string[]): Promise<number> {
     const head = await safeHead();
     const bound = args.toBlock !== undefined && args.toBlock < head ? args.toBlock : head;
 
-    // The capability probe, ONCE, before any indexing. `assetSupported` is read by
-    // `makeTransferSource`, which backfill calls after bootstrap — so this must run first
-    // or the cheap path is silently never used, which is exactly what happened the first
-    // time this was wired: the run completed, produced correct rows, and took 70 getLogs
-    // chunks instead of one page. Nothing looked wrong.
-    const support = args.fetchPath === 'logs'
-      ? { supported: false, reason: 'forced by --fetch-path logs' }
-      : await supportsAssetTransfers(probeFetcher, head);
-    assetSupported = support.supported;
-
     out(
       `indexing ${args.contract} on chain ${args.chainId} (${chain.name}) at level ${args.level}\n` +
       (assetSupported
         ? '  via alchemy_getAssetTransfers, falling back to eth_getLogs on failure\n'
-        : `  via eth_getLogs (${support.reason ?? 'getAssetTransfers unavailable'})\n`),
+        : `  via eth_getLogs (${built.fetchPathReason ?? 'getAssetTransfers unavailable'})\n`),
     );
 
     const reporter = createProgressReporter({
