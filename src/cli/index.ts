@@ -32,7 +32,7 @@ import { ConfigError } from '../errors.js';
 import type { Address, Hash } from '../types.js';
 import { parseArgs, USAGE, wantsHelp, type ParsedArgs } from './args.js';
 import { estimateBackfill, formatEstimate, type CuPrices } from './estimate.js';
-import { EXIT, formatError, reportError } from './exit.js';
+import { EXIT, formatError, describeError } from '../report.js';
 import { createProgressReporter } from './progress.js';
 
 const out = (s: string): void => { process.stdout.write(s); };
@@ -315,7 +315,7 @@ const argv = process.argv.slice(2);
 try {
   process.exitCode = await main(argv);
 } catch (error) {
-  const reported = reportError(error);
+  const reported = describeError(error);
   err(formatError(reported, { verbose: argv.includes('--verbose'), err: error }));
   process.exitCode = reported.exitCode;
 }

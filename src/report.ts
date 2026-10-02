@@ -1,9 +1,19 @@
+/**
+ * Turning any thrown value into something worth printing, plus the exit-code table.
+ *
+ * LIVES IN src/, NOT src/cli/, because the Telegram bot needs the same mapping and a
+ * second one would drift. An earlier design split it — prose here, exit codes left in
+ * src/cli/ — and that was wrong: the bot's startup path needs EXIT too, so the split
+ * would have had the bot importing from src/cli/, which is the layering smell the
+ * split existed to remove. Exit codes are not CLI-specific; both front ends are
+ * processes that exit. The bot ignores `exitCode` in replies and uses it on startup.
+ */
 import { BaseError, HttpRequestError, TimeoutError } from 'viem';
 import {
   ByakuganError, ClassifyError, CollectionLockedError, ConfigError, DecodeError,
   DeployBlockUnavailableError, EnrichmentLevelError, MigrationError, RangeExhaustedError,
   TxEnrichmentError, UnsupportedStandardError, UsageError,
-} from '../errors.js';
+} from './errors.js';
 
 /**
  * Exit codes, grouped so a wrapping script can act on the CATEGORY without knowing
@@ -78,7 +88,7 @@ export interface Reported {
  * this code raised deliberately — but its absence from the specific list is why the
  * test asserts every exported class is mapped.
  */
-export function reportError(err: unknown): Reported {
+export function describeError(err: unknown): Reported {
   // Order matters: subclasses before the ByakuganError catch-all.
   if (err instanceof UsageError) {
     return {
