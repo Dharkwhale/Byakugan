@@ -184,6 +184,36 @@ user see?" and "would this test fail if the value shown were wrong rather than
 missing?" — assert the content, with a value that could only come from the real
 source.
 
+**And a third instance, which is why the note above became the rule below.**
+`/status` replied "is not indexed — /index 0x…" for the whole of a live first
+index. `getCollection` reads `not_indexed` until `standard` is set, and the
+deploy-block search runs before that, so the longest part of a first run was
+reported as nothing happening — and the reply told the user to start a second
+job. Correct code, correctly wired, three times now, hiding the one thing it
+existed to show. Three instances and no structural guard means the questions
+above are not enough: they are asked of the states someone thought to test.
+
+**So: a command or output whose purpose is visibility is tested in EVERY state
+the underlying thing can occupy, and the list of states is enumerated from the
+state machine — not from the states that seemed worth testing.** Write the
+states down first, from the data model and the lifecycle, then write one test
+per state. A state with no test is a state that ships unseen, and "that one
+can't happen" is a claim to prove with a test, not an exemption.
+
+For `/status` the enumeration is, at minimum:
+
+- **absent** — nothing in `collections`, no lock, no job
+- **claimed, not bootstrapped** — a row exists, `standard` still NULL
+- **bootstrapping** — a job running in this process, still no `standard`
+- **indexing** — a job running, `standard` set, watermark below target
+- **complete** — no job, watermark at target
+- **orphaned lock, live** — lock row, no map entry, `now <= expiresAt`
+- **orphan expired** — lock row, no map entry, `now > expiresAt`
+
+The two that had no test were the two that were broken. The enumeration is what
+makes that visible before a user finds it, and it belongs in the plan's task,
+not in the reviewer's head.
+
 ### Derive expectations from the spec, never from the fixture
 
 When a fixture is hand-authored — ABI-encoded log data, a hex blob, a
@@ -199,6 +229,44 @@ Prefer generating adversarial or malformed fixtures programmatically
 (`encodeAbiParameters`) over hand-computing offsets: the encoder is correct by
 construction, and a malformed shape usually cannot be captured from a
 compliant chain anyway.
+
+### Where a test depends on exact bytes, assert the bytes
+
+**When a test's meaning rests on a precise byte sequence — a control character,
+an RTL or bidi mark, a zero-width character, an encoded or escaped form, a
+specific line ending — assert that sequence against the file or value itself.
+Do not read the source and judge it correct.** Reading proves what you believe
+you wrote; counting proves what is there.
+
+This exists because fixing a one-line escape took three attempts, and the first
+two produced a *plausible wrong answer* rather than an error:
+
+- The intent was a test constant holding U+202E written as the escape `‮`,
+  so the invisible character would not sit in the file that tests the defence
+  against it. Attempt one went through a tool-call's JSON, which parsed the
+  escape into the character — leaving a literal under a comment claiming an
+  escape, which is the exact defect being repaired.
+- Attempt two produced **two** backslashes. TypeScript reads that as the
+  six-character text `‮`, not the override character, so
+  `expect(reply).not.toContain(RLO)` would have passed against output that still
+  carried the real override. A green test proving nothing.
+- Attempt three wrote the byte with `chr(92)` in Python, bypassing both layers,
+  and was settled by counting: one backslash on the line, zero literal U+202E
+  anywhere in the file.
+
+Three escaping layers sat between the intention and the file — the tool-call
+JSON, bash heredoc backslash handling, and TypeScript's own string escapes — and
+two of them failed silently in the direction of looking right. **This is the same
+shape as `INSERT OR IGNORE` suppressing a `CHECK` violation: the mechanism
+absorbs the error and returns something that resembles success.** The remedy is
+the same too — stop asking the mechanism whether it worked, and measure the
+result.
+
+In practice: after writing such a value, count it (`line.count(chr(92))`, a
+search for the literal character across the whole file, `od -c` on the region).
+And when a test depends on a constant like this, **re-run its mutant after
+changing the constant** — a mutation run against the old value proves nothing
+about the new one.
 
 ### Assert behaviour, not configuration
 
