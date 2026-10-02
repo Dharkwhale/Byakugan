@@ -173,6 +173,63 @@ describe('chat output is scrubbed through the wiring', () => {
     expect(text).toContain('failed');
     expect(text).not.toContain(FAKE_KEY);
   });
+
+  /**
+   * Captures what would actually go over the wire.
+   *
+   * MEASURED, not assumed: grammY calls the LAST-installed transformer FIRST, so the scrub
+   * `buildBot` installs is the INNERMOST one — correct, since nothing downstream can then
+   * reintroduce a secret, but it means a test recorder installed afterwards short-circuits
+   * above it and sees pre-scrub payloads. Stubbing `client.fetch` instead observes the
+   * request after every transformer has run, which is the only position that proves what
+   * leaves the process. Nothing is sent: the stub never calls the network.
+   */
+  function wireTap() {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchStub = (async (_url: unknown, init: unknown) => {
+      const body = (init as { body?: string } | undefined)?.body;
+      if (typeof body === 'string') bodies.push(JSON.parse(body) as Record<string, unknown>);
+      return {
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: 7, date: 0, chat: { id: 1 } } }),
+      };
+    }) as unknown as typeof fetch;
+    return { bodies, fetchStub };
+  }
+
+  it('scrubs a handler that BYPASSES the replier and calls ctx.api directly', async () => {
+    // The replier's scrubbing is a convention every handler has to follow. This is the gate
+    // that does not depend on remembering: the transformer sits under every outbound call,
+    // whatever made it, so a handler written later that reaches for `ctx.api` cannot leak.
+    const FAKE_KEY = 'zz-fake-secret-ZXCV0987654321';
+    const { bodies, fetchStub } = wireTap();
+    // buildBot directly, not via setup(): setup installs a recording transformer, and
+    // being installed LAST it runs first and short-circuits above the scrub.
+    const { deps } = setup({ secrets: [FAKE_KEY] });
+    const bot = buildBot({ ...deps, botConfig: { botInfo, client: { fetch: fetchStub } } });
+    bot.command('direct', async (ctx) => {
+      await ctx.api.sendMessage(ctx.chat!.id, `leaking ${FAKE_KEY} straight out`);
+    });
+    await bot.handleUpdate(command(ALLOWED, '/direct'));
+    await flush();
+    const sent = bodies.map((b) => String(b.text ?? '')).join('\n');
+    expect(sent).toContain('leaking');
+    expect(sent).not.toContain(FAKE_KEY);
+  });
+
+  it('leaves non-string payload fields alone, so an upload is not reshaped', async () => {
+    const FAKE_KEY = 'zz-fake-secret-ZXCV0987654321';
+    const { bodies, fetchStub } = wireTap();
+    const { deps } = setup({ secrets: [FAKE_KEY] });
+    const bot = buildBot({ ...deps, botConfig: { botInfo, client: { fetch: fetchStub } } });
+    bot.command('direct', async (ctx) => {
+      await ctx.api.sendMessage(ctx.chat!.id, 'hello', { disable_notification: true });
+    });
+    await bot.handleUpdate(command(ALLOWED, '/direct'));
+    await flush();
+    expect(bodies[0]).toMatchObject({ disable_notification: true, text: 'hello' });
+    expect(typeof bodies[0]!.chat_id).toBe('number');
+  });
 });
 
 describe('Task 13 placeholders fail loudly', () => {

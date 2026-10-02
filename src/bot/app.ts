@@ -15,7 +15,7 @@ import { EXIT, describeError, formatError, type ExitCode } from '../report.js';
 import { isConflict, isUnauthorized } from '../telegram/failures.js';
 import { allowOnly } from './auth.js';
 import type { JobRegistry } from './jobs.js';
-import { deriveSecretTokens } from '../secrets.js';
+import { deriveSecretTokens, scrubSecrets } from '../secrets.js';
 import { makeReplier as makeScrubbedReplier } from './replier.js';
 import { handleIndex, type HandleIndexDeps } from './commands/index.js';
 import { handleStatus } from './commands/status.js';
@@ -166,6 +166,28 @@ export function buildBot(d: BotDeps): Bot {
   // Derived ONCE; every outbound chat string is scrubbed with these inside the replier.
   const tokens = deriveSecretTokens(d.secrets);
   const makeReplier = (ctx: Context) => makeScrubbedReplier(ctx, tokens);
+
+  // THE LAST GATE, below the replier and independent of it.
+  //
+  // The replier scrubs because it is the one place commands send text from — but that is a
+  // CONVENTION, and a future handler calling `ctx.reply` or `ctx.api.sendMessage` directly
+  // would walk straight past it. A grammY transformer sits under every outbound call
+  // whatever made it, so the guarantee stops depending on each new handler remembering,
+  // which is the failure this project has already paid for once.
+  //
+  // Installed BEFORE any other transformer, so it runs outermost and anything registered
+  // later (a test recorder, say) observes payloads that are already scrubbed.
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    const source = payload as unknown as Record<string, unknown>;
+    const scrubbed: Record<string, unknown> = {};
+    // Strings only. A document's InputFile and every number, boolean and nested object are
+    // passed through untouched: this guards the text that a human reads, and must not
+    // reshape an upload on its way out.
+    for (const [field, value] of Object.entries(source)) {
+      scrubbed[field] = typeof value === 'string' ? scrubSecrets(value, tokens) : value;
+    }
+    return prev(method, scrubbed as typeof payload, signal);
+  });
 
   // FIRST, before any handler.
   bot.use(allowOnly(d.allowedUserIds, d.logDrop));
