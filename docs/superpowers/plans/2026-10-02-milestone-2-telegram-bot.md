@@ -2772,7 +2772,13 @@ describe('classifyStartupFailure', () => {
       api(409, 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running'),
     );
     expect(result?.exitCode).toBe(EXIT.BUSY);
-    expect(result?.message).toMatch(/displaced|taken over/i);
+    expect(result?.message).toMatch(/taken over/i);
+    // Names the likely cause, so the operator looks for the old process rather than
+    // treating it as a transient failure.
+    expect(result?.message).toMatch(/older process still running/i);
+    // Says what it costs: the displaced process's in-flight jobs are gone.
+    expect(result?.message).toMatch(/orphaned/i);
+    expect(result?.message).toContain(String(process.pid));
     // It must NOT tell the operator to restart this one, which would just displace the
     // other instance in turn and trade places forever.
     expect(result?.message).toMatch(/flip-flop|trade places|find and stop/i);
@@ -2879,11 +2885,18 @@ export function classifyStartupFailure(
     return {
       exitCode: EXIT.BUSY,
       message:
-        'Another instance of this bot has taken over polling, and this one has been ' +
-        'displaced — Telegram terminates the existing getUpdates request when a new one ' +
-        'arrives, so this process can no longer receive updates. Do NOT simply restart it: ' +
-        'that would displace the other instance in turn and the two would trade places. ' +
-        'Find and stop the other instance first.',
+        `Another instance has taken over polling and this one (pid ${process.pid}) is ` +
+        'stopping. Telegram terminates the existing getUpdates request when a new one ' +
+        'arrives, so this process can no longer receive updates.
+' +
+        '  The likely cause is an older process still running — check for one before ' +
+        'assuming this was a one-off.
+' +
+        '  Do NOT simply restart this instance: it would displace the other in turn and ' +
+        'the two would trade places indefinitely. Find and stop the other one first.
+' +
+        '  Any /index job that was running here has died; its collection lock clears on ' +
+        'the stale timeout and /status reports it as orphaned until then.',
     };
   }
   if (isUnauthorized(err)) {
@@ -2898,6 +2911,12 @@ export function classifyStartupFailure(
 async function main(): Promise<number> {
   const config = loadConfig();
   const { token, allowedUserIds } = requireBotConfig(config);
+
+  // The pid, on every start. A handover leaves no error anywhere once the displaced process
+  // is gone — the new bot works, the old one vanishes, and neither chat shows anything — so
+  // without this a flip-flop is diagnosed by guessing.
+  process.stderr.write(`byakugan bot starting, pid ${process.pid}
+`);
 
   const db = openDb(config.dbPath);
   runMigrations(db);

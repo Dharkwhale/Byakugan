@@ -317,12 +317,36 @@ The entry point exits rather than retrying on two conditions:
   Measured against a live bot (see the Task 1 notes), and the opposite of what this spec
   first assumed: two concurrent `getUpdates` and the SECOND succeeds while the FIRST is
   rejected with *"terminated by other getUpdates request"*. Telegram does not refuse the
-  newcomer; it kills the request already in flight. So there is no split-brain — only one
-  poller ever receives updates — but the process that sees a 409 is the one being replaced,
-  and it cannot poll at all. It exits `EXIT.BUSY`, and its message says it was displaced and
-  that restarting it blindly would displace the other in turn and trade places. It does
-  **not** retry.
-- **401 Unauthorized** means the token is wrong; exits `EXIT.USAGE`.
+  newcomer; it kills the request already in flight. The process that sees a 409 is therefore
+  the one being replaced, and it cannot poll at all. It exits `EXIT.BUSY` and does **not**
+  retry.
+
+  **The exit message must state the handover plainly**, because nothing else will. It says
+  that another instance has taken over, that this one is stopping, and that the likely cause
+  is an older process still running — and it does not advise restarting, which would displace
+  the other in turn and trade places indefinitely.
+
+- **The startup log records the process id.** A handover leaves no error anywhere once the
+  displaced process is gone: the new bot works, the old one vanishes, and neither chat shows
+  anything. A pid in the log is what makes a flip-flop diagnosable from logs rather than from
+  guessing, and it is one line.
+
+### What a handover actually costs
+
+Worth writing down, because it is milder than the split-brain this spec first assumed and
+not harmless either.
+
+- **Update delivery is never split.** Exactly one poller receives updates at any moment, so
+  no message is handled twice and none is lost to a race.
+- **The displaced process exits on its NEXT poll**, which is prompt but not instant. Until
+  then two processes are alive against the same SQLite file, and the collection lock is what
+  keeps their work from colliding — which is what it was built for.
+- **Its detached jobs die with it.** This is the real cost. A `/index` running in the
+  displaced process is killed mid-run; the per-chunk atomic commit means nothing is corrupt
+  and the watermark stays honest, but the job is gone and its collection lock survives until
+  the stale timeout. `/index` and `/status` already report that as the **orphaned** state, so
+  the user sees a true explanation rather than silence — which is the reason that state
+  exists.
 
 **Mutation target:** retrying on 409 instead of exiting must fail a test.
 
@@ -363,7 +387,13 @@ in `secrets`.
   lock expires, `/index` reports the orphan state.
 - **No `/cancel`.** A started job runs to completion or failure. The confirmation gate is
   what prevents starting the wrong one.
-- **Long polling, single instance.** Enforced by exiting on 409 rather than by coordination.
+- **Long polling, single instance, enforced by displacement rather than coordination.** NOT
+  split-brain: that was an assumption in an earlier draft of this spec and the measurement
+  showed it was wrong. Exactly one poller ever receives updates. The milder real problem is a
+  **zombie**: starting a second instance while an old one lives gives a working bot and, for
+  the moment before the old one next polls, two live processes — and the old one's in-flight
+  jobs die when it exits, leaving locks that clear on the stale timeout. The pid in the
+  startup log is how that is diagnosed after the fact.
 - **Group chats are untested.** The allowlist is per-user, so a group containing an allowed
   user would let that user drive the bot while others read the output.
 - **Compute-unit prices remain unverified** (`src/chain/cuCosts.ts`, `VERIFIED = false`), so
