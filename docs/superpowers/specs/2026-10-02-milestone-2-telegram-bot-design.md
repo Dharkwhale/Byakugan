@@ -15,7 +15,7 @@ message.
 
 ## Scope
 
-**In:** `/index`, `/status`, `/firstminters`, `/overlap`, allowed-user gating, detached
+**In:** `/index`, `/status`, `/firstminters`, `/firstrecipients`, `/overlap`, allowed-user gating, detached
 background jobs, rate-limited in-place progress edits, CSV output past the message limit.
 
 **Out:** anything the scope bar already forbids (signing, keys, buying). Also out, and
@@ -139,6 +139,7 @@ redacted from output.
 /index 0x… [--chain N] [--mints-only|--logs-only] [--to-block N] [--yes]
 /status [0x…]
 /firstminters 0x… [--chain N] [--limit N]
+/firstrecipients 0x… [--chain N] [--limit N]
 /overlap 0x… 0x… [0x… …] [--min N]
 /help
 ```
@@ -157,6 +158,13 @@ address, reports standard, deploy block and whether it was validated, watermark,
 level, kind counts, and the job state from §5.
 
 `/overlap` requires at least two addresses and defaults `--min` to 2.
+
+`/firstrecipients` was added after review found an incoherence: without it, `logs_only`
+could be indexed and nothing could query it, which makes a level dead configuration. It is
+also the ONLY query with no enrichment gate — `to_addr` comes from the log — so it is the
+only test of that path. Its `minter` column is nullable and renders as
+"unknown (not enriched)" rather than blank, because a blank column reads as an address
+nobody noticed was missing.
 
 ## 5 · Jobs
 

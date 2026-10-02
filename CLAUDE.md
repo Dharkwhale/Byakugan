@@ -155,6 +155,29 @@ was forgotten once and a scrubbing guard sat mutated in the working tree until
 it was noticed. Same structural fix as scrubbing at the boundary: remove the
 step that depends on remembering.
 
+### A visibility feature is tested on what it DISPLAYS
+
+**When a feature exists to make something visible, the test asserts the visible
+output — not that the code path ran.** Correct code, correctly wired, displaying
+nothing is the failure mode, and it passes any test that only checks the wiring.
+
+This has now happened twice, a milestone apart, and both times the code was right:
+
+- The dry-run capability probe was wired into the dry-run path only, so every real
+  CLI run silently used `eth_getLogs`. The run completed, the rows were correct,
+  and it took seventy chunks where one page would have done. Nothing in the output
+  said which fetch path it used, so nothing could have noticed.
+- The bot's progress line was planned to NAME the fetch path, and the plan passed
+  `'pending'` to the job registry and `'indexing'` to the renderer. The line would
+  have rendered, the test would have found a line, and the one thing it existed to
+  show would have been absent.
+
+Both are the same defect: a feature whose whole purpose is to surface information,
+tested on its own existence. The questions that catch it are "what string does a
+user see?" and "would this test fail if the value shown were wrong rather than
+missing?" — assert the content, with a value that could only come from the real
+source.
+
 ### Derive expectations from the spec, never from the fixture
 
 When a fixture is hand-authored — ABI-encoded log data, a hex blob, a

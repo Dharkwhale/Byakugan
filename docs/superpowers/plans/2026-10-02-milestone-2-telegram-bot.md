@@ -2314,7 +2314,7 @@ git commit -m "feat: /status reporting index state and job state separately"
 
 ---
 
-## Task 11: /firstminters and /overlap
+## Task 11: /firstminters, /firstrecipients and /overlap
 
 **Files:**
 - Create: `src/bot/commands/queries.ts`
@@ -2322,7 +2322,7 @@ git commit -m "feat: /status reporting index state and job state separately"
 
 **Interfaces:**
 - Consumes: `firstMinters`, `firstRecipients`, `overlap`, `getCollection`, `parseQueryCommand`, `respond`, `describeError`, `nextCommand`.
-- Produces: `handleFirstMinters(a: QueryDeps): Promise<void>`, `handleOverlap(a: QueryDeps): Promise<void>` with `QueryDeps = { text: string; replier: Replier; db: Database.Database; defaultChainId: number | undefined }`.
+- Produces: `handleFirstMinters(a: QueryDeps): Promise<void>`, `handleFirstRecipients(a: QueryDeps): Promise<void>`, `handleOverlap(a: QueryDeps): Promise<void>` with `QueryDeps = { text: string; replier: Replier; db: Database.Database; defaultChainId: number | undefined }`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2416,6 +2416,53 @@ describe('handleFirstMinters', () => {
   });
 });
 
+describe('handleFirstRecipients', () => {
+  // THE ONLY TEST OF THE UNGATED PATH. Every other query refuses something: firstMinters
+  // needs the acting wallet, overlap needs buys. This one answers from the log alone, and
+  // it is what stops logs_only being a level that can be indexed and never queried.
+  it('answers on a logs_only index, where firstMinters refuses', async () => {
+    const { base, sent } = setup();
+    collection(A);
+    setEnrichmentLevel(db, { chainId: 1, contract: A, level: 'logs_only' });
+    insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: null, txValueWei: null }]);
+
+    await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
+    expect(sent[0]).toContain(WALLET);
+
+    await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
+    expect(sent[1]).toMatch(/minting wallet/i);
+  });
+
+  it('shows the minter as unknown rather than blank on a logs_only index', async () => {
+    // A visibility feature is tested on what it DISPLAYS: tx_from is genuinely null here,
+    // and the reply must say so rather than rendering an empty column that reads as an
+    // address nobody noticed was missing.
+    const { base, sent } = setup();
+    collection(A);
+    setEnrichmentLevel(db, { chainId: 1, contract: A, level: 'logs_only' });
+    insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: null, txValueWei: null }]);
+    await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
+    expect(sent[0]).toMatch(/unknown \(not enriched\)/);
+    expect(sent[0]).not.toMatch(/minter: *
+/);
+  });
+
+  it('names the minter once it IS enriched', async () => {
+    const { base, sent } = setup();
+    collection(A);
+    insertTransfers(db, [mint(A, WALLET, 1, 10)]);
+    await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
+    expect(sent[0]).toContain(WALLET);
+    expect(sent[0]).not.toContain('unknown');
+  });
+
+  it('says NOT INDEXED rather than returning an empty list', async () => {
+    const { base, sent } = setup();
+    await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
+    expect(sent[0]).toMatch(/not indexed/i);
+  });
+});
+
 describe('handleOverlap', () => {
   it('requires at least two collections', async () => {
     const { base, sent } = setup();
@@ -2461,7 +2508,7 @@ Expected: FAIL — module not found.
 
 ```ts
 import type Database from 'better-sqlite3';
-import { firstMinters, overlap } from '../../db/repositories/analytics.js';
+import { firstMinters, firstRecipients, overlap } from '../../db/repositories/analytics.js';
 import { getCollection } from '../../db/repositories/collections.js';
 import { describeError } from '../../report.js';
 import { parseQueryCommand } from '../args.js';
@@ -2531,6 +2578,53 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
   }
 }
 
+/**
+ * The companion query, and the ONLY one with no enrichment gate.
+ *
+ * `to_addr` comes from the log, so this answers completely at every level including
+ * `logs_only` — which is the whole reason `logs_only` exists as something other than dead
+ * configuration. `minter` is nullable here and is rendered as "unknown (not enriched)"
+ * rather than left blank: a blank column reads as an address that nobody noticed was
+ * missing, and the difference between "not fetched" and "no sender" is exactly the
+ * distinction this project keeps having to defend.
+ */
+export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
+  let parsed;
+  try {
+    parsed = parseQueryCommand(d.text, d.defaultChainId);
+  } catch (err) {
+    const r = describeError(err);
+    await d.replier.reply(`${r.headline}
+
+  ${r.detail}`);
+    return;
+  }
+  const contract = parsed.contracts[0]!;
+  if (notIndexed(d.db, parsed.chainId, [contract]).length > 0) {
+    await d.replier.reply(
+      `${contract} on chain ${parsed.chainId} is not indexed, so there is nothing to ` +
+      `report — this is different from having no recipients.
+  /index ${contract} ` +
+      `--chain ${parsed.chainId}`,
+    );
+    return;
+  }
+
+  const rows = firstRecipients(d.db, {
+    chainId: parsed.chainId, contract, limit: parsed.limit,
+  });
+  await respond(d.replier, {
+    title: `First mint recipients of ${contract} (chain ${parsed.chainId})`,
+    headers: ['recipient', 'minter', 'received', 'block', 'log'],
+    rows: rows.map((r) => [
+      r.recipient,
+      r.minter ?? 'unknown (not enriched)',
+      String(r.received), String(r.blockNumber), String(r.logIndex),
+    ]),
+    filename: `firstrecipients-${parsed.chainId}-${contract}-${Date.now()}.csv`,
+  });
+}
+
 export async function handleOverlap(d: QueryDeps): Promise<void> {
   let parsed;
   try {
@@ -2589,7 +2683,7 @@ Expected: PASS.
 
 ```bash
 git add src/bot/commands/queries.ts test/unit/botQueries.test.ts
-git commit -m "feat: /firstminters and /overlap, distinguishing unindexed from empty"
+git commit -m "feat: /firstminters, /firstrecipients and /overlap, distinguishing unindexed from empty"
 ```
 
 ---
@@ -2701,7 +2795,7 @@ import { createJobRegistry } from './jobs.js';
 import { makeReplier } from './replier.js';
 import { handleIndex, nextCommand } from './commands/index.js';
 import { handleStatus } from './commands/status.js';
-import { handleFirstMinters, handleOverlap } from './commands/queries.js';
+import { handleFirstMinters, handleFirstRecipients, handleOverlap } from './commands/queries.js';
 
 const STALE_LOCK_MS = 15 * 60_000;
 const CONFIRM_THRESHOLD_SECONDS = 300;
@@ -2783,6 +2877,7 @@ async function main(): Promise<number> {
       '/index 0x… [--chain N] [--mints-only|--logs-only] [--to-block N] [--yes]',
       '/status [0x…]',
       '/firstminters 0x… [--chain N] [--limit N]',
+      '/firstrecipients 0x… [--chain N] [--limit N]',
       '/overlap 0x… 0x… [--min N]',
       '',
       'Levels: logs_only indexes without transactions and cannot answer /firstminters;',
@@ -2812,6 +2907,12 @@ async function main(): Promise<number> {
   });
   bot.command('firstminters', async (ctx) => {
     await handleFirstMinters({
+      text: ctx.message?.text ?? '', replier: makeReplier(ctx), db,
+      defaultChainId: config.defaultChainId,
+    });
+  });
+  bot.command('firstrecipients', async (ctx) => {
+    await handleFirstRecipients({
       text: ctx.message?.text ?? '', replier: makeReplier(ctx), db,
       defaultChainId: config.defaultChainId,
     });
