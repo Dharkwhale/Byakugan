@@ -49,7 +49,7 @@ function deps(over: Record<string, unknown> = {}, editImpl?: (id: number, t: str
       replier, db, clock, logger,
       registry: createJobRegistry({ clock, staleMs: 900_000 }),
       defaultChainId: 1,
-      chainConfig: { name: 'ethereum' },
+      chainName: (id: number) => (id === 8453 ? 'base' : 'ethereum'),
       runBackfill: vi.fn(async (_a: unknown) => indexedResult),
       estimate: vi.fn(async (_a: unknown) => ({ seconds: 30, summary: SUMMARY })),
       confirmThresholdSeconds: 300,
@@ -89,6 +89,13 @@ describe('handleIndex', () => {
       .toMatchObject({ kind: 'running', source: 'getAssetTransfers' });
     await flush();
     expect(base.runBackfill).toHaveBeenCalledOnce();
+  });
+
+  it('names the chain it PARSED, not the default chain', async () => {
+    const { base, sent } = deps();
+    await handleIndex({ ...base, text: `/index ${ADDR} --chain 8453` });
+    expect(sent[0]).toContain('on chain 8453 (base)');
+    expect(sent[0]).not.toContain('ethereum');
   });
 
   it('STATES the level used, so a later refusal is traceable', async () => {

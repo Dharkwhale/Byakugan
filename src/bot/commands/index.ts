@@ -47,7 +47,15 @@ export interface HandleIndexDeps {
    */
   logger: Logger;
   defaultChainId: number | undefined;
-  chainConfig: { name: string };
+  /**
+   * The display name of a chain, looked up with the chain the command ACTUALLY parsed.
+   *
+   * A function rather than a fixed `{ name }` resolved by the caller: the caller does not
+   * know the chain until `parseIndexCommand` has run, and resolving the default's name up
+   * front labels `/index 0x… --chain 8453` with the default chain's name while indexing
+   * 8453, on the one line telling the user what is happening.
+   */
+  chainName(chainId: number): string;
   /**
    * Which source the run will use, for the registry and the progress line.
    *
@@ -194,7 +202,7 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
   // `run` is a no-op, so the `finally` is correct on both paths.
   try {
     const sent = await d.replier.reply(
-      `Indexing ${contract} on chain ${chainId} (${d.chainConfig.name}) at level ${level}.\n` +
+      `Indexing ${contract} on chain ${chainId} (${d.chainName(chainId)}) at level ${level}.\n` +
       `  estimated ${humanizeSeconds(seconds)}; progress follows in this message.`,
     );
     const progress = createJobProgress({
