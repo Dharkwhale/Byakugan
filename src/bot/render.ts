@@ -12,8 +12,19 @@ export const MESSAGE_BUDGET = 3500;
 const NAME_LIMIT = 64;
 /** C0 and C1 controls. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
-/** Bidi embedding and isolate controls, which can make text display as something else. */
-const BIDI = /[‪-‮⁦-⁩]/g;
+/**
+ * Unicode format characters (category Cf), matched by property so the list cannot drift.
+ * Probed on this runtime: U+200B/200C/200D/2060 (zero-width), U+200E/200F (LRM/RLM),
+ * U+061C (ALM) and every bidi embedding/override/isolate control (U+202A-202E,
+ * U+2066-2069) are ALL Cf, so none needs naming separately. They are invisible or they
+ * reorder text, and an all-zero-width name would otherwise survive as a blank string
+ * instead of "(unnamed)".
+ *
+ * Stripping all of Cf also removes ZWJ, so an emoji family sequence may render as
+ * separate people. That is a deliberate trade for a security boundary on
+ * attacker-controlled text.
+ */
+const FORMAT = /\p{Cf}/gu;
 
 /**
  * Makes on-chain text safe to put in a message.
@@ -31,22 +42,50 @@ export function sanitizeOnChainText(value: string | null | undefined): string {
   if (typeof value !== 'string') return '(unnamed)';
   // Newlines and tabs are C0 controls, so CONTROL would delete them and fuse "Cool\nCollection"
   // into "CoolCollection". Turn whitespace into a space first, then strip what remains.
-  const cleaned = value.replace(/\s+/g, ' ').replace(CONTROL, '').replace(BIDI, '').replace(/\s+/g, ' ').trim();
+  // The emptiness check below stays AFTER stripping, so an all-invisible name is "(unnamed)".
+  const cleaned = value
+    .replace(/\s+/g, ' ')
+    .replace(CONTROL, '')
+    .replace(FORMAT, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (cleaned.length === 0) return '(unnamed)';
-  return cleaned.length > NAME_LIMIT ? `${cleaned.slice(0, NAME_LIMIT)}…` : cleaned;
+  // Truncate by CODE POINT, not UTF-16 code unit: slice() can cut a surrogate pair in half,
+  // and the lone surrogate is sent as U+FFFD. Grapheme clusters (combining marks, ZWJ-less
+  // sequences) may still be split at the cut. That is a decision, not an oversight: a cut
+  // mark is cosmetic, whereas a lone surrogate is corrupt text.
+  const points = Array.from(cleaned);
+  return points.length > NAME_LIMIT ? `${points.slice(0, NAME_LIMIT).join('')}…` : cleaned;
 }
 
 export function renderTable(a: { title: string; headers: string[]; rows: string[][] }): string {
-  const lines = [a.title, ''];
   if (a.rows.length === 0) return [a.title, '', '(no rows)'].join('\n');
-  for (const row of a.rows) {
-    lines.push(a.headers.map((h, i) => `${h}: ${row[i] ?? ''}`).join('  '));
-  }
+  const lines = [a.title, ''];
+  a.rows.forEach((row, r) => {
+    // A short row would render as a silently blank cell: missing data picking the cheaper
+    // answer. Say so instead.
+    if (row.length !== a.headers.length) {
+      throw new Error(
+        `renderTable: row ${r} has ${row.length} cells, expected ${a.headers.length} (one per header)`,
+      );
+    }
+    lines.push(a.headers.map((h, i) => `${h}: ${row[i]}`).join('  '));
+  });
   return lines.join('\n');
 }
 
+/**
+ * Spreadsheet formula injection: a cell starting with = + - @ tab or CR is executed when the
+ * owner opens the file in Excel or Sheets (=HYPERLINK(...) is the classic). Collection names
+ * are attacker-controlled, so neutralise with a leading apostrophe, which spreadsheets treat
+ * as a text marker. Note this also prefixes a legitimate negative number; no column here
+ * holds one.
+ */
+const FORMULA_LEAD = /^[=+\-@\t\r]/;
+
 /** RFC-4180 quoting: a field containing a comma, quote or newline is quoted, quotes doubled. */
-function csvField(value: string): string {
+function csvField(raw: string): string {
+  const value = FORMULA_LEAD.test(raw) ? `'${raw}` : raw;
   return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  MESSAGE_BUDGET, respond, sanitizeOnChainText,
+  MESSAGE_BUDGET, renderTable, respond, sanitizeOnChainText, toCsv,
 } from '../../src/bot/render.js';
 import type { Replier } from '../../src/bot/replier.js';
 
@@ -24,8 +24,8 @@ describe('sanitizeOnChainText', () => {
 
   // Escapes, not literals: a bidi control pasted into source is invisible and easily lost.
   it('strips bidi overrides, which can make text read as something else', () => {
-    expect(sanitizeOnChainText('abc‮def‬')).toBe('abcdef');
-    expect(sanitizeOnChainText('⁦x⁩')).toBe('x');
+    expect(sanitizeOnChainText('abc\u202edef\u202c')).toBe('abcdef');
+    expect(sanitizeOnChainText('\u2066x\u2069')).toBe('x');
   });
 
   it('collapses whitespace runs', () => {
@@ -36,6 +36,25 @@ describe('sanitizeOnChainText', () => {
     const out = sanitizeOnChainText('x'.repeat(2000));
     expect(out.length).toBeLessThanOrEqual(65);
     expect(out.endsWith('…')).toBe(true);
+  });
+
+  it('does not split a surrogate pair at the truncation boundary', () => {
+    // 63 x's, then an emoji whose high surrogate sits at UTF-16 index 63.
+    const out = sanitizeOnChainText('x'.repeat(63) + '\u{1f600}yyy');
+    expect(out).not.toMatch(/[�-�]/);
+    expect(out).toBe('x'.repeat(63) + '\u{1f600}…');
+    // And past the cut: 64 x's then an emoji, which must be dropped whole.
+    const out2 = sanitizeOnChainText('x'.repeat(64) + '\u{1f600}');
+    expect(out2).not.toMatch(/[�-�]/);
+  });
+
+  it('turns an all-invisible name into the placeholder', () => {
+    expect(sanitizeOnChainText('\u200b\u200c\u200d\u2060')).toBe('(unnamed)');
+  });
+
+  it('strips LRM, RLM and ALM, which can still reorder text', () => {
+    expect(sanitizeOnChainText('foo\u200e bar')).toBe('foo bar');
+    expect(sanitizeOnChainText('a\u200fb\u061cc')).toBe('abc');
   });
 
   it('renders an absent name as a placeholder, not as "undefined"', () => {
@@ -83,5 +102,20 @@ describe('respond', () => {
     await respond(replier, { ...small, rows });
     expect(sendDocument.mock.calls[0]![0].contents).toContain('"a,b"');
     expect(sendDocument.mock.calls[0]![0].contents).toContain('"he said ""hi"""');
+  });
+  it('neutralises a spreadsheet formula in a field', () => {
+    const csv = toCsv({
+      headers: ['name'],
+      rows: [['=HYPERLINK("http://evil","x")'], ['+1'], ['@SUM(A1)'], ['-2+3'], ['plain']],
+    });
+    const fields = csv.split('\n').slice(1);
+    expect(fields[0]).toBe('"\'=HYPERLINK(""http://evil"",""x"")"');
+    for (const f of fields) expect(f).not.toMatch(/^"?[=+\-@\t\r]/);
+    expect(fields[4]).toBe('plain');
+  });
+
+  it('throws on a ragged row instead of rendering a blank cell', () => {
+    expect(() => renderTable({ title: 't', headers: ['a', 'b'], rows: [['1', '2'], ['only']] }))
+      .toThrow(/row 1 has 1 cells, expected 2/);
   });
 });
