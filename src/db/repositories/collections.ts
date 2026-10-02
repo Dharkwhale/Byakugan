@@ -136,3 +136,25 @@ export function advanceWatermark(
      WHERE chain_id = @chainId AND contract = @contract AND locked_by = @jobId
   `).run({ chainId: a.chainId, contract: a.contract, jobId: a.jobId, toBlock: a.toBlock, nowMs });
 }
+
+/**
+ * Who holds this collection's lock, if anyone.
+ *
+ * Read-only, and deliberately NOT filtered on `standard IS NOT NULL` like
+ * `getCollection` is: a row claimed by a job that then died mid-bootstrap still holds a
+ * lock, and the bot has to be able to say so.
+ */
+export function inspectLock(
+  db: Database.Database,
+  chainId: number,
+  contract: string,
+): { lockedBy: string; lockedAt: number } | null {
+  const row = db
+    .prepare(`
+      SELECT locked_by AS lockedBy, locked_at AS lockedAt
+        FROM collections
+       WHERE chain_id = ? AND contract = ? AND locked_by IS NOT NULL
+    `)
+    .get(chainId, contract) as { lockedBy: string; lockedAt: number } | undefined;
+  return row ?? null;
+}
