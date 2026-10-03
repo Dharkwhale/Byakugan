@@ -58,7 +58,7 @@ allowlist), 3 provider unavailable, 4 busy (another instance took over polling),
 ## 2. Test results
 
 - `npm run typecheck`: clean.
-- `BYAKUGAN_NO_DOTENV=1 npx vitest run`: **897 passed, 17 skipped, across 45 files** (44 files
+- `BYAKUGAN_NO_DOTENV=1 npx vitest run`: **898 passed, 17 skipped, across 45 files** (44 files
   passed, 1 skipped). Re-run when this report was written.
 - The 17 skipped are the real-provider smoke suite, skipped because this run had no credentials
   loaded. They were not run for this report, so nothing here is evidence about the real provider.
@@ -148,6 +148,15 @@ reasons and recorded here so the claim they make is not mistaken for a tested on
    changing. The controller's first ruling on this asserted a live crash; it was wrong, and was
    corrected after the implementer read the parser.
 
+6. **The 90-second request timeout is asserted as CONFIGURATION, not behaviour.** The rules
+   prefer behaviour, and this is the exception they allow: the behaviour is a request aborting
+   after 90 seconds, observable only by waiting 90 seconds, and this project does not sleep in
+   tests. What carries the meaning is the RELATIONSHIP between three numbers — the timeout must
+   exceed grammY's 30-second long poll or polling dies mid-flight, and must undercut its
+   500-second default or the stall it exists to bound comes back — and that relationship is
+   what the test pins. The two grammY figures are read from its source, so the test would not
+   notice grammY changing them.
+
 **A fixture-level gap that was fixed, not argued:** the first scrub test used a URL-shaped fake
 secret, and a mutant that derived tokens from `[]` survived, because `scrubSecrets` has fallback
 passes that redact URL-shaped keys with no tokens at all. The test switched to a plain fake secret
@@ -234,9 +243,16 @@ matrix itself and applied the Task 10 fix round itself.
 - **A failed progress edit is invisible to the user.** By decision, an edit failure never aborts
   the backfill, so a stale progress message does not mean a stalled job. The failure is logged.
 - **`finish` and `fail` wait for a progress edit already in flight.** If that edit's socket
-  stalls, they wait with it. No explicit grammY client timeout is configured in the wiring (a
-  search of `src/bot` and `src/telegram` for one found none), so the bound is grammY's default,
-  which was not measured. A fresh send would have succeeded in that case.
+  stalls, they wait with it, and a fresh send would have succeeded in that case. The bound is
+  now an explicit 90-second client timeout rather than grammY's 500-second default.
+  **This was a dropped carry-forward, found while writing this report.** Task 8 deferred the
+  fix to "where the grammY client is configured", the wiring task never did it, and neither the
+  controller nor the Task 12b review noticed; a stalled edit could therefore have held a
+  finished job's final message for over eight minutes while `/status` reported it as running.
+  90 rather than 30 because `bot.start()` long-polls through the same client with a 30-second
+  timeout. Both grammY figures were read out of its source. The timeout's *behaviour* is not
+  tested — it is only observable by waiting 90 seconds — so what is pinned is the relationship
+  between the three numbers; see section 5.
 - **A real CLI run now makes two `eth_blockNumber` calls** (20 CU rather than 10): the port
   factory fetches a safe head for the probe and the CLI then calls `safeHead()` again, so the
   probe uses the older head. Harmless to the probe. The Task 13 change is
