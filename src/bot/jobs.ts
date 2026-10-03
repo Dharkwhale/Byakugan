@@ -38,6 +38,19 @@ export interface JobRegistry {
     onError?: (err: unknown) => void;
   }): void;
   note(a: { chainId: number; contract: string; lastBlock: number }): void;
+  /**
+   * Every job running in THIS process.
+   *
+   * `size()` alone could not answer `/status` with no address: that reply has to say which
+   * collections are being worked on, and a count cannot. Without it the list branch read
+   * `collections` only — and a first index leaves no row there until the deploy-block search
+   * ends, so a live job showed up as "Nothing indexed yet. Start with /index", telling the
+   * user to start the job they had already started. That is the same defect CLAUDE.md records
+   * three times over, arriving a fourth time in the half of the command nobody enumerated.
+   */
+  running(): Array<{
+    chainId: number; contract: string; startedAt: number; source: string; lastBlock?: number;
+  }>;
   size(): number;
 }
 
@@ -149,6 +162,19 @@ export function createJobRegistry(a: { clock: Clock; staleMs: number }): JobRegi
     note({ chainId, contract, lastBlock }) {
       const entry = running.get(key(chainId, contract));
       if (entry) entry.lastBlock = lastBlock;
+    },
+
+    running() {
+      return [...running.entries()].map(([k, entry]) => {
+        const sep = k.indexOf(':');
+        return {
+          chainId: Number(k.slice(0, sep)),
+          contract: k.slice(sep + 1),
+          startedAt: entry.startedAt,
+          source: entry.source,
+          ...(entry.lastBlock === undefined ? {} : { lastBlock: entry.lastBlock }),
+        };
+      });
     },
 
     size() { return running.size; },

@@ -52,8 +52,17 @@ function runningLine(job: Extract<JobState, { kind: 'running' }>, now: number): 
 function orphanLine(job: Extract<JobState, { kind: 'orphaned' }>, now: number): string {
   if (now <= job.expiresAt) {
     const minutes = Math.max(0, Math.round((job.expiresAt - now) / 60_000));
-    return `a previous run left a lock and did not release it; nothing is indexing it. ` +
-      `The lock expires in ${minutes} minutes and clears itself`;
+    // BOTH readings, because the lock table cannot tell them apart. `inspectLock` returns any
+    // row with `locked_by` set, and `inspect` calls it orphaned whenever the key is absent
+    // from THIS process's map — so a lock held by a live CLI run against the same database
+    // looks identical to one left by a dead process. Claiming "nothing is indexing it" was a
+    // guarantee the data does not support, and the false half is the one that wastes the
+    // reader's time: `advanceWatermark` refreshes `locked_at` every chunk, so a live run's
+    // lock never expires and the "try again in N minutes" advice would never come true.
+    return `a lock is held and this process is not the holder (job ${job.lockedBy}). Either a ` +
+      `previous run died holding it, or another process — a CLI run against the same ` +
+      `database — is indexing it now. If it died, the lock goes stale in ${minutes} minutes ` +
+      'and the next /index clears it; if something is running, that will not happen';
   }
   return 'a previous run left a lock, and the lock has expired; the next /index will clear it';
 }
@@ -78,8 +87,34 @@ export async function handleStatus(a: {
        ORDER BY indexed_at DESC NULLS LAST
        LIMIT ${LIST_LIMIT}
     `).all() as Array<{ chainId: number; contract: string; level: string; watermark: number }>;
+    // RUNNING JOBS COME FIRST, and this branch is why the registry grew `running()`.
+    //
+    // `collections` holds no row until the deploy-block search finishes, which is the longest
+    // part of a first index. Reading only that table told a user whose job was live
+    // "Nothing indexed yet. Start with /index" — pointing them at the job they had already
+    // started. `/status <address>` was fixed for exactly this; the no-address half was not,
+    // because the state enumeration was applied to one of the two and not the other.
+    const live = a.registry.running();
+    const liveLines = live.map((j) => {
+      const minutes = Math.round((a.clock.now() - j.startedAt) / 60_000);
+      return `chain ${j.chainId}  ${j.contract}  indexing now, started ${minutes} minutes ` +
+        `ago, via ${j.source}` +
+        (j.lastBlock === undefined ? ', no blocks indexed yet' : `, at block ${j.lastBlock}`);
+    });
+
     if (rows.length === 0) {
-      await a.replier.reply('Nothing indexed yet. Start with /index 0x…');
+      await a.replier.reply(
+        live.length === 0
+          ? 'Nothing indexed yet. Start with /index 0x…'
+          : [
+            `Nothing has finished indexing yet, but ${live.length} job(s) are running:`,
+            '',
+            ...liveLines,
+            '',
+            'A first index writes nothing until its deploy-block search finishes, so a job',
+            'can be working for minutes before it appears above.',
+          ].join('\n'),
+      );
       return;
     }
     // The TOTAL is counted and shown, never left implied by the number of rows printed. A
@@ -92,9 +127,14 @@ export async function handleStatus(a: {
       ? `Indexed collections (all chains) — most recent ${rows.length} of ${total}`
       : `Indexed collections (all chains) — ${total}`;
     await a.replier.reply(
-      [heading, '', ...rows.map((r) =>
-        `chain ${r.chainId}  ${r.contract}  recorded level ${r.level}  through ${r.watermark}`)]
-        .join('\n'),
+      [
+        heading, '',
+        ...rows.map((r) =>
+          `chain ${r.chainId}  ${r.contract}  recorded level ${r.level}  through ${r.watermark}`),
+        // Appended rather than merged into the rows above: a running job may have no
+        // `collections` row at all, so it cannot be a column on a row that does not exist.
+        ...(liveLines.length === 0 ? [] : ['', 'Running now:', ...liveLines]),
+      ].join('\n'),
     );
     return;
   }

@@ -111,6 +111,21 @@ describe('respond', () => {
     expect(sendDocument.mock.calls[0]![0].contents.split('\n')).toHaveLength(501);
   });
 
+  it('bounds a caption of ASTRAL characters in the unit Telegram counts', async () => {
+    // The fixture is the point. An all-BMP title cannot distinguish measuring in UTF-16 code
+    // units from slicing in code points, so the previous test could not see that the two
+    // disagreed. Emoji are two code units each: slicing 970 CODE POINTS would have returned
+    // ~1,940 UNITS, over the limit this function exists to enforce.
+    const { replier, sendDocument } = fakeReplier();
+    const rows = Array.from({ length: 500 }, (_, i) => [`0x${String(i).padStart(40, '0')}`, '1']);
+    await respond(replier, { ...small, title: '\u{1F600}'.repeat(3_000), rows });
+    const { caption } = sendDocument.mock.calls[0]![0];
+    expect(caption.length).toBeLessThanOrEqual(1024);
+    expect(caption).toContain('caption truncated');
+    // No lone surrogate left at the cut: a split pair renders as U+FFFD.
+    expect(caption).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
   it('leaves a caption that already fits completely alone', async () => {
     const { replier, sendDocument } = fakeReplier();
     const rows = Array.from({ length: 500 }, (_, i) => [`0x${String(i).padStart(40, '0')}`, '1']);

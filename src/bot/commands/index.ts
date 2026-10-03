@@ -139,13 +139,22 @@ export async function handleIndex(d: HandleIndexDeps): Promise<void> {
   // it still refuses. Falling through on that millisecond would start a job whose claim
   // then fails, so the user gets an error where "try again after that" is the true answer.
   if (state.kind === 'orphaned' && d.clock.now() <= state.expiresAt) {
-    // NOT the same as running. A previous process died holding the lock; nothing is
-    // working on this collection and the lock clears itself.
+    // NOT the same as a job in THIS process's map — but not provably a dead one either, and
+    // the earlier wording claimed it was. `inspectLock` returns any row with `locked_by` set,
+    // so a lock held by a live CLI run against the same database is indistinguishable from
+    // one a crashed process left behind. "Nothing is indexing it now" was therefore a
+    // guarantee the lock table cannot support, and the wrong half is expensive:
+    // `advanceWatermark` refreshes `locked_at` on every chunk, so a live run's lock never
+    // goes stale and a user following "try again after that" would retry for hours.
     const minutes = Math.max(0, Math.round((state.expiresAt - d.clock.now()) / 60_000));
     await d.replier.reply(
-      `A previous run left a lock on ${contract} (chain ${chainId}) and did not release it.\n` +
-      `  Nothing is indexing it now. The lock expires in ${minutes} minutes and clears itself.\n` +
-      '  Try again after that.',
+      `${contract} (chain ${chainId}) is locked by job ${state.lockedBy}, which is not ` +
+      'running in this bot.\n' +
+      '  Either a previous run died holding the lock, or another process — a CLI run against ' +
+      'the same database — is indexing it right now.\n' +
+      `  If it died, the lock goes stale in ${minutes} minutes and the next /index takes it ` +
+      'over. If something is still running, it will keep the lock fresh and that will not ' +
+      'happen, so check for another process before waiting.',
     );
     return;
   }

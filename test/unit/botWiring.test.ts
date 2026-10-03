@@ -257,3 +257,60 @@ describe('a failing prepare', () => {
     }
   });
 });
+
+describe('the request timeout is actually wired into the client', () => {
+  /*
+   * BEHAVIOURAL, and it has to be: an earlier version of this pinned the timeout by
+   * comparing three exported constants to each other, which proved the constants were
+   * consistent and nothing else. Deleting the `client` key from `new Bot(...)` entirely left
+   * 898 tests passing. The milestone report then recorded "argued, not tested" over it with
+   * the reason that the behaviour could only be seen by waiting 90 seconds — which is false.
+   * grammY arms a plain `setTimeout` (`grammy/out/core/client.js`, `createTimeout`), so fake
+   * timers drive it in zero wall time, and its rejection message names the number of seconds
+   * it was given, so the CONFIGURED VALUE is observable from outside.
+   */
+  /**
+   * Never settles, deliberately. An earlier version rejected on `signal.abort`, and grammY
+   * reported that as an `HttpError` about the network request — so the test still proved the
+   * 90-second boundary but lost the message naming the value. Hanging outright leaves
+   * grammY's own timeout promise as the only thing that can win its race, and its rejection
+   * text carries the number of seconds it was configured with.
+   */
+  function hangingFetch(): typeof fetch {
+    return (() => new Promise(() => undefined)) as unknown as typeof fetch;
+  }
+
+  it('aborts a hung request at 90 seconds, not at grammY 500-second default', async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps } = setup();
+      const bot = buildBot({
+        ...deps,
+        botConfig: { botInfo, client: { fetch: hangingFetch() } },
+      });
+
+      const call = bot.api.sendMessage(1, 'hello');
+      // Nothing may settle it early; without the catch an unhandled rejection is reported
+      // before the assertion runs.
+      let settled: 'pending' | 'rejected' = 'pending';
+      const watched = call.then(
+        () => { settled = 'pending'; },
+        (err: unknown) => { settled = 'rejected'; return err; },
+      );
+
+      await vi.advanceTimersByTimeAsync(89_999);
+      expect(settled).toBe('pending');
+
+      await vi.advanceTimersByTimeAsync(2);
+      const err = await watched;
+      expect(settled).toBe('rejected');
+      // grammY wraps the cause in an HttpError and keeps the original on `.error`. That
+      // original names the number of seconds grammY was actually given, so this pins 90
+      // rather than merely proving that some timeout exists somewhere.
+      const cause = (err as { error?: { message?: string } }).error;
+      expect(cause?.message).toMatch(/timed out after 90 seconds/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

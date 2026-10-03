@@ -143,5 +143,19 @@ const CAPTION_LIMIT = 1024;
 function boundCaption(caption: string): string {
   if (caption.length <= CAPTION_LIMIT) return caption;
   const marker = '… (caption truncated; the full result is in the file)';
-  return `${Array.from(caption).slice(0, CAPTION_LIMIT - marker.length).join('')}${marker}`;
+  const budget = CAPTION_LIMIT - marker.length;
+  // MEASURED AND CUT IN THE SAME UNIT. `caption.length` counts UTF-16 code units, which is
+  // what Telegram counts, so slicing by CODE POINT could return a value twice the limit this
+  // function exists to enforce: ~970 astral characters pass the slice and arrive as ~1,940
+  // units, and the send is rejected — the outcome being guarded against. Not reachable
+  // through today's callers, whose titles hold only addresses and integers, which is exactly
+  // why no test noticed; it is a guard for the caller that comes later.
+  //
+  // Cut on a code-point boundary even so, by stepping back off a lone high surrogate. A split
+  // pair would otherwise render as U+FFFD, and `sanitizeOnChainText` above is careful about
+  // the same thing.
+  let end = budget;
+  const code = caption.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  return `${caption.slice(0, end)}${marker}`;
 }

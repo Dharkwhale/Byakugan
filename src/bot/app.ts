@@ -136,13 +136,6 @@ export interface BotDeps {
 }
 
 /**
- * Builds the bot and registers everything, with the allowlist FIRST.
- *
- * Order is the security property: grammY runs middleware in registration order, and a
- * command handler that matches does not call `next()`, so any handler registered before
- * `allowOnly` answers whoever sent the update. `test/unit/botWiring.test.ts` pins this.
- */
-/**
  * How long any single Telegram request may hang before it is aborted.
  *
  * grammY's default is 500 seconds — 8 minutes 20, matching the Bot API server's own cap.
@@ -161,6 +154,13 @@ export const REQUEST_TIMEOUT_SECONDS = 90;
 export const GRAMMY_DEFAULT_REQUEST_TIMEOUT_SECONDS = 500;
 export const GRAMMY_DEFAULT_LONG_POLL_SECONDS = 30;
 
+/**
+ * Builds the bot and registers everything, with the allowlist FIRST.
+ *
+ * Order is the security property: grammY runs middleware in registration order, and a
+ * command handler that matches does not call `next()`, so any handler registered before
+ * `allowOnly` answers whoever sent the update. `test/unit/botWiring.test.ts` pins this.
+ */
 export function buildBot(d: BotDeps): Bot {
   const bot = new Bot(d.token, {
     ...d.botConfig,
@@ -172,16 +172,24 @@ export function buildBot(d: BotDeps): Bot {
   const tokens = deriveSecretTokens(d.secrets);
   const makeReplier = (ctx: Context) => makeScrubbedReplier(ctx, tokens);
 
-  // THE LAST GATE, below the replier and independent of it.
+  // A SECOND GATE, below the replier and independent of it.
   //
   // The replier scrubs because it is the one place commands send text from — but that is a
   // CONVENTION, and a future handler calling `ctx.reply` or `ctx.api.sendMessage` directly
-  // would walk straight past it. A grammY transformer sits under every outbound call
-  // whatever made it, so the guarantee stops depending on each new handler remembering,
-  // which is the failure this project has already paid for once.
+  // would walk straight past it. This transformer sits under those calls too, so the
+  // guarantee stops depending on each new handler remembering.
   //
-  // Installed BEFORE any other transformer, so it runs outermost and anything registered
-  // later (a test recorder, say) observes payloads that are already scrubbed.
+  // WHAT IT DOES NOT COVER, stated because an earlier version of this comment overstated it:
+  //   - TOP-LEVEL STRINGS ONLY. A nested string — `reply_markup` button text,
+  //     `sendMediaGroup`'s `media[].caption` — is not reached, and neither is an `InputFile`'s
+  //     contents or filename. The replier scrubs those for the paths that go through it.
+  //   - It is the INNERMOST transformer, not the outermost. MEASURED: grammY's `ApiClient.use`
+  //     folds with `transformers.reduce(concatTransformer, this.call)`, so the LAST installed
+  //     runs FIRST and this one, installed at construction, runs last before the wire. That is
+  //     the right position for a scrubber — nothing downstream can reintroduce a secret — but
+  //     it means a transformer registered LATER sees the payload BEFORE this scrub. So a future
+  //     `bot.api.config.use(logPayloads)`, or any library transformer added after
+  //     construction, must not assume what it observes has been redacted.
   bot.api.config.use(async (prev, method, payload, signal) => {
     const source = payload as unknown as Record<string, unknown>;
     const scrubbed: Record<string, unknown> = {};

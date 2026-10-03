@@ -117,13 +117,20 @@ describe('handleStatus', () => {
     expect(sent[0]).toContain('indexing now, started 3 minutes ago, via getAssetTransfers');
   });
 
-  it('reports a live orphaned lock as nothing running, with minutes to expiry', async () => {
+  it('offers BOTH readings of a live lock, because the table cannot tell them apart', async () => {
+    // It used to say "nothing is indexing it", which the data does not support: a lock held
+    // by a live CLI run against the same database is indistinguishable from one a crashed
+    // process left. The false half is the costly one — advanceWatermark refreshes locked_at
+    // every chunk, so a live run's lock never goes stale and "wait N minutes" never comes true.
     const { base, sent } = setup();
     indexed();
     lock(0); // expiresAt 900000, now 600000
     await handleStatus({ ...base, text: `/status ${ADDR}` });
-    expect(sent[0]).toContain('nothing is indexing it');
-    expect(sent[0]).toContain('expires in 5 minutes');
+    expect(sent[0]).toContain('a lock is held and this process is not the holder');
+    expect(sent[0]).toContain('job dead');            // names the holder from the lock row
+    expect(sent[0]).toMatch(/another process/i);      // the reading that used to be missing
+    expect(sent[0]).toContain('goes stale in 5 minutes');
+    expect(sent[0]).not.toContain('nothing is indexing it');
     expect(sent[0]).not.toContain('indexing now');
   });
 
@@ -133,7 +140,7 @@ describe('handleStatus', () => {
     lock(0);
     clock.set(STALE);
     await handleStatus({ ...base, text: `/status ${ADDR}` });
-    expect(sent[0]).toContain('expires in 0 minutes');
+    expect(sent[0]).toContain('goes stale in 0 minutes');
   });
 
   it('reports an EXPIRED lock as expired, not as expiring in 0 minutes', async () => {
@@ -225,6 +232,63 @@ describe('handleStatus', () => {
     expect(sent[0]).toContain('via getAssetTransfers');
     // The pointer to /index must NOT appear: following it is the one wrong move here.
     expect(sent[0]).not.toContain(`/index ${ADDR}`);
+  });
+
+  /*
+   * The no-address branch has its own states, and they went unenumerated while the
+   * address branch's seven were all covered. This is the fourth appearance of the defect
+   * CLAUDE.md records three times: a live first index writes no `collections` row until its
+   * deploy-block search ends, so a registry-blind list reported "Nothing indexed yet. Start
+   * with /index" to someone whose job was already running.
+   */
+  describe('the list branch, in every state it can occupy', () => {
+    function startJob(contract: string, source = 'getAssetTransfers') {
+      const { base, sent, clock } = setup();
+      base.registry.claim({ chainId: 1, contract, source })!.run({
+        run: () => new Promise(() => undefined),
+      });
+      return { base, sent, clock };
+    }
+
+    it('EMPTY and idle: says nothing is indexed and points at /index', async () => {
+      const { base, sent } = setup();
+      await handleStatus({ ...base, text: '/status' });
+      expect(sent[0]).toMatch(/nothing indexed yet/i);
+      expect(sent[0]).toContain('/index');
+    });
+
+    it('EMPTY while a first index runs: names the job, and does NOT say to start one', async () => {
+      const { base, sent, clock } = startJob(ADDR);
+      clock.advance(240_000);
+      await handleStatus({ ...base, text: '/status' });
+      expect(sent[0]).toMatch(/1 job\(s\) are running/);
+      expect(sent[0]).toContain(ADDR);
+      expect(sent[0]).toContain('4 minutes ago');
+      expect(sent[0]).toContain('via getAssetTransfers');
+      expect(sent[0]).toContain('no blocks indexed yet');
+      // The whole point: the old reply told the user to start the job they had started.
+      expect(sent[0]).not.toMatch(/nothing indexed yet/i);
+      expect(sent[0]).not.toMatch(/Start with \/index/);
+    });
+
+    it('POPULATED while another collection bootstraps: shows both', async () => {
+      const { base, sent, clock } = startJob(OTHER);
+      indexed();
+      clock.advance(60_000);
+      await handleStatus({ ...base, text: '/status' });
+      expect(sent[0]).toContain('Indexed collections');
+      expect(sent[0]).toContain(ADDR);          // the finished one
+      expect(sent[0]).toContain('Running now:');
+      expect(sent[0]).toContain(OTHER);         // the one still bootstrapping
+    });
+
+    it('POPULATED and idle: no running section at all', async () => {
+      const { base, sent } = setup();
+      indexed();
+      await handleStatus({ ...base, text: '/status' });
+      expect(sent[0]).toContain(ADDR);
+      expect(sent[0]).not.toContain('Running now:');
+    });
   });
 
   it('says so when nothing has been indexed at all', async () => {
