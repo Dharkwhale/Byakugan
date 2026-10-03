@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { classifyStartupFailure, requireBotConfig } from '../../src/bot/app.js';
+import {
+  classifyStartupFailure, requireBotConfig,
+  GRAMMY_DEFAULT_LONG_POLL_SECONDS, GRAMMY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+  REQUEST_TIMEOUT_SECONDS,
+} from '../../src/bot/app.js';
 import { EXIT } from '../../src/report.js';
 import { ConfigError } from '../../src/errors.js';
 import type { Config } from '../../src/config.js';
@@ -63,5 +67,20 @@ describe('classifyStartupFailure', () => {
 
   it('is undefined for anything else, so it is not swallowed', () => {
     expect(classifyStartupFailure(new Error('network down'))).toBeUndefined();
+  });
+});
+
+describe('the request timeout', () => {
+  /*
+   * A CONFIGURATION assertion, deliberately, and this is the exception the rule allows.
+   * The behaviour — a request aborting after N seconds — can only be observed by waiting
+   * N seconds, and this project does not sleep in tests. What carries the meaning here is
+   * not that the option is set but the RELATIONSHIP between three numbers, and that is
+   * assertable: too low and long polling is killed mid-poll, too high and a stalled
+   * progress edit holds a finished job's final message for minutes.
+   */
+  it('clears the long poll and undercuts grammY default', () => {
+    expect(REQUEST_TIMEOUT_SECONDS).toBeGreaterThan(GRAMMY_DEFAULT_LONG_POLL_SECONDS);
+    expect(REQUEST_TIMEOUT_SECONDS).toBeLessThan(GRAMMY_DEFAULT_REQUEST_TIMEOUT_SECONDS);
   });
 });

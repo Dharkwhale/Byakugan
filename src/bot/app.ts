@@ -142,8 +142,32 @@ export interface BotDeps {
  * command handler that matches does not call `next()`, so any handler registered before
  * `allowOnly` answers whoever sent the update. `test/unit/botWiring.test.ts` pins this.
  */
+/**
+ * How long any single Telegram request may hang before it is aborted.
+ *
+ * grammY's default is 500 seconds — 8 minutes 20, matching the Bot API server's own cap.
+ * That is far too long here for one specific reason: `finish` and `fail` await a progress
+ * tick that is already on the wire before they write the result, so a single stalled edit
+ * would hold a finished job's final message for over eight minutes, and `/status` would
+ * keep reporting it as running throughout.
+ *
+ * 90 seconds, not 30: `bot.start()` long-polls `getUpdates` with a 30-second timeout and
+ * that request goes through the same client, so the budget has to clear it comfortably.
+ * Both figures were read out of grammY's source rather than recalled.
+ */
+export const REQUEST_TIMEOUT_SECONDS = 90;
+
+/** grammY's own defaults, read from its source. Here so a test can pin the relationship. */
+export const GRAMMY_DEFAULT_REQUEST_TIMEOUT_SECONDS = 500;
+export const GRAMMY_DEFAULT_LONG_POLL_SECONDS = 30;
+
 export function buildBot(d: BotDeps): Bot {
-  const bot = new Bot(d.token, d.botConfig);
+  const bot = new Bot(d.token, {
+    ...d.botConfig,
+    // Spread last so a test supplying its own client (a stub `fetch`, say) keeps it while
+    // still inheriting the timeout.
+    client: { timeoutSeconds: REQUEST_TIMEOUT_SECONDS, ...d.botConfig?.client },
+  });
   // Derived ONCE; every outbound chat string is scrubbed with these inside the replier.
   const tokens = deriveSecretTokens(d.secrets);
   const makeReplier = (ctx: Context) => makeScrubbedReplier(ctx, tokens);
