@@ -85,8 +85,22 @@ The consequence is that a run whose chunk is slow shows an identical message for
 takes, and an unchanging message is how a *hung* process looks.
 
 - On a long index, did you ever think it had died?
-- If so, the fix is a changing element that is cheap to justify — a tick count, say, or the
-  block range moving even when rows do not — and I would rather add it than have you wondering.
+
+**Candidate on the table, from the owner, and it is a better framing than mine.** The choice is
+not "timestamp or nothing": a field that changes only when *work happens* — chunks completed,
+rows inserted, current block — differs between renders without defeating the identical-text
+guard, and a chunk that genuinely takes minutes then shows the same numbers honestly. Not
+redesigned now; recorded so it is on the table when the observations come back.
+
+**One measurement that moves where the problem is, though.** The line already contains
+`blocks X-Y`, which changes every chunk, so the identical-text case is rarer than I implied
+above — two consecutive ticks only collide if the chunk range *and* the row count both repeat.
+And `onProgress` fires once per chunk, after it completes (`src/indexer/backfill.ts:248`), so
+during a single slow chunk **no tick fires at all**: no field can change, because nothing calls
+the reporter. A work counter fixes the collision case; the frozen-message case needs something
+that ticks independently of chunk completion. Worth knowing which one you actually saw — the
+message jumping in large steps, or sitting still for minutes — because they want different
+answers.
 
 ## 6. The edit interval is 4 seconds, chosen rather than measured
 
