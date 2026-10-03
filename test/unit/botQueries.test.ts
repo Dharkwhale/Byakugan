@@ -279,6 +279,70 @@ describe('handleFirstRecipients', () => {
   });
 });
 
+describe('extra arguments are refused, not silently dropped', () => {
+  /*
+   * The defect this fixes: /firstminters 0xA 0xB answered about 0xA and said nothing about
+   * 0xB, while /status refused the identical shape. Answering a question nobody asked is the
+   * same family as the visibility bugs — the reply looks complete and the omission is
+   * invisible. The rule now lives in parseQueryCommand, the one path all four commands share,
+   * so a command added later cannot forget it.
+   */
+  for (const [name, handler] of [
+    ['firstminters', handleFirstMinters],
+    ['firstrecipients', handleFirstRecipients],
+  ] as const) {
+    it(`/${name} refuses TWO addresses instead of answering about the first`, async () => {
+      const { base, sent } = setup();
+      collection(A); collection(B);
+      insertTransfers(db, [mint(A, WALLET, 1, 10), mint(B, WALLET, 2, 11)]);
+      await handler({ ...base, text: `/${name} ${A} ${B}` });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('takes ONE address and you sent 2');
+      expect(sent[0]).toContain(A);
+      expect(sent[0]).toContain(B);
+      // The thing that used to happen must not: no answer about either collection. Asserted
+      // on the answer's CONTENT — the wallet — because the usage line legitimately contains
+      // the words "minter" and "recipients", so a word-level negative would fail on the
+      // refusal itself and prove nothing.
+      expect(sent[0]).not.toContain(WALLET);
+    });
+
+    it(`/${name} refuses --min, which it does not read`, async () => {
+      const { base, sent } = setup();
+      collection(A);
+      await handler({ ...base, text: `/${name} ${A} --min 3` });
+      expect(sent[0]).toContain('--min does not apply to this command');
+    });
+  }
+
+  it('/overlap refuses --limit, which it does not read', async () => {
+    // It used to accept it, discard it, and not even list it in the usage line.
+    const { base, sent } = setup();
+    collection(A); collection(B);
+    await handleOverlap({ ...base, text: `/overlap ${A} ${B} --limit 50` });
+    expect(sent[0]).toContain('--limit does not apply to this command');
+  });
+
+  it('/overlap still takes MANY addresses, which is the point of the arity being per command', async () => {
+    const { base, sent } = setup();
+    collection(A); collection(B);
+    insertTransfers(db, [mint(A, WALLET, 1, 10), mint(B, WALLET, 2, 11)]);
+    await handleOverlap({ ...base, text: `/overlap ${A} ${B}` });
+    expect(sent[0]).toContain(WALLET);
+    expect(sent[0]).not.toContain('takes ONE address');
+  });
+
+  it('a repeated address is ONE address, because the dedupe runs first', async () => {
+    const { base, sent } = setup();
+    collection(A);
+    insertTransfers(db, [mint(A, WALLET, 1, 10)]);
+    await handleFirstMinters({ ...base, text: `/firstminters ${A} ${A}` });
+    // The user named one collection, twice. Refusing that would be pedantry.
+    expect(sent[0]).not.toContain('takes ONE address');
+    expect(sent[0]).toContain(WALLET);
+  });
+});
+
 describe('handleOverlap', () => {
   it('requires at least two collections', async () => {
     const { base, sent } = setup();

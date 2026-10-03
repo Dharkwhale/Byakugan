@@ -5,7 +5,9 @@ import { getCollection } from '../../db/repositories/collections.js';
 import { countUnclassified } from '../../db/repositories/enrichment.js';
 import { EnrichmentLevelError } from '../../errors.js';
 import { describeError } from '../../report.js';
-import { parseQueryCommand, type QueryArgs } from '../args.js';
+import {
+  parseQueryCommand, type AddressArity, type QueryArgs, type QueryOption,
+} from '../args.js';
 import { respond } from '../render.js';
 import type { Replier } from '../replier.js';
 import type { JobRegistry } from '../jobs.js';
@@ -39,9 +41,11 @@ const USAGE = {
  * whenever this returns a result. The usage line is appended to every parse failure so the
  * user sees the shape of the command they got wrong, not only the fault.
  */
-async function parseOrReply(d: QueryDeps, usage: string): Promise<QueryArgs | undefined> {
+async function parseOrReply(
+  d: QueryDeps, usage: string, arity: AddressArity, accepts: readonly QueryOption[],
+): Promise<QueryArgs | undefined> {
   try {
-    return parseQueryCommand(d.text, d.defaultChainId);
+    return parseQueryCommand(d.text, d.defaultChainId, arity, accepts);
   } catch (err) {
     const r = describeError(err);
     await d.replier.reply(`${r.headline}\n\n  ${r.detail}\n\n  usage: ${usage}`);
@@ -199,7 +203,7 @@ function notIndexedReply(
 }
 
 export async function handleFirstMinters(d: QueryDeps): Promise<void> {
-  const parsed = await parseOrReply(d, USAGE.firstminters);
+  const parsed = await parseOrReply(d, USAGE.firstminters, 'one', ['limit']);
   if (parsed === undefined) return;
   const contract = parsed.contracts[0];
   // Unreachable today (the parser throws first); kept so the type checker is not what
@@ -248,7 +252,7 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
  * distinction this project keeps having to defend.
  */
 export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
-  const parsed = await parseOrReply(d, USAGE.firstrecipients);
+  const parsed = await parseOrReply(d, USAGE.firstrecipients, 'one', ['limit']);
   if (parsed === undefined) return;
   const contract = parsed.contracts[0];
   if (contract === undefined) {
@@ -284,7 +288,7 @@ export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
 }
 
 export async function handleOverlap(d: QueryDeps): Promise<void> {
-  const parsed = await parseOrReply(d, USAGE.overlap);
+  const parsed = await parseOrReply(d, USAGE.overlap, 'many', ['min']);
   if (parsed === undefined) return;
   const first = parsed.contracts[0];
   // parseQueryCommand already deduped, so a repeated address cannot inflate this count.
@@ -315,6 +319,12 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
     const through = leastIndexedThrough(d.db, parsed.chainId, parsed.contracts);
     // Throws EnrichmentLevelError on an index that cannot tell a buy from a transfer. It is
     // surfaced below rather than caught here: an empty table would be a wrong answer.
+    // No `--limit` here, and not because it was forgotten: the parse path now REFUSES it for
+    // this command rather than accepting and ignoring it, and `overlap` deliberately returns
+    // every wallet that qualifies. Capping it by default would silently change the answer —
+    // "wallets in 3+ of these collections" is not a top-N question — so the missing ROW BOUND
+    // stays an honest gap in the milestone report instead of being closed with a cap nobody
+    // asked for.
     const rows = overlap(d.db, {
       chainId: parsed.chainId, contracts: parsed.contracts, minCollections: parsed.min,
     });

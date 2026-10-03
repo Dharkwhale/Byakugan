@@ -71,13 +71,42 @@ export interface QueryArgs {
 }
 
 /**
+ * How many addresses the command being parsed accepts.
+ *
+ * Checked HERE rather than in each handler. `/status` enforced it itself and the two
+ * single-address queries forgot, so `/firstminters 0xA 0xB` answered about `0xA` and said
+ * nothing about `0xB` — a question nobody asked, answered confidently, which is the same
+ * family as the visibility bugs: the output looks complete and the omission is invisible.
+ * Putting it in the one path every query already goes through means a new command cannot
+ * forget it, and the single-address commands pass `'one'` rather than re-deriving the rule.
+ */
+export type AddressArity = 'one' | 'many';
+
+/**
+ * The options a command actually uses.
+ *
+ * Same reasoning as the arity above, applied to flags. `parseQueryCommand` accepted
+ * `--limit` and `--min` for every command and each handler read only the ones it cared
+ * about, so `/overlap 0xA 0xB --limit 50` was accepted, did nothing, and said nothing — and
+ * `/status 0xA --limit 50` likewise. The grammar was wider than any command's behaviour,
+ * which is the same wrong shape as answering about the first of two addresses: the user's
+ * instruction is discarded and the reply looks like it was obeyed.
+ *
+ * `--chain` is accepted everywhere, so only the other two need naming.
+ */
+export type QueryOption = 'limit' | 'min';
+
+/**
  * Addresses are DEDUPED. `/overlap 0xA 0xA 0xB` asks about two collections, not three,
  * and counting the repeat would make every wallet that touched 0xA look like it spanned
- * two collections.
+ * two collections. Note the dedupe runs BEFORE the arity check, so `/status 0xA 0xA` is one
+ * address and is allowed — the user named one collection, twice.
  */
 export function parseQueryCommand(
   text: string,
   defaultChainId: number | undefined,
+  arity: AddressArity = 'many',
+  accepts: readonly QueryOption[] = ['limit', 'min'],
 ): QueryArgs {
   const parts = tokens(text);
   const contracts: Address[] = [];
@@ -101,12 +130,31 @@ export function parseQueryCommand(
     const value = parts[++i];
     if (value === undefined) throw new UsageError(`${token} needs a value.`);
     if (token === '--chain') { chainRaw = value; chainId = Number(value); }
-    else if (token === '--limit') limit = Number(value);
-    else if (token === '--min') min = Number(value);
+    else if (token === '--limit' || token === '--min') {
+      const name = token.slice(2) as QueryOption;
+      // Refused, not ignored. A flag this command does not read is an instruction the user
+      // gave and the reply would silently discard.
+      if (!accepts.includes(name)) {
+        throw new UsageError(
+          `${token} does not apply to this command, so it is refused rather than ignored — ` +
+          'a reply that quietly dropped it would look like it had been obeyed.',
+        );
+      }
+      if (name === 'limit') limit = Number(value);
+      else min = Number(value);
+    }
     else throw new UsageError(`unknown option ${token}.`);
   }
 
   if (contracts.length === 0) throw new UsageError('Send at least one address.');
+  if (arity === 'one' && contracts.length > 1) {
+    throw new UsageError(
+      `This command takes ONE address and you sent ${contracts.length} ` +
+      `(${contracts.join(', ')}). It is refused rather than answered about the first, ` +
+      'because a reply about one of them would look like a complete answer. Send them one ' +
+      'at a time, or use /overlap for a question across several collections.',
+    );
+  }
   if (chainId === undefined) {
     throw new UsageError('No chain specified and no default is configured. Use --chain N.');
   }

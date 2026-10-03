@@ -141,14 +141,19 @@ export async function handleStatus(a: {
 
   let parsed: ReturnType<typeof parseQueryCommand>;
   try {
-    parsed = parseQueryCommand(a.text, a.defaultChainId);
+    // `'one'` rather than a check of its own below. This command had the arity rule and the
+    // two single-address queries did not, which is how `/firstminters 0xA 0xB` came to answer
+    // about `0xA` silently. The rule now lives in the one path all of them share.
+    parsed = parseQueryCommand(a.text, a.defaultChainId, 'one', []);
   } catch (err) {
     const reported = describeError(err);
-    await a.replier.reply(`${reported.headline}\n\n  ${reported.detail}`);
+    await a.replier.reply(
+      `${reported.headline}\n\n  ${reported.detail}\n\n  usage: /status 0x… [--chain N]`,
+    );
     return;
   }
   const contract = parsed.contracts[0];
-  if (contract === undefined || parsed.contracts.length > 1) {
+  if (contract === undefined) {
     await a.replier.reply('/status takes one address: /status 0x… [--chain N]');
     return;
   }

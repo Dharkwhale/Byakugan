@@ -303,9 +303,23 @@ describe('handleStatus', () => {
     expect(sent[0]).toContain('"0xnope" is not a valid address');
   });
 
-  it('refuses more than one address', async () => {
+  it('refuses more than one address, now from the SHARED parse path', async () => {
+    // The refusal moved out of this handler and into `parseQueryCommand`, so the two
+    // single-address queries get it too instead of each needing to remember. It names both
+    // addresses, because "you sent two" is less useful than showing which two.
     const { base, sent } = setup();
     await handleStatus({ ...base, text: `/status ${ADDR} ${MINTER}` });
-    expect(sent[0]).toContain('/status takes one address');
+    expect(sent[0]).toContain('takes ONE address and you sent 2');
+    expect(sent[0]).toContain(ADDR);
+    expect(sent[0]).toContain(MINTER);
+    expect(sent[0]).toContain('usage: /status 0x…');
+  });
+
+  it('refuses an option it does not use, rather than ignoring it', async () => {
+    // /status reads neither --limit nor --min, and used to accept both and discard them.
+    const { base, sent } = setup();
+    await handleStatus({ ...base, text: `/status ${ADDR} --limit 50` });
+    expect(sent[0]).toContain('--limit does not apply to this command');
+    expect(sent[0]).toMatch(/refused rather than ignored/);
   });
 });
