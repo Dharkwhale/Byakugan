@@ -12,8 +12,8 @@ across several collections at once.
 wallet client anywhere in it. A test asserts the config schema contains no private-key
 field. It reads chains; it cannot touch them.
 
-Milestone 1 (the historical indexer) is complete. The Telegram bot is Milestone 2 — see
-[Querying, today](#querying-today).
+Milestones 1 (the historical indexer) and 2 (the Telegram bot) are complete. To use it from a
+chat, go to [The Telegram bot](#the-telegram-bot).
 
 ---
 
@@ -161,11 +161,224 @@ the databases, which is how the equivalence above was confirmed end to end.
 collection, fetching the transactions cost roughly 142× the cost of fetching the logs.
 That is what the enrichment levels are for.
 
-## Querying, today
+## The Telegram bot
 
-**The Telegram bot is Milestone 2 and does not exist yet.** There is no `/firstminters`
-command to run. What exists is the indexer and the query functions it fills, so today you
-query the database directly:
+The bot is how you normally use Byakugan: you send it a collection's address in a chat, it
+indexes that collection, and you then ask it who minted first. It runs on your own machine
+(or server) and talks to Telegram over long polling, so nothing needs to be exposed to the
+internet.
+
+This section takes you from a fresh clone to a working `/firstminters` reply, assuming you
+have never made a Telegram bot. Do the steps in order. Each says what it is **for**, because
+when something does not work, knowing why a step exists is how you find which one you missed.
+
+### What you need before you start
+
+- Everything from [Quick start](#quick-start): Node 20+, `npm install`, and a `.env` with an
+  RPC URL for the chain you want (for example `RPC_URL_8453`). The bot indexes through that
+  same endpoint, so it spends that account's compute units.
+- A Telegram account, in the Telegram app or at web.telegram.org.
+
+### Step 1: Create the bot and get its token
+
+A Telegram bot is an account that a program controls. Telegram has one official bot,
+**@BotFather**, whose only job is to make other bots.
+
+1. In Telegram, search for **@BotFather** and open it. Check it has the blue verified tick;
+   there are impostors.
+2. Send `/newbot`.
+3. It asks for a **name** (shown in chats, anything you like) and then a **username**, which
+   must be unique across Telegram and must end in `bot` (for example `my_byakugan_bot`).
+4. BotFather replies with a **token**: a long string of the form
+   `<numbers>:<letters and digits>`. This is the bot's password. Whoever holds it can run
+   your bot.
+
+**Treat the token as a secret.** Put it in `.env` and nowhere else: not in the code, not in a
+commit, not in a screenshot, not in a chat message. If it leaks, send `/revoke` to
+@BotFather to issue a new one. Byakugan scrubs it from its own logs and error output, but it
+cannot protect a token you paste somewhere yourself.
+
+### Step 2: Find your own numeric user id
+
+Anyone on Telegram can message your bot once they know its username. The bot therefore
+answers **only the user ids you list**, and silently ignores everyone else. That list is the
+only access control there is, so you need your own id to be on it.
+
+The id is a plain number (for example `123456789`), not your `@username`; usernames are
+rejected. One way to get it is to message **@userinfobot** in Telegram, which replies with
+your id. (That bot is a third-party service and not part of this project. Your user id is
+not a secret.)
+
+### Step 3: Fill in `.env`
+
+Add these two lines to the `.env` you created in the quick start:
+
+```
+TELEGRAM_BOT_TOKEN=<the token from BotFather, in place of this text>
+TELEGRAM_ALLOWED_USER_IDS=123456789
+```
+
+For more than one person, comma separate: `TELEGRAM_ALLOWED_USER_IDS=123456789,987654321`.
+
+**The allowlist is required.** If `TELEGRAM_ALLOWED_USER_IDS` is empty, or contains something
+that is not a number, the bot **refuses to start** and says why. It does not guess, because an
+empty list could mean "nobody" (a bot that looks dead) or "everybody" (a private bot that is
+not private), and the two are indistinguishable until someone is harmed by the wrong guess.
+
+### Step 4: Create the database
+
+```bash
+npm run migrate
+```
+
+This creates `./data/byakugan.db` (or wherever `DB_PATH` points) and its tables. The bot also
+applies any pending migrations when it starts, but running this once yourself means a
+problem with the database shows up now, with nothing else in play.
+
+### Step 5: Start the bot
+
+```bash
+npm run bot
+```
+
+It prints `byakugan bot starting, pid <number>` and then stays running; leave this terminal
+open. Stop it with Ctrl+C. If it exits straight away, read the last line it printed: a missing
+token, an empty allowlist, or a token Telegram rejected each says so by name.
+
+Run **one** copy only. See [Single instance](#single-instance).
+
+### Step 6: Open the chat and send `/start`
+
+In Telegram, search for the **username** you gave BotFather, open it and press **Start** (or
+send `/start`). A bot cannot open a conversation with you; the chat has to exist first, and
+this creates it. The bot replies `Ready. /help for commands.`
+
+If you get **no reply at all**, the cause is almost always that your user id is not in
+`TELEGRAM_ALLOWED_USER_IDS`: the bot drops messages from anyone not on the list without
+answering, and writes a line to the terminal naming the id it dropped. Compare that id with
+your list, fix `.env`, and restart the bot. (The allowlist is read at startup, so editing
+`.env` while it runs changes nothing.)
+
+### Step 7: Index a collection
+
+Indexing reads a collection's whole transfer history from the chain into your database. The
+queries in step 8 read only that database, so nothing can be answered for a collection that
+has not been indexed.
+
+Always preview first. This costs almost nothing and starts no job:
+
+```
+/index 0xec04bedeec2f23307bba10468822d5b76a4284f5 --chain 8453 --dry-run
+```
+
+It replies with the deploy block, how many blocks must be read, and an **estimate** of how
+long that will take. Then start it for real:
+
+```
+/index 0xec04bedeec2f23307bba10468822d5b76a4284f5 --chain 8453
+```
+
+- If the estimate is over five minutes, the bot does **not** start. It replies with the
+  estimate and the same command with `--yes` on the end. Send that to confirm. This is
+  deliberate: a started job cannot be cancelled and holds that collection's lock until it
+  finishes.
+- Once started, the bot posts a progress message and edits it as blocks complete. When it
+  finishes it edits the message to the result.
+- To try it on a bounded range first, add `--to-block <number>`.
+- Leaving out `--chain` uses `DEFAULT_CHAIN_ID` from `.env`.
+
+**The enrichment level is fixed the first time a collection is indexed.** The default is
+`full`, which can answer every question and costs the most. `--mints-only` is cheaper and
+answers `/firstminters` but not `/overlap`; `--logs-only` is cheapest and answers neither of
+those. See [Enrichment levels](#enrichment-levels) for what each means and costs. Re-indexing
+at a different level is refused, so choose before the first run.
+
+An interrupted run costs nothing: send the same `/index` again and it resumes from where it
+stopped. If the bot was restarted mid-job, `/index` may reply that a previous run left a lock;
+the lock expires by itself after 15 minutes, and `/status` shows how long is left.
+
+### Step 8: Ask a question
+
+```
+/firstminters 0xec04bedeec2f23307bba10468822d5b76a4284f5 --chain 8453
+```
+
+This is the wallets that minted earliest, one row per **acting** wallet, with how many
+recipients each minted to. Use `/status` to see whether the collection is finished first; a
+query answered while a job is still running says so and covers only the blocks indexed so
+far.
+
+### Commands
+
+| command | what it does |
+|---|---|
+| `/index 0x… [--chain N] [--mints-only] [--logs-only] [--to-block N] [--deploy-block N] [--dry-run] [--yes]` | Index a collection. `--dry-run` only reports the estimate. `--yes` confirms a long run. `--deploy-block` supplies the deploy block when the bot says it cannot resolve it. `--level <level>` also works in place of the two shorthands; give one level option at most. |
+| `/status` | List every indexed collection (up to 20, with the total), and any job running. |
+| `/status 0x… [--chain N]` | One collection: its level, deploy block, how far it has been indexed, row counts by kind, and whether a job is running or a lock is left behind. |
+| `/firstminters 0x… [--chain N] [--limit N]` | Earliest minting wallets. `--limit` defaults to 20. Needs level `mints_only` or `full`. |
+| `/firstrecipients 0x… [--chain N] [--limit N]` | Addresses that received the first mints. Works at every level. |
+| `/overlap 0x… 0x… [0x…] [--chain N] [--min N]` | Wallets that acquired in at least `--min` (default 2) of the listed collections. Needs at least two addresses, all at level `full`. |
+| `/help` | The command list. |
+| `/start` | Replies `Ready.` and opens the chat. |
+
+Addresses may be checksummed or lowercase; they are normalised. A query for a collection
+that has never been indexed says **not indexed** and offers the `/index` command. That is a
+different answer from an empty result, and the bot keeps them apart. A query the index cannot
+answer completely, such as `/overlap` on a collection indexed at `mints_only`, is refused
+with the command that fixes it, rather than answered approximately.
+
+**Long answers arrive as a CSV file.** Output over 3,500 characters (Telegram's limit is
+4,096; the bot stays well under it) is sent as a `.csv` document instead of a message. Text
+that comes from the chain, such as a collection's name, is cleaned of control and bidi
+characters before it is shown, and spreadsheet-formula prefixes in the CSV are neutralised.
+
+### Exit codes
+
+For a process supervisor (systemd, pm2, Docker) deciding whether to restart the bot.
+
+| code | meaning | what to do |
+|---|---|---|
+| 0 | clean stop | — |
+| 1 | internal defect | report it |
+| 2 | bad configuration, including a missing token, an empty allowlist, or a token Telegram rejected | fix `.env`; restarting will not help |
+| 3 | provider or chain unavailable | retry later |
+| 4 | another instance took over polling | find and stop the other process before restarting |
+| 5 | local database state needs attention | look at the migrations |
+
+### Single instance
+
+Run exactly one bot per token. Telegram gives updates to whichever process polled most
+recently and ends the other's request with a 409 conflict, so a second copy does not split the
+work: it displaces the first. The displaced process exits with code 4 and its in-flight
+`/index` jobs die with it. If you restart a supervised process that exited 4 without finding
+the other one, the two will displace each other in turn. Each start prints its pid, which is
+how to tell afterwards.
+
+### Known limitations of the bot
+
+- **No job queue.** Two concurrent jobs share the account-wide compute-unit budget and both
+  run slower.
+- **No persistence of jobs across a restart.** A restart loses the running job and its
+  progress message goes stale. The rows already written are kept, and the same `/index`
+  resumes from the watermark. Until the lock expires, `/index` reports the leftover lock.
+- **No `/cancel`.** A started job runs to completion or failure. The confirmation gate on long
+  runs is the only protection against starting the wrong one.
+- **One instance, enforced by exiting on a 409**, not by coordination. See above.
+- **Group chats are untested.** The allowlist is per user, so in a group an allowed user
+  could drive the bot while everyone in the group reads the answers.
+- **Time and compute-unit estimates are estimates.** They rest on published prices and one
+  approximation that nobody has measured; see the Milestone 2 report. The bot says
+  "estimated" and nothing stronger.
+- **A failed progress-message edit never stops an index.** The edit is cosmetic and the
+  indexing is the expensive part, so a rejected edit is logged and the job continues. The
+  consequence is that a stale progress message does not mean a stalled job; check `/status`.
+
+The milestone report, with the measured and unmeasured claims set out separately, is
+[`docs/superpowers/reports/2026-10-03-milestone-2-report.md`](docs/superpowers/reports/2026-10-03-milestone-2-report.md).
+
+## Querying from code
+
+The bot is a front end for these functions, which you can also call directly from a script:
 
 ```ts
 import { openDb } from './src/db/connection.js';
@@ -184,8 +397,8 @@ firstRecipients(db, { chainId: 8453, contract: '0xec04…', limit: 10 });
 overlap(db, { chainId: 8453, contracts: ['0xec04…', '0xd77b…'], minCollections: 2 });
 ```
 
-Addresses must be lowercase — these functions reject a checksummed one rather than
-silently matching nothing.
+Addresses must be lowercase here — these functions reject a checksummed one rather than
+silently matching nothing. (The bot lowercases for you.)
 
 `firstMinters` groups by the acting wallet and reports `recipients`, `minted` and
 `mintedToOthers`, so a bot minting to many fresh addresses shows up as one wallet with
@@ -202,6 +415,8 @@ src/indexer/    logs → decode → classify → backfill orchestration → leve
 src/db/         connection, migrations, repositories (collections, transfers,
                 enrichment, analytics)
 src/cli/        argument parsing, exit codes, progress, cost estimation
+src/bot/        the Telegram bot: commands, allowlist, job registry, progress, rendering
+src/telegram/   classification of Telegram API failures
 db/migrations/  .sql, applied in order, immutable once applied
 config/         chains.json
 scripts/        operational probes; each imports the output scrubber FIRST
@@ -224,8 +439,23 @@ npm test          # everything
 npm run typecheck
 ```
 
-Two integration suites need things not everyone has, and **skip with a printed reason**
-rather than failing:
+**Run routine tests with `BYAKUGAN_NO_DOTENV=1`.** `test/setup.ts` loads `.env` on purpose, so
+that the real-provider smoke suite can run. The consequence is that a plain `npm test` or
+`npx vitest run` makes real calls to your RPC endpoint and **spends your compute units**.
+That is wanted when you are checking the provider; it is not wanted every time you change a
+bot message. During Milestone 2 it was being spent incidentally, well over a dozen full
+runs, before this was noticed. Set the variable for everyday runs and run the credentialed suite
+deliberately:
+
+```bash
+BYAKUGAN_NO_DOTENV=1 npm test     # no credentials loaded; the smoke suite skips itself
+npm test                          # loads .env; spends real quota
+```
+
+In PowerShell the first is `$env:BYAKUGAN_NO_DOTENV=1; npm test`.
+
+Four suites need things not everyone has (three anvil suites and the smoke suite), and
+**skip with a printed reason** rather than failing:
 
 | suite | needs | what only it can cover |
 |---|---|---|
@@ -234,7 +464,6 @@ rather than failing:
 
 ```bash
 npm run build:fixtures       # forge build, for the anvil suites
-BYAKUGAN_NO_DOTENV=1 npm test # simulate a machine with no credentials
 ```
 
 A test that pins a concurrency, security, idempotency or atomicity property is expected
@@ -287,6 +516,8 @@ Every one of these is pinned by a test, so they are choices rather than surprise
 - Setting `CU_PER_GETLOGS`, `CU_PER_GETTRANSACTION` and `CU_PER_GETBLOCK` makes
   `--dry-run` print cost columns; leaving them unset prints "not computed" rather than a
   guess, and enrichment then takes the per-tx path, which cannot over-fetch.
+- **The bot's time estimate also divides by a number nobody has measured**: 50, the assumed
+  speed-up of `alchemy_getAssetTransfers` over `eth_getLogs`. See the Milestone 2 report.
 - `COMPUTE_UNITS_PER_SECOND` overrides the 300 CU/s free-tier ceiling if you are on a
   paid tier.
 
@@ -317,4 +548,4 @@ npm run index -- --help
 ## Stack
 
 TypeScript (strict, ESM, NodeNext) · [viem](https://viem.sh) (public client only) ·
-better-sqlite3 · zod · pino · vitest · Foundry for fixtures · grammY, from Milestone 2.
+better-sqlite3 · zod · pino · vitest · Foundry for fixtures · [grammY](https://grammy.dev).
