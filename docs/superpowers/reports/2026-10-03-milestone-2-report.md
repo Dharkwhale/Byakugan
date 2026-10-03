@@ -58,7 +58,7 @@ allowlist), 3 provider unavailable, 4 busy (another instance took over polling),
 ## 2. Test results
 
 - `npm run typecheck`: clean.
-- `BYAKUGAN_NO_DOTENV=1 npx vitest run`: **898 passed, 17 skipped, across 45 files** (44 files
+- `BYAKUGAN_NO_DOTENV=1 npx vitest run`: **904 passed, 17 skipped, across 45 files** (44 files
   passed, 1 skipped). Re-run when this report was written.
 - The 17 skipped are the real-provider smoke suite, skipped because this run had no credentials
   loaded. They were not run for this report, so nothing here is evidence about the real provider.
@@ -148,14 +148,26 @@ reasons and recorded here so the claim they make is not mistaken for a tested on
    changing. The controller's first ruling on this asserted a live crash; it was wrong, and was
    corrected after the implementer read the parser.
 
-6. **The 90-second request timeout is asserted as CONFIGURATION, not behaviour.** The rules
-   prefer behaviour, and this is the exception they allow: the behaviour is a request aborting
-   after 90 seconds, observable only by waiting 90 seconds, and this project does not sleep in
-   tests. What carries the meaning is the RELATIONSHIP between three numbers — the timeout must
-   exceed grammY's 30-second long poll or polling dies mid-flight, and must undercut its
-   500-second default or the stall it exists to bound comes back — and that relationship is
-   what the test pins. The two grammY figures are read from its source, so the test would not
-   notice grammY changing them.
+6. **WITHDRAWN — this entry was wrong, and it is left here rather than deleted because a
+   false "argued, not tested" is the most expensive kind of entry in this list.** It claimed
+   the 90-second request timeout could only be asserted as configuration, because the
+   behaviour was "observable only by waiting 90 seconds, and this project does not sleep in
+   tests". The whole-branch review disproved both halves.
+
+   The reason was false: grammY arms the timeout with a plain `setTimeout`, which vitest's
+   fake timers drive in zero wall time, and its rejection message names the number of seconds
+   it was configured with — so the value is observable from outside.
+
+   And the weaker assertion did not even hold. The review mutated `buildBot` to
+   `new Bot(d.token, d.botConfig)`, deleting the timeout wiring entirely, and the suite stayed
+   green at 898 passed. The controller reproduced that result. The test compared three
+   exported constants to each other and never asked whether `buildBot` passed any of them to
+   grammY, so the guard was wired by nothing at all while an entry in this section closed the
+   question over it.
+
+   Now tested behaviourally against a hanging stub `fetch` under fake timers: pending at
+   89,999 ms, rejected at 90,001 ms with `timed out after 90 seconds`. Two mutants die —
+   deleting the wiring, and changing 90 to 400. Nothing about the timeout is argued any more.
 
 **A fixture-level gap that was fixed, not argued:** the first scrub test used a URL-shaped fake
 secret, and a mutant that derived tokens from `[]` survived, because `scrubSecrets` has fallback
@@ -250,9 +262,9 @@ matrix itself and applied the Task 10 fix round itself.
   controller nor the Task 12b review noticed; a stalled edit could therefore have held a
   finished job's final message for over eight minutes while `/status` reported it as running.
   90 rather than 30 because `bot.start()` long-polls through the same client with a 30-second
-  timeout. Both grammY figures were read out of its source. The timeout's *behaviour* is not
-  tested — it is only observable by waiting 90 seconds — so what is pinned is the relationship
-  between the three numbers; see section 5.
+  timeout. Both grammY figures were read out of its source. The timeout's behaviour IS tested,
+  under fake timers against a hanging stub fetch, after a first attempt that asserted nothing
+  useful at all; see section 5.6, which records that failure rather than hiding it.
 - **A real CLI run now makes two `eth_blockNumber` calls** (20 CU rather than 10): the port
   factory fetches a safe head for the probe and the CLI then calls `safeHead()` again, so the
   probe uses the older head. Harmless to the probe. The Task 13 change is
@@ -273,3 +285,51 @@ priority:
 Deferred minors that the review should also see, most important first: the two surrogate cases
 in Task 4's test share one `it`, so the second can never be the first failure, and a later edit
 weakening it would escape a mutation run. The Task 6 chain test has the same shape.
+
+---
+
+## 10. The whole-branch review, and what it found
+
+The owner asked that the final review treat the eight controller-written commits as its
+priority rather than reviewing uniformly, on the grounds that they are the only code on the
+branch with no independent check. It did, and **every finding it raised was in that set** —
+which is the clearest available evidence that the asymmetry was real and worth naming.
+
+Five were fixed in `94898b3`. In descending order of how badly they wanted an outside reader:
+
+1. **The 90-second timeout was wired by nothing.** Deleting the `client` key left the suite
+   green; see the withdrawn §5.6 above. Now behaviourally tested, two mutants dead.
+2. **The scrubbing transformer's comment claimed the opposite of what grammY does** — that it
+   runs outermost, so a later transformer sees scrubbed payloads. It runs INNERMOST. The right
+   position for the wire, but a future `bot.api.config.use(logPayloads)` would see unscrubbed
+   text, and the comment invited exactly that. The same commit contained the correct statement
+   in its own test, which is what makes this the clearest thing an independent reader catches.
+3. **`/status` with no address held the FOURTH instance of this project's named visibility
+   defect** — the one `bfa999c` fixed in the address branch of the same function. It read
+   `collections` alone, so a live first index (which writes no row until its deploy-block
+   search ends) was reported as "Nothing indexed yet. Start with /index", pointing the user at
+   the job they had already started. The state enumeration CLAUDE.md demands had been applied
+   to one half of the command and not the other. The registry grew `running()`; the list branch
+   now has a test per state.
+4. **Both orphan-lock replies asserted "nothing is indexing it"**, which the lock table cannot
+   support — a lock held by a live CLI run against the same database is indistinguishable from
+   one a crashed process left, and `advanceWatermark` refreshes `locked_at` every chunk, so a
+   live run's lock never goes stale and "try again in N minutes" never comes true.
+5. **`boundCaption` measured in UTF-16 units and cut in code points**, so astral characters
+   could return roughly twice the limit it exists to enforce. Unreachable through today's
+   callers, which is why an all-BMP fixture could not see it — a worked instance of the
+   "fixture a fallback also handles" rule applied to units rather than paths.
+
+Two Minors were left, recorded rather than fixed: three silent-drop inconsistencies across the
+query surface (`/firstminters 0xA 0xB` answers about `0xA` and says nothing about `0xB`, while
+`/status` refuses the same shape; `--limit` parses for `/overlap` and does nothing; `/overlap`
+has no row bound), and the 90-second timeout also capping large document uploads that grammY's
+500-second default would have completed.
+
+### One process failure worth recording
+
+While fixing finding 3 the controller ran a mutant against an UNCOMMITTED fix and restored with
+`git checkout -- src/bot/commands/status.ts`, which reverted the fix along with the mutant. The
+work was redone and the lesson is the one CLAUDE.md already states — mutation work goes on a
+branch over COMMITTED code — but the rule had been read as being about the mutant, not about
+what else the restore takes with it.
