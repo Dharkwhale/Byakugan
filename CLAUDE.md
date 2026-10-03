@@ -200,6 +200,14 @@ states down first, from the data model and the lifecycle, then write one test
 per state. A state with no test is a state that ships unseen, and "that one
 can't happen" is a claim to prove with a test, not an exemption.
 
+**The enumeration binds PER CODE PATH, not per command.** The fourth instance landed
+*after* this rule existed, in `/status` — because the address branch was enumerated
+and the no-address branch was not. One command, two paths, one of them covered. So
+the unit is the branch that produces output, not the slash command: if a handler
+forks on its input, each fork gets its own state list. A command whose states are
+"all tested" because its other half was tested is the shape this rule was written
+to stop.
+
 For `/status` the enumeration is, at minimum:
 
 - **absent** — nothing in `collections`, no lock, no job
@@ -212,7 +220,38 @@ For `/status` the enumeration is, at minimum:
 
 The two that had no test were the two that were broken. The enumeration is what
 makes that visible before a user finds it, and it belongs in the plan's task,
-not in the reviewer's head.
+not in the reviewer's head. And the list above covers `/status <address>` only —
+`/status` with no address has its own three states (empty and idle, empty while a
+first index runs, populated while another collection bootstraps), which is the
+distinction the paragraph above exists for.
+
+### Code the coordinator wrote gets an independent reviewer before its task closes
+
+**When the agent coordinating a plan writes code itself rather than dispatching it,
+that code still gets a fresh reviewer before the task is called complete — not at
+branch end, and not the coordinator re-reading its own work.**
+
+This is measured, not cautious. Milestone 2's final whole-branch review was asked to
+prioritise the eight commits the coordinator had written without an implementer.
+**Every finding it produced was in those eight.** The other ~38 commits, each of
+which had an independent implementer *and* an independent reviewer, produced none.
+What it found in them:
+
+- A test that compared three exported constants to each other and never checked the
+  value reached the library. Deleting the wiring entirely left the suite green.
+- A gap entry in the milestone report closing that question, justified by a claim
+  about the library that was false.
+- A comment stating the opposite of what the library does, in the same commit whose
+  own test stated it correctly.
+
+None of the three is subtle. All three are invisible to the person who wrote them,
+because each is a belief about one's own work rather than a fact about the code —
+which is exactly what a second reader supplies and self-review cannot.
+
+Writing the code yourself is sometimes right: a one-line fix, or a rate limit making
+dispatch impossible. The rule is not "never write it", it is **"never also be its
+only reader."** Dispatch a reviewer on the diff, and if that is impossible, say so in
+the report and name the commits, so the gap is visible rather than assumed away.
 
 ### Derive expectations from the spec, never from the fixture
 

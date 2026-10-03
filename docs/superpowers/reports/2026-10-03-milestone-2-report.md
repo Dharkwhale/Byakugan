@@ -58,7 +58,7 @@ allowlist), 3 provider unavailable, 4 busy (another instance took over polling),
 ## 2. Test results
 
 - `npm run typecheck`: clean.
-- `BYAKUGAN_NO_DOTENV=1 npx vitest run`: **904 passed, 17 skipped, across 45 files** (44 files
+- `BYAKUGAN_NO_DOTENV=1 npx vitest run`: **912 passed, 17 skipped, across 45 files** (44 files
   passed, 1 skipped). Re-run when this report was written.
 - The 17 skipped are the real-provider smoke suite, skipped because this run had no credentials
   loaded. They were not run for this report, so nothing here is evidence about the real provider.
@@ -320,10 +320,23 @@ Five were fixed in `94898b3`. In descending order of how badly they wanted an ou
    callers, which is why an all-BMP fixture could not see it — a worked instance of the
    "fixture a fallback also handles" rule applied to units rather than paths.
 
-Two Minors were left, recorded rather than fixed: three silent-drop inconsistencies across the
-query surface (`/firstminters 0xA 0xB` answers about `0xA` and says nothing about `0xB`, while
-`/status` refuses the same shape; `--limit` parses for `/overlap` and does nothing; `/overlap`
-has no row bound), and the 90-second timeout also capping large document uploads that grammY's
+The silent-drop Minor was then fixed at the owner's direction, in the SHARED parse path rather
+than per handler (`bdffd0e`): `parseQueryCommand` now takes an address arity and a per-command
+option allowlist, so `/firstminters 0xA 0xB` is refused the way `/status` already refused it,
+`/status`'s own duplicate check is deleted, and an option a command does not read — `--limit` on
+`/overlap`, either flag on `/status` — is refused rather than accepted and discarded. Three
+mutants die. The owner's framing: answering a question nobody asked is the same defect family as
+the four visibility bugs.
+
+**Attempted and backed out, recorded because the failure was informative:** making `/overlap`
+honour `--limit`. It broke two tests and they were right to break. `parseQueryCommand` defaults
+`limit` to 20, so honouring it would have silently capped every overlap answer at 20 wallets and
+stopped long results reaching the CSV path at all. "Wallets in 3+ of these collections" is not a
+top-N question, so a cap changes the answer rather than bounding the output.
+
+Two Minors remain recorded rather than fixed: **`/overlap` has no row bound** (it materialises
+every qualifying wallet into strings and then a CSV; allowlisted callers only, so robustness
+rather than security), and the 90-second timeout also caps large document uploads that grammY's
 500-second default would have completed.
 
 ### One process failure worth recording
