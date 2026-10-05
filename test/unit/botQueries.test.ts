@@ -73,9 +73,76 @@ function unclassified(contract: string, to: string, token: number, block: number
 }
 
 /** The rendered line for one row, exactly as `renderTable` writes it. */
-function line(cells: Array<[string, string]>): string {
-  return cells.map(([h, v]) => `${h}: ${v}`).join('  ');
+/**
+ * Builds the expected MESSAGE form of one row: rank, then each shown cell with its short
+ * label. Pass the cells exactly as the renderer should emit them, label included, because the
+ * labels are part of what is being asserted — a row that reads `received: 1  block: …` is the
+ * old wide form and should fail here.
+ *
+ * Addresses are left as the caller writes them: short above five rows, full at or below, which
+ * is the rule under test rather than something this helper should hide.
+ */
+function line(rank: number, cells: string[], rankWidth = 1): string {
+  return `${String(rank).padStart(rankWidth)}  ${cells.join('   ')}`;
 }
+
+
+describe('the /firstminters header, per collection shape', () => {
+  /*
+   * The header carries the counts, the hoisted constant columns AND the one-sender
+   * explanation, so it is its own code path with its own states. Enumerated: many senders,
+   * one sender (which has two opposite causes the index cannot separate), and the counts
+   * themselves.
+   */
+  it('MANY senders: counts, no explanation, minters per-row', async () => {
+    const { base, sent } = setup();
+    collection(A);
+    insertTransfers(db, [
+      { ...mint(A, WALLET, 1, 10), txFrom: BOT },
+      { ...mint(A, OTHER_WALLET, 2, 11), txFrom: OTHER_WALLET },
+    ]);
+    await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
+    expect(sent[0]).toContain('2 mints');
+    expect(sent[0]).toContain('2 sending wallets');
+    expect(sent[0]).not.toMatch(/sent by one wallet/i);
+    expect(sent[0]).toContain(BOT);
+    expect(sent[0]).toContain(OTHER_WALLET);
+  });
+
+  it('ONE sender: names it, and states BOTH causes without choosing between them', async () => {
+    // A deployer distributing and a relayer paying for real collectors both produce one
+    // sender, and the index cannot tell them apart — so asserting "no meaningful answer"
+    // would be true in only one of the two cases.
+    const { base, sent } = setup();
+    collection(A);
+    insertTransfers(db, [
+      { ...mint(A, WALLET, 1, 10), txFrom: BOT },
+      { ...mint(A, OTHER_WALLET, 2, 11), txFrom: BOT },
+    ]);
+    await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
+    expect(sent[0]).toContain('1 sending wallet');
+    expect(sent[0]).not.toContain('1 sending wallets');
+    expect(sent[0]).toContain(`sent by one wallet, ${BOT}`);
+    expect(sent[0]).toMatch(/deployer/);
+    expect(sent[0]).toMatch(/relayer/);
+    expect(sent[0]).toMatch(/cannot tell which/);
+    expect(sent[0]).toContain('/firstrecipients');
+    // The claim that is only sometimes true must NOT appear.
+    expect(sent[0]).not.toMatch(/no meaningful answer/i);
+  });
+
+  it('reports mints and recipients as COUNTS, replacing the to-others boolean', async () => {
+    const { base, sent } = setup();
+    collection(A);
+    insertTransfers(db, [
+      { ...mint(A, WALLET, 1, 10), txFrom: BOT },
+      { ...mint(A, OTHER_WALLET, 2, 11), txFrom: BOT },
+    ]);
+    await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
+    expect(sent[0]).toContain('2 mints → 2 wallets');
+    expect(sent[0]).not.toContain('to others');
+  });
+});
 
 describe('handleFirstMinters', () => {
   it('says NOT INDEXED, and that reply differs from an indexed collection with no mints', async () => {
@@ -107,14 +174,17 @@ describe('handleFirstMinters', () => {
     ]);
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
     // BOT minted twice, to two recipients, neither of them itself; WALLET minted once for itself.
-    expect(sent[0]).toContain(line([
-      ['minter', BOT], ['first recipient', WALLET], ['minted', '2'], ['recipients', '2'],
-      ['to others', 'yes'], ['block', '10'], ['log', '0'],
-    ]));
-    expect(sent[0]).toContain(line([
-      ['minter', WALLET], ['first recipient', WALLET], ['minted', '1'], ['recipients', '1'],
-      ['to others', 'no'], ['block', '12'], ['log', '0'],
-    ]));
+    // Two rows, so addresses stay FULL and the minter column is per-row because the minters
+    // differ — the hoist must not fire here. `log` is absent from the message by design.
+    // Two rows, so addresses stay FULL. The minters DIFFER so that column is per-row; the
+    // first recipient happens to be the same wallet in both, so it HOISTS to the header —
+    // both halves of the hoist rule in one fixture.
+    expect(sent[0]).toContain(line(1, [BOT, '×2', 'to 2', 'blk 10']));
+    expect(sent[0]).toContain(line(2, [WALLET, '×1', 'to 1', 'blk 12']));
+    expect(sent[0]).toContain(`all first recipient: ${WALLET}`);
+    // `log` is in the CSV only, and the boolean column is gone.
+    expect(sent[0]).not.toContain('log: ');
+    expect(sent[0]).not.toContain('to others');
   });
 
   it('sends a CSV when the output is long, named from the injected clock', async () => {
@@ -148,10 +218,7 @@ describe('handleFirstMinters', () => {
       unclassified(A, OTHER_WALLET, 2, 11),
     ]);
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
-    expect(sent[0]).toContain(line([
-      ['minter', BOT], ['first recipient', WALLET], ['minted', '1'], ['recipients', '1'],
-      ['to others', 'yes'], ['block', '10'], ['log', '0'],
-    ]));
+    expect(sent[0]).toContain(line(1, [BOT, `→ ${WALLET}`, '×1', 'to 1', 'blk 10']));
   });
 
   it('answers on a logs_only index that holds no mints (the gate reads rows, not the level)', async () => {
@@ -171,7 +238,8 @@ describe('handleFirstMinters', () => {
     collection(A, 4321);
     insertTransfers(db, [mint(A, WALLET, 1, 10)]);
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
-    expect(sent[0]).toContain('(chain 1), indexed through block 4321');
+    expect(sent[0]).toContain('(chain 1)');
+    expect(sent[0]).toContain('indexed through block 4321');
   });
 
   it('replies with the usage line when no address is given', async () => {
@@ -193,7 +261,7 @@ describe('handleFirstRecipients', () => {
     insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: null, txValueWei: null }]);
 
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(`recipient: ${WALLET}`);
+    expect(sent[0]).toContain(WALLET);
 
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
     expect(sent[1]).toMatch(/minting wallet/i);
@@ -207,10 +275,9 @@ describe('handleFirstRecipients', () => {
     setEnrichmentLevel(db, { chainId: 1, contract: A, level: 'logs_only' });
     insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: null, txValueWei: null }]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(line([
-      ['recipient', WALLET], ['minter', 'unknown (not enriched)'], ['received', '1'],
-      ['block', '10'], ['log', '0'],
-    ]));
+    // One row: the minter is not hoisted (a single row has nothing to repeat) and the
+    // address stays full.
+    expect(sent[0]).toContain(line(1, [WALLET, 'by unknown (not enriched)', '×1', 'blk 10']));
   });
 
   it('names the minter once it IS enriched', async () => {
@@ -218,9 +285,7 @@ describe('handleFirstRecipients', () => {
     collection(A);
     insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: BOT }]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(line([
-      ['recipient', WALLET], ['minter', BOT], ['received', '1'], ['block', '10'], ['log', '0'],
-    ]));
+    expect(sent[0]).toContain(line(1, [WALLET, `by ${BOT}`, '×1', 'blk 10']));
     expect(sent[0]).not.toContain('unknown');
   });
 
@@ -248,9 +313,7 @@ describe('handleFirstRecipients', () => {
       unclassified(A, OTHER_WALLET, 2, 11),
     ]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(line([
-      ['recipient', WALLET], ['minter', BOT], ['received', '1'], ['block', '10'], ['log', '0'],
-    ]));
+    expect(sent[0]).toContain(line(1, [WALLET, `by ${BOT}`, '×1', 'blk 10']));
   });
 
   it('sends a CSV when the output is long, named from the injected clock', async () => {
@@ -268,7 +331,8 @@ describe('handleFirstRecipients', () => {
     collection(A, 4321);
     insertTransfers(db, [mint(A, WALLET, 1, 10)]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain('(chain 1), indexed through block 4321');
+    expect(sent[0]).toContain('(chain 1)');
+    expect(sent[0]).toContain('indexed through block 4321');
   });
 
   it('replies with the usage line when no address is given', async () => {
@@ -379,8 +443,8 @@ describe('handleOverlap', () => {
       mint(A, OTHER_WALLET, 4, 13), mint(B, OTHER_WALLET, 5, 14),
     ]);
     await handleOverlap({ ...base, text: `/overlap ${A} ${B} ${C}` });
-    expect(sent[0]).toContain(line([['wallet', WALLET], ['collections', '3']]));
-    expect(sent[0]).toContain(line([['wallet', OTHER_WALLET], ['collections', '2']]));
+    expect(sent[0]).toContain(line(1, [WALLET, 'in 3']));
+    expect(sent[0]).toContain(line(2, [OTHER_WALLET, 'in 2']));
   });
 
   it('REFUSES on a mints_only index and names the re-index as the next action', async () => {
@@ -430,7 +494,7 @@ describe('handleOverlap', () => {
     setEnrichmentLevel(db, { chainId: 1, contract: B, level: 'mints_only' });
     insertTransfers(db, [mint(A, WALLET, 1, 10), mint(B, WALLET, 2, 11)]);
     await handleOverlap({ ...base, text: `/overlap ${A} ${B}` });
-    expect(sent[0]).toContain(line([['wallet', WALLET], ['collections', '2']]));
+    expect(sent[0]).toContain(line(1, [WALLET, 'in 2']));
     expect(sent[0]).not.toMatch(/needs fully enriched/);
   });
 
@@ -524,7 +588,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
       'this answer covers blocks up to 7777 only and may change.',
     );
     expect(sent[0]).toContain(`indexed through block ${WATERMARK_A}`);   // the existing watermark kept
-    expect(sent[0]).toContain(`minter: ${BOT}`);                          // and the answer is given
+    expect(sent[0]).toContain(BOT);                          // and the answer is given
     expect(sent[0]).not.toContain('(no rows)');
   });
 
@@ -540,7 +604,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
       'this answer covers blocks up to 7777 only and may change.',
     );
     expect(sent[0]).toContain(`indexed through block ${WATERMARK_A}`);
-    expect(sent[0]).toContain(`recipient: ${WALLET}`);
+    expect(sent[0]).toContain(WALLET);
   });
 
   it('/overlap: one running collection of two counts, and the notice names the LEAST block', async () => {
@@ -555,7 +619,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
       'this answer covers blocks up to 5555 only and may change.',
     );
     expect(sent[0]).toContain('indexed through block 5555 at the least');
-    expect(sent[0]).toContain(line([['wallet', WALLET], ['collections', '2']]));
+    expect(sent[0]).toContain(line(1, [WALLET, 'in 2']));
   });
 
   it('/overlap: a job on the OTHER collection counts too, and on both says 2 of 2', async () => {
@@ -570,7 +634,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
     running(both.registry, A); running(both.registry, B);
     await handleOverlap({ ...both.base, text: `/overlap ${A} ${B}` });
     expect(both.sent[0]).toContain('INDEXING IN PROGRESS on 2 of 2 collections');
-    expect(both.sent[0]).toContain(line([['wallet', WALLET], ['collections', '2']]));
+    expect(both.sent[0]).toContain(line(1, [WALLET, 'in 2']));
   });
 
   it('says nothing about indexing when no job is running, including over an orphaned lock', async () => {
@@ -581,7 +645,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
       .run('dead-job', 1, A);
     insertTransfers(db, [mint(A, WALLET, 1, 10)]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(`recipient: ${WALLET}`);
+    expect(sent[0]).toContain(WALLET);
     expect(sent[0]).not.toMatch(/INDEXING IN PROGRESS/i);
   });
 

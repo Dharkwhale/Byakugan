@@ -70,6 +70,88 @@ describe('sanitizeOnChainText', () => {
   });
 });
 
+describe('the header, in every shape that changes it', () => {
+  /*
+   * The header now carries three jobs — the counts, the hoisted constant columns, and the
+   * shape explanation — so it is a code path with its own states, and the enumeration rule
+   * binds per path rather than per command. The states are: nothing hoistable, one column
+   * hoistable, EVERY column hoistable (which must not empty the rows), one row, and at or
+   * below the full-address cut.
+   */
+  const spec = (rows: string[][]) => ({
+    title: 'T', headers: ['wallet', 'count'], rows, filename: 'f.csv',
+    labels: { wallet: '', count: 'in ' },
+  });
+  const A = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const B = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+  it('hoists NOTHING when every column varies', () => {
+    const text = renderTable(spec([[A, '3'], [B, '2']]));
+    expect(text).not.toContain('all ');
+    expect(text).toContain(`1  ${A}   in 3`);
+    expect(text).toContain(`2  ${B}   in 2`);
+  });
+
+  it('hoists the column that is constant, and leaves the other per-row', () => {
+    const text = renderTable(spec([[A, '2'], [B, '2']]));
+    expect(text).toContain('all count: 2');
+    // The hoisted value must not also be repeated on each row.
+    expect(text).toContain(`1  ${A}`);
+    expect(text).not.toContain('in 2');
+  });
+
+  it('keeps ONE column per-row even when every column is constant', () => {
+    // Otherwise the rows become bare rank numbers and the result says nothing — a rule meant
+    // to remove repetition deleting the information instead.
+    const text = renderTable(spec([[A, '2'], [A, '2']]));
+    expect(text).toContain('all count: 2');
+    expect(text).toContain(`1  ${A}`);
+    expect(text).toContain(`2  ${A}`);
+  });
+
+  it('hoists nothing for a SINGLE row, which has nothing to repeat', () => {
+    const text = renderTable(spec([[A, '7']]));
+    expect(text).not.toContain('all ');
+    expect(text).toContain(`1  ${A}   in 7`);
+  });
+
+  it('shows FULL addresses at five rows and SHORTENS above it', () => {
+    const five = Array.from({ length: 5 }, (_, i) => [A, String(i)]);
+    expect(renderTable(spec(five))).toContain(A);
+    const six = Array.from({ length: 6 }, (_, i) => [A, String(i)]);
+    const text = renderTable(spec(six));
+    expect(text).not.toContain(A);
+    expect(text).toContain('0xaaaa…aaaa');
+  });
+
+  it('pads the rank so a two-digit result still lines up on the left', () => {
+    // Addresses must VARY here, or the wallet column hoists and the rows carry only the count
+    // — which is correct behaviour but tests the wrong thing.
+    const text = renderTable(spec(
+      Array.from({ length: 10 }, (_, i) => [`0x${String(i).padStart(40, 'a')}`, String(i)]),
+    ));
+    expect(text).toContain(' 1  0xaaaa…aaa0');
+    expect(text).toContain('10  0xaaaa…aaa9');
+  });
+
+  it('keeps a hidden column out of the MESSAGE and in the CSV', () => {
+    const base = {
+      title: 'T', headers: ['wallet', 'log'], rows: [[A, '7'], [B, '9']], filename: 'f.csv',
+      hideFromMessage: ['log'], labels: { wallet: '' },
+    };
+    expect(renderTable(base)).not.toContain('log');
+    expect(renderTable(base)).not.toContain('7');
+    expect(toCsv(base)).toContain('wallet,log');
+    expect(toCsv(base)).toContain(`${A},7`);
+  });
+
+  it('renders notes under the title, and still says (no rows) when empty', () => {
+    const text = renderTable({ ...spec([]), notes: ['indexed through block 10'] });
+    expect(text).toContain('indexed through block 10');
+    expect(text).toContain('(no rows)');
+  });
+});
+
 describe('respond', () => {
   const small = {
     title: 'First minters', headers: ['wallet', 'minted'],

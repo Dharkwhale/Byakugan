@@ -60,9 +60,64 @@ export function sanitizeOnChainText(value: string | null | undefined): string {
   return points.length > NAME_LIMIT ? `${points.slice(0, NAME_LIMIT).join('')}…` : cleaned;
 }
 
-export function renderTable(a: { title: string; headers: string[]; rows: string[][] }): string {
-  if (a.rows.length === 0) return [a.title, '', '(no rows)'].join('\n');
-  const lines = [a.title, ''];
+/** Addresses are stored lowercase, so this is the shape of every address cell. */
+const ADDRESS_CELL = /^0x[0-9a-f]{40}$/;
+
+/**
+ * Above this many rows an address is shortened; at or below it, shown in full.
+ *
+ * Shortening is what buys a one-display-line row, and it costs copy-and-paste. At five rows
+ * or fewer there is nothing to scan, so an address you cannot paste is the worse trade —
+ * `/firstminters` on a single-sender collection is exactly that case.
+ */
+const FULL_ADDRESS_ROWS = 5;
+
+const shortAddress = (value: string): string => `${value.slice(0, 6)}…${value.slice(-4)}`;
+
+export interface TableSpec {
+  title: string;
+  /** Lines under the title: the shape explanation, the in-progress notice. */
+  notes?: readonly string[];
+  headers: string[];
+  rows: string[][];
+  /** Columns kept in the CSV but left out of the message. Ordering tiebreaks, mostly. */
+  hideFromMessage?: readonly string[];
+  /**
+   * Short per-cell prefixes for the message, by header name. `''` drops the label entirely.
+   *
+   * Cells carry their own label because Telegram renders a proportional font: padded columns
+   * do not line up, so an aligned header row is not available and the label has to travel
+   * with the value. Short ones (`×`, `blk `) keep a row to one display line where
+   * `received: 1  block: 51905880` did not. Defaults to the old `header: ` form.
+   */
+  labels?: Readonly<Record<string, string>>;
+}
+
+/**
+ * Renders a result for a CHAT, which is a different problem from rendering it for a terminal.
+ *
+ * The first version put every field on one line as `header: value`, which measured 143
+ * characters for `/firstrecipients` and wrapped to four or five display lines on a phone with
+ * nothing marking where one row ended and the next began. The line breaks were there; they
+ * landed mid-paragraph and were invisible. So this is designed for the WRAP:
+ *
+ *   - A RANK NUMBER gives every row a left edge, which survives wrapping where a newline does
+ *     not. It is the thing that makes a wall of text scannable again.
+ *   - A column whose value is the SAME on every row is hoisted into the header, because it is
+ *     a property of the result rather than of each row. On a relayed or distributed mint the
+ *     repeated sender was half the width of every line.
+ *   - Addresses shorten above `FULL_ADDRESS_ROWS` rows, so a row fits one display line.
+ *
+ * All three rules are derived from the data, not configured per command: constant-ness is
+ * measured across the rows, and an address is recognised by its shape. A new column gets the
+ * behaviour without the caller opting in.
+ *
+ * The CSV is unaffected and always carries every column and every value in full.
+ */
+export function renderTable(a: TableSpec): string {
+  const head = [a.title, ...(a.notes ?? [])];
+  if (a.rows.length === 0) return [...head, '', '(no rows)'].join('\n');
+
   a.rows.forEach((row, r) => {
     // A short row would render as a silently blank cell: missing data picking the cheaper
     // answer. Say so instead.
@@ -71,7 +126,44 @@ export function renderTable(a: { title: string; headers: string[]; rows: string[
         `renderTable: row ${r} has ${row.length} cells, expected ${a.headers.length} (one per header)`,
       );
     }
-    lines.push(a.headers.map((h, i) => `${h}: ${row[i]}`).join('  '));
+  });
+
+  const hidden = new Set(a.hideFromMessage ?? []);
+  const shown = a.headers
+    .map((header, index) => ({ header, index }))
+    .filter(({ header }) => !hidden.has(header));
+
+  // One row cannot have a "constant" column in any useful sense — there is nothing to repeat —
+  // so the hoist needs at least two rows to mean anything.
+  const allEqual = a.rows.length > 1
+    ? shown.filter(({ index }) => a.rows.every((row) => row[index] === a.rows[0]![index]))
+    : [];
+  // NEVER hoist every column. If all of them are constant the rows have nothing left to
+  // carry, and the message becomes a header followed by bare rank numbers — information
+  // deleted by a rule meant to remove repetition. One column always stays per-row, so a row
+  // is always about something.
+  const constant = allEqual.length === shown.length ? allEqual.slice(1) : allEqual;
+  const perRow = shown.filter((c) => !constant.includes(c));
+
+  const full = a.rows.length <= FULL_ADDRESS_ROWS;
+  const cell = (value: string): string =>
+    (!full && ADDRESS_CELL.test(value) ? shortAddress(value) : value);
+  const label = (header: string): string => a.labels?.[header] ?? `${header}: `;
+
+  const lines = [...head];
+  if (constant.length > 0) {
+    lines.push(
+      constant
+        .map(({ header, index }) => `all ${header}: ${cell(a.rows[0]![index]!)}`)
+        .join(' · '),
+    );
+  }
+  lines.push('');
+
+  const width = String(a.rows.length).length;
+  a.rows.forEach((row, r) => {
+    const cells = perRow.map(({ header, index }) => `${label(header)}${cell(row[index]!)}`);
+    lines.push(`${String(r + 1).padStart(width)}  ${cells.join('   ')}`);
   });
   return lines.join('\n');
 }
@@ -105,7 +197,7 @@ export function toCsv(a: { headers: string[]; rows: string[][] }): string {
  */
 export async function respond(
   replier: Replier,
-  a: { title: string; headers: string[]; rows: string[][]; filename: string },
+  a: TableSpec & { filename: string },
 ): Promise<void> {
   const text = renderTable(a);
   if (text.length <= MESSAGE_BUDGET) {

@@ -224,21 +224,70 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
     // handler and leaving the user with nothing.
     const through = indexedThrough(d.db, parsed.chainId, contract);
     const rows = firstMinters(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
+    const totals = rows.reduce(
+      (acc, r) => ({ minted: acc.minted + r.minted, recipients: acc.recipients + r.recipients }),
+      { minted: 0, recipients: 0 },
+    );
     await respond(d.replier, {
-      title: `First minters of ${contract} (chain ${parsed.chainId}), ` +
-        `indexed through block ${through}` + noticeLine(jobs, 1, through),
+      title: `First minters of ${contract} (chain ${parsed.chainId})`,
+      notes: [
+        `indexed through block ${through} · ${totals.minted} mints → ` +
+        // Replaces a `to others: yes/no` column. The boolean said that a mint went elsewhere
+        // and needed the schema to read; the counts say it and are the figures being asked
+        // about anyway.
+        `${totals.recipients} wallets · ${rows.length} sending wallet` +
+        (rows.length === 1 ? '' : 's') + noticeLine(jobs, 1, through),
+        ...singleSenderNote(rows),
+      ],
       // `first recipient` is shown so a mint sent to someone other than its acting wallet is
-      // visible as such, and to whom; a yes/no column would only say that it happened.
-      headers: ['minter', 'first recipient', 'minted', 'recipients', 'to others', 'block', 'log'],
+      // visible as such, and to whom.
+      headers: ['minter', 'first recipient', 'minted', 'recipients', 'block', 'log'],
       rows: rows.map((r) => [
         r.minter, r.firstRecipient, String(r.minted), String(r.recipients),
-        r.mintedToOthers ? 'yes' : 'no', String(r.blockNumber), String(r.logIndex),
+        String(r.blockNumber), String(r.logIndex),
       ]),
+      // `log` only breaks ordering ties within a block; it is noise in a chat and is kept in
+      // the file for anyone reproducing the order.
+      hideFromMessage: ['log'],
+      labels: {
+        minter: '', 'first recipient': '→ ', minted: '×', recipients: 'to ',
+        block: 'blk ',
+      },
       filename: `firstminters-${parsed.chainId}-${contract}-${d.clock.now()}.csv`,
     });
   } catch (err) {
     await replyError(d, err, { contract, chainId: parsed.chainId });
   }
+}
+
+/**
+ * What ONE sending wallet means — stated, not interpreted.
+ *
+ * Two opposite situations produce it and the index cannot tell them apart:
+ *
+ *   - A DEPLOYER minting a supply and distributing it. "Which wallets minted first" then has
+ *     no meaningful answer, because only one did.
+ *   - A RELAYER paying gas for real collectors — sponsored and gasless mints are common, and
+ *     measured on Base one EOA sends for several unrelated collections. There the collection
+ *     may have a thousand genuine minters and `tx_from` is the platform.
+ *
+ * So this says what is true of both and names the wallet, rather than asserting "no meaningful
+ * answer", which holds in only one of the two cases. The recipients view is reliable either
+ * way, because `to_addr` is the collector in both.
+ *
+ * A cheap local discriminator exists once more than one collection is indexed — a sender
+ * appearing across several of them is a relayer, one appearing in a single collection is
+ * probably its deployer — and it costs no provider call. Not built; see
+ * `docs/superpowers/notes/2026-10-03-what-to-watch.md`.
+ */
+function singleSenderNote(rows: readonly { minter: string }[]): string[] {
+  if (rows.length !== 1) return [];
+  return [
+    '',
+    `Every mint was sent by one wallet, ${rows[0]!.minter}. That is either a deployer`,
+    'distributing a supply, or a relayer paying gas for collectors who are genuinely',
+    'distinct — this cannot tell which. /firstrecipients is reliable either way.',
+  ];
 }
 
 /**
@@ -272,14 +321,22 @@ export async function handleFirstRecipients(d: QueryDeps): Promise<void> {
     const through = indexedThrough(d.db, parsed.chainId, contract);
     const rows = firstRecipients(d.db, { chainId: parsed.chainId, contract, limit: parsed.limit });
     await respond(d.replier, {
-      title: `First mint recipients of ${contract} (chain ${parsed.chainId}), ` +
-        `indexed through block ${through}` + noticeLine(jobs, 1, through),
+      title: `First mint recipients of ${contract} (chain ${parsed.chainId})`,
+      notes: [
+        `indexed through block ${through} · ${rows.length} shown` +
+        noticeLine(jobs, 1, through),
+      ],
       headers: ['recipient', 'minter', 'received', 'block', 'log'],
       rows: rows.map((r) => [
         r.recipient,
+        // Still spelled out rather than blank: a null here is "never fetched", and an empty
+        // cell reads as an address nobody noticed was missing. When every row shares it, the
+        // renderer hoists it into the header and it costs one line, not twenty.
         r.minter ?? 'unknown (not enriched)',
         String(r.received), String(r.blockNumber), String(r.logIndex),
       ]),
+      hideFromMessage: ['log'],
+      labels: { recipient: '', minter: 'by ', received: '×', block: 'blk ' },
       filename: `firstrecipients-${parsed.chainId}-${contract}-${d.clock.now()}.csv`,
     });
   } catch (err) {
@@ -349,6 +406,7 @@ export async function handleOverlap(d: QueryDeps): Promise<void> {
         noticeLine(jobs, parsed.contracts.length, through),
       headers: ['wallet', 'collections'],
       rows: rows.map((r) => [r.address, String(r.collections)]),
+      labels: { wallet: '', collections: 'in ' },
       filename: `overlap-${parsed.chainId}-${parsed.contracts.length}-${d.clock.now()}.csv`,
     });
   } catch (err) {
