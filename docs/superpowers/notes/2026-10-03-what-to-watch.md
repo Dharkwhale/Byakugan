@@ -151,3 +151,50 @@ these collections" question changes the answer instead of bounding the output.
 Whether the commands are the right commands, or what Milestone 3 should contain. You said the
 scope should come from using it, and a list of my guesses about that would only anchor you to
 them.
+
+---
+
+# First-use findings (2026-10-05)
+
+Recorded from the owner's first real use and the shape probes that followed. Not fixes —
+inputs to Milestone 3 scoping, which the owner asked to come from use rather than from the PRD.
+
+## `/firstminters` answers "who PAID". `/firstrecipients` answers "who GOT IT".
+
+The original goal was *"the first 10 wallets that mint this NFT"*. On a sponsored or gasless
+mint the payer is not the minter: a platform relayer sends the transaction and the collector
+receives the token. Measured on Base — the same EOA
+`0xf9ba6c1cd54a3c7fe7e9d164d1178feb29c16501` sends the mints for two unrelated collections
+(The Dream Station, After School), ~1,000 mints each to ~1,000 distinct recipients, one
+transaction per mint. That is a relayer, not a deployer; a deployer distributing its own supply
+is collection-specific, as TAGGED CREW's `0x06c2dbe4…` is.
+
+So on a relayed mint `/firstminters` reports ONE wallet for a thousand genuine collectors, and
+the **recipient** is closer to the question that was being asked. `/overlap` is unaffected: it
+groups by `to_addr`.
+
+**Open for M3, the owner's call:** whether the default should flip — whether "who minted" should
+mean the recipient, with the payer as the secondary column rather than the primary one.
+
+## The cheap version of telling a relayer from a deployer
+
+Distinguishing them needs no provider call once two collections are indexed: **a sender that
+appears across several indexed collections is a relayer; one that appears in a single
+collection is probably its deployer.** That is a local `SELECT` over `tx_from`, zero CU, and it
+is exactly how the relayer above was identified — by noticing one address serving two
+collections.
+
+**Not built.** Noted because the previous conclusion was that the bot could not tell the two
+apart cheaply, and that conclusion was wrong. It needs ≥2 indexed collections to say anything,
+so it is worth nothing on a fresh database and everything on a used one.
+
+## What the free ratios can and cannot do
+
+Two ratios over recent mints — distinct transactions ÷ mints, distinct recipients ÷ mints —
+are free from `getAssetTransfers` and DO separate protocol artifacts (Uniswap V3 Positions
+scored 0.25 on recipients, Slipstream 0.04, because one wallet opens many positions).
+
+They do **not** separate a public mint from a relayed one. Both candidates above scored 0.98
+transactions and 0.94–1.00 recipients — the public-mint signature — and both had one sender. A
+relayer that loops one transaction per mint is indistinguishable on any free signal. Only
+`tx_from` separates them, which is what CLAUDE.md already said about why `tx_from` is indexed.
