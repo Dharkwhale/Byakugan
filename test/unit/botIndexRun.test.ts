@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import { Writable } from 'node:stream';
 import { handleIndex } from '../../src/bot/commands/index.js';
-import { ASSET_TRANSFERS_SPEEDUP_UNVERIFIED, makePrepare } from '../../src/bot/indexRun.js';
+import { makePrepare } from '../../src/bot/indexRun.js';
+import { humanizeSeconds } from '../../src/cli/estimate.js';
 import { createJobRegistry } from '../../src/bot/jobs.js';
 import type { makeBackfillPorts } from '../../src/chain/ports.js';
 import { manualClock } from '../../src/clock.js';
@@ -162,15 +163,39 @@ describe('the estimate', () => {
     return run.estimate({ chainId: 1, contract: ADDR, level: 'full' });
   }
 
-  it('divides by the UNVERIFIED factor on the getAssetTransfers path only', async () => {
+  it('acts on the SAME number it displays, on both paths', async () => {
+    // The defect this replaces: the dry run displayed the undivided getLogs ceiling while the
+    // confirmation gate acted on that ÷ 50, so the bot reported a figure it did not believe.
+    // The two must not diverge again, whichever path is chosen.
+    for (const path of ['getLogs', 'getAssetTransfers'] as const) {
+      const { seconds, summary } = await estimateFor(path);
+      expect(seconds).toBeGreaterThan(0);
+      // `humanizeSeconds` is what the summary prints, so the displayed string has to contain
+      // the rendering of the very number handed to the gate.
+      expect(summary).toContain(humanizeSeconds(seconds));
+    }
+  });
+
+  it('gives the two paths the SAME seconds, since no divisor invents a difference', async () => {
     const logs = await estimateFor('getLogs');
     const assets = await estimateFor('getAssetTransfers');
-    expect(logs.seconds).toBeGreaterThan(0);
-    expect(assets.seconds).toBeCloseTo(logs.seconds / ASSET_TRANSFERS_SPEEDUP_UNVERIFIED, 10);
+    expect(assets.seconds).toBeCloseTo(logs.seconds, 10);
   });
 
   it('says which path it is estimating, and why when it is the fallback', async () => {
     expect((await estimateFor('getLogs')).summary).toMatch(/eth_getLogs only[\s\S]*Method not found/);
-    expect((await estimateFor('getAssetTransfers')).summary).toMatch(/CEILING/);
+    expect((await estimateFor('getLogs')).summary).toMatch(/this run's own figure, not a ceiling/);
+  });
+
+  it('on the fast path, names the figure a CEILING and refuses to invent one for the run', async () => {
+    // The owner's complaint: "a user can't tell whether 1.6 hours means 1.6 hours or 30
+    // seconds". The reply now has to say which of the two it is showing.
+    const { summary } = await estimateFor('getAssetTransfers');
+    expect(summary).toMatch(/FALLBACK CEILING, not a\s+prediction/);
+    expect(summary).toMatch(/latency-bound/);
+    expect(summary).toMatch(/not estimable/);
+    expect(summary).toMatch(/Expect\s+substantially less than the ceiling/);
+    // And why the prompt may still fire for a run that will be quick.
+    expect(summary).toMatch(/uses the ceiling on purpose/);
   });
 });

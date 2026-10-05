@@ -12,16 +12,25 @@ import type { Address, EnrichmentLevel } from '../types.js';
 import type { HandleIndexDeps, IndexRun } from './commands/index.js';
 
 /**
- * UNVERIFIED. A stated approximation, not a measurement.
+ * REMOVED, deliberately, and the reasoning is kept because the shape recurs.
  *
- * `alchemy_getAssetTransfers` has no range cap and pages by transfer count, so how many
- * calls a run takes is unknowable before the logs are read. Dividing the getLogs figure by
- * this is a guess at the ratio, used only so the confirmation gate does not demand a
- * `--yes` for a run that the cheap path will finish in minutes. It belongs in the
- * milestone report beside the compute-unit prices, which are unverified in the same way.
- * Never present the result as measured: the reply says "estimated".
+ * There used to be an `ASSET_TRANSFERS_SPEEDUP_UNVERIFIED = 50` here. The estimate's model
+ * is `calls ÷ calls-per-second` — pure THROUGHPUT, which is the right model for `eth_getLogs`
+ * at scale, where thousands of calls queue behind a compute-unit ceiling. On the
+ * `getAssetTransfers` path a run is a handful of pages and wall time is dominated by per-call
+ * LATENCY, which that model does not represent at all. Dividing by 50 patched a missing model
+ * with a constant.
+ *
+ * Worse than imprecise, it split the answer in two: the dry run DISPLAYED the undivided
+ * ceiling and the confirmation gate ACTED on the divided figure, so the bot showed one number
+ * and believed another fifty times smaller. Output whose purpose is to inform a decision,
+ * reporting something other than what the system acts on, is the same defect as the
+ * `'pending'` progress label and `/status` reporting "not indexed" during a live index.
+ *
+ * So: one number, used for both, and the uncertainty is STATED rather than divided away. The
+ * gate deliberately uses the ceiling — asking for a `--yes` that turns out to be unnecessary
+ * costs a round trip, and not asking costs an eleven-hour run nobody chose.
  */
-export const ASSET_TRANSFERS_SPEEDUP_UNVERIFIED = 50;
 
 /**
  * The bot's chain-facing half of `/index`: builds the ports ONCE per command and returns the
@@ -89,15 +98,23 @@ export function makePrepare(a: {
         const viaAssetTransfers = built.fetchPath === 'getAssetTransfers';
         const pathNote = viaAssetTransfers
           ? '  fetch path        alchemy_getAssetTransfers, with eth_getLogs as fallback.\n' +
-            '                    The getLogs figures below are therefore a CEILING.\n'
+            '                    THE TIME BELOW IS THE getLogs FALLBACK CEILING, not a\n' +
+            '                    prediction for this run. Wall time on the fast path is\n' +
+            '                    latency-bound — a few large pages, not many small calls —\n' +
+            '                    and is not estimable before the logs are read, so no figure\n' +
+            '                    for it is given rather than one being invented. Expect\n' +
+            '                    substantially less than the ceiling.\n' +
+            '                    The confirmation prompt uses the ceiling on purpose: being\n' +
+            '                    asked unnecessarily costs a round trip, and not being asked\n' +
+            '                    costs a run you did not choose.\n'
           : '  fetch path        eth_getLogs only — getAssetTransfers is unavailable here\n' +
-            `                    (${built.fetchPathReason ?? 'no reason given'})\n`;
+            `                    (${built.fetchPathReason ?? 'no reason given'})\n` +
+            '                    The time below is this run\'s own figure, not a ceiling.\n';
         return {
-          // getAssetTransfers has no range cap, so the getLogs-derived figure is a ceiling
-          // on that path; the divisor is UNVERIFIED (see its declaration).
-          seconds: viaAssetTransfers
-            ? estimate.logsSeconds / ASSET_TRANSFERS_SPEEDUP_UNVERIFIED
-            : estimate.logsSeconds,
+          // ONE number, displayed and acted on. See the note where the divisor used to be:
+          // showing the ceiling while gating on ceiling/50 meant the reply reported something
+          // the bot did not believe.
+          seconds: estimate.logsSeconds,
           summary: pathNote + formatEstimate({
             estimate,
             chunkNote: probed.note, chunkMeasured: probed.measured,
