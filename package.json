@@ -18,7 +18,9 @@
     "compare:paths": "node --env-file-if-exists=.env --import tsx scripts/compare-fetch-paths.ts",
     "verify:scrub": "node --env-file-if-exists=.env --import tsx scripts/verify-secret-scrub.ts",
     "bot": "node --env-file-if-exists=.env --import tsx src/bot/index.ts",
-    "probe:telegram": "node --env-file-if-exists=.env --import tsx scripts/probe-telegram.ts"
+    "probe:telegram": "node --env-file-if-exists=.env --import tsx scripts/probe-telegram.ts",
+    "inspect:shape": "node --env-file-if-exists=.env --import tsx scripts/inspect-collection-shape.ts",
+    "find:publicmint": "node --env-file-if-exists=.env --import tsx scripts/find-public-mint-collection.ts"
   },
   "keywords": [],
   "author": "",
