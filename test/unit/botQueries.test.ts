@@ -82,6 +82,14 @@ function unclassified(contract: string, to: string, token: number, block: number
  * Addresses are left as the caller writes them: short above five rows, full at or below, which
  * is the rule under test rather than something this helper should hide.
  */
+/**
+ * `0x1234…abcd`, the renderer's short form. Needed wherever a row's FULL width would exceed
+ * the 80-character budget, which is now what decides the form rather than the row count alone.
+ */
+function short(address: string): string {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
 function line(rank: number, cells: string[], rankWidth = 1): string {
   return `${String(rank).padStart(rankWidth)}  ${cells.join('   ')}`;
 }
@@ -105,8 +113,9 @@ describe('the /firstminters header, per collection shape', () => {
     expect(sent[0]).toContain('2 mints');
     expect(sent[0]).toContain('2 sending wallets');
     expect(sent[0]).not.toMatch(/sent by one wallet/i);
-    expect(sent[0]).toContain(BOT);
-    expect(sent[0]).toContain(OTHER_WALLET);
+    // Two address columns and nothing hoisted: over the width budget, so both shorten.
+    expect(sent[0]).toContain(`${short(BOT)}   → ${short(WALLET)}`);
+    expect(sent[0]).toContain(`${short(OTHER_WALLET)}   → ${short(OTHER_WALLET)}`);
   });
 
   it('ONE sender: names it, and states BOTH causes without choosing between them', async () => {
@@ -122,7 +131,11 @@ describe('the /firstminters header, per collection shape', () => {
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
     expect(sent[0]).toContain('1 sending wallet');
     expect(sent[0]).not.toContain('1 sending wallets');
-    expect(sent[0]).toContain(`sent by one wallet, ${BOT}`);
+    expect(sent[0]).toContain('Every mint was sent by one wallet:');
+    // On its own line and in FULL, so it can be selected without catching prose around it.
+    expect(sent[0]).toContain(`
+  ${BOT}
+`);
     expect(sent[0]).toMatch(/deployer/);
     expect(sent[0]).toMatch(/relayer/);
     expect(sent[0]).toMatch(/cannot tell which/);
@@ -218,7 +231,7 @@ describe('handleFirstMinters', () => {
       unclassified(A, OTHER_WALLET, 2, 11),
     ]);
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
-    expect(sent[0]).toContain(line(1, [BOT, `→ ${WALLET}`, '×1', 'to 1', 'blk 10']));
+    expect(sent[0]).toContain(line(1, [short(BOT), `→ ${short(WALLET)}`, '×1', 'to 1', 'blk 10']));
   });
 
   it('answers on a logs_only index that holds no mints (the gate reads rows, not the level)', async () => {
@@ -261,7 +274,7 @@ describe('handleFirstRecipients', () => {
     insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: null, txValueWei: null }]);
 
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(WALLET);
+    expect(sent[0]).toContain(short(WALLET));
 
     await handleFirstMinters({ ...base, text: `/firstminters ${A}` });
     expect(sent[1]).toMatch(/minting wallet/i);
@@ -277,7 +290,7 @@ describe('handleFirstRecipients', () => {
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
     // One row: the minter is not hoisted (a single row has nothing to repeat) and the
     // address stays full.
-    expect(sent[0]).toContain(line(1, [WALLET, 'by unknown (not enriched)', '×1', 'blk 10']));
+    expect(sent[0]).toContain(line(1, [short(WALLET), 'by unknown (not enriched)', '×1', 'blk 10']));
   });
 
   it('names the minter once it IS enriched', async () => {
@@ -285,7 +298,7 @@ describe('handleFirstRecipients', () => {
     collection(A);
     insertTransfers(db, [{ ...mint(A, WALLET, 1, 10), txFrom: BOT }]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(line(1, [WALLET, `by ${BOT}`, '×1', 'blk 10']));
+    expect(sent[0]).toContain(line(1, [short(WALLET), `by ${short(BOT)}`, '×1', 'blk 10']));
     expect(sent[0]).not.toContain('unknown');
   });
 
@@ -313,7 +326,7 @@ describe('handleFirstRecipients', () => {
       unclassified(A, OTHER_WALLET, 2, 11),
     ]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(line(1, [WALLET, `by ${BOT}`, '×1', 'blk 10']));
+    expect(sent[0]).toContain(line(1, [short(WALLET), `by ${short(BOT)}`, '×1', 'blk 10']));
   });
 
   it('sends a CSV when the output is long, named from the injected clock', async () => {
@@ -604,7 +617,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
       'this answer covers blocks up to 7777 only and may change.',
     );
     expect(sent[0]).toContain(`indexed through block ${WATERMARK_A}`);
-    expect(sent[0]).toContain(WALLET);
+    expect(sent[0]).toContain(short(WALLET));
   });
 
   it('/overlap: one running collection of two counts, and the notice names the LEAST block', async () => {
@@ -645,7 +658,7 @@ describe('a query answered mid-backfill says so, and still answers', () => {
       .run('dead-job', 1, A);
     insertTransfers(db, [mint(A, WALLET, 1, 10)]);
     await handleFirstRecipients({ ...base, text: `/firstrecipients ${A}` });
-    expect(sent[0]).toContain(WALLET);
+    expect(sent[0]).toContain(short(WALLET));
     expect(sent[0]).not.toMatch(/INDEXING IN PROGRESS/i);
   });
 

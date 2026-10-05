@@ -64,13 +64,20 @@ export function sanitizeOnChainText(value: string | null | undefined): string {
 const ADDRESS_CELL = /^0x[0-9a-f]{40}$/;
 
 /**
- * Above this many rows an address is shortened; at or below it, shown in full.
+ * Full addresses need BOTH a short result and a row that still fits. Count alone was not
+ * enough.
  *
- * Shortening is what buys a one-display-line row, and it costs copy-and-paste. At five rows
- * or fewer there is nothing to scan, so an address you cannot paste is the worse trade —
- * `/firstminters` on a single-sender collection is exactly that case.
+ * Shortening buys a narrow row and costs copy-and-paste, so at a handful of rows — where
+ * there is nothing to scan — a pasteable address is the better trade. But `/firstminters` has
+ * TWO address columns, and one row of two full addresses measured 121 characters: the rule
+ * bought pasteability and spent it on wrapping, which is the problem it was meant to solve.
+ *
+ * So the width decides, and the count only says when it is worth trying. `ROW_WIDTH_BUDGET` is
+ * taken from the owner's own report rather than invented: a `/firstrecipients` row at 80
+ * characters read acceptably and a `/firstminters` row at 121 did not.
  */
 const FULL_ADDRESS_ROWS = 5;
+const ROW_WIDTH_BUDGET = 80;
 
 const shortAddress = (value: string): string => `${value.slice(0, 6)}…${value.slice(-4)}`;
 
@@ -145,10 +152,24 @@ export function renderTable(a: TableSpec): string {
   const constant = allEqual.length === shown.length ? allEqual.slice(1) : allEqual;
   const perRow = shown.filter((c) => !constant.includes(c));
 
-  const full = a.rows.length <= FULL_ADDRESS_ROWS;
+  const label = (header: string): string => a.labels?.[header] ?? `${header}: `;
+  const rankWidth = String(a.rows.length).length;
+  /** The row as it would render with addresses at a given length. */
+  const renderRow = (row: string[], shorten: boolean): string => {
+    const cells = perRow.map(({ header, index }) => {
+      const value = row[index]!;
+      return `${label(header)}${shorten && ADDRESS_CELL.test(value) ? shortAddress(value) : value}`;
+    });
+    return `${''.padStart(rankWidth)}  ${cells.join('   ')}`;
+  };
+
+  // Try full addresses, then keep them only if the WIDEST row still fits. One table decides
+  // once, so rows do not mix lengths — a column that changes width halfway down is harder to
+  // read than either choice.
+  const widestFull = Math.max(...a.rows.map((row) => renderRow(row, false).length));
+  const full = a.rows.length <= FULL_ADDRESS_ROWS && widestFull <= ROW_WIDTH_BUDGET;
   const cell = (value: string): string =>
     (!full && ADDRESS_CELL.test(value) ? shortAddress(value) : value);
-  const label = (header: string): string => a.labels?.[header] ?? `${header}: `;
 
   const lines = [...head];
   if (constant.length > 0) {
@@ -160,10 +181,9 @@ export function renderTable(a: TableSpec): string {
   }
   lines.push('');
 
-  const width = String(a.rows.length).length;
   a.rows.forEach((row, r) => {
     const cells = perRow.map(({ header, index }) => `${label(header)}${cell(row[index]!)}`);
-    lines.push(`${String(r + 1).padStart(width)}  ${cells.join('   ')}`);
+    lines.push(`${String(r + 1).padStart(rankWidth)}  ${cells.join('   ')}`);
   });
   return lines.join('\n');
 }

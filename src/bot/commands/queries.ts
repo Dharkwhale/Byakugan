@@ -282,11 +282,17 @@ export async function handleFirstMinters(d: QueryDeps): Promise<void> {
  */
 function singleSenderNote(rows: readonly { minter: string }[]): string[] {
   if (rows.length !== 1) return [];
+  // The ADDRESS GETS ITS OWN LINE. Inline it ran the first sentence to 109 characters and
+  // wrapped a hex string across the middle of a clause, which is the hardest thing on a phone
+  // screen to read. Prose does not need a pasteable address mid-sentence; a line of its own is
+  // both easier to read and easier to select.
   return [
     '',
-    `Every mint was sent by one wallet, ${rows[0]!.minter}. That is either a deployer`,
-    'distributing a supply, or a relayer paying gas for collectors who are genuinely',
-    'distinct — this cannot tell which. /firstrecipients is reliable either way.',
+    'Every mint was sent by one wallet:',
+    `  ${rows[0]!.minter}`,
+    'That is either a deployer distributing a supply, or a relayer paying gas for',
+    'collectors who are genuinely distinct — this cannot tell which.',
+    '/firstrecipients is reliable either way.',
   ];
 }
 
